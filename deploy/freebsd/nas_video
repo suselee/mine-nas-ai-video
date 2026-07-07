@@ -19,7 +19,7 @@ load_rc_config "$name"
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-f -p ${pidfile} -u ${nas_video_user} /bin/sh -c 'cd ${nas_video_chdir} && exec ${nas_video_uv} ${nas_video_flags}'"
+command_args="-f -p ${pidfile} -u ${nas_video_user} /bin/sh -c \"export PATH=/usr/local/bin:/usr/bin:/bin; cd ${nas_video_chdir} || exit 1; exec ${nas_video_uv} ${nas_video_flags}\""
 
 run_rc_command "$1"
 
