@@ -109,6 +109,10 @@ class Settings:
     context_before_seconds: int
     context_after_seconds: int
     max_moment_seconds: int
+    clip_video_codec: str
+    clip_audio_codec: str
+    clip_video_preset: str
+    clip_video_crf: int
     llama_base_url: str
     llama_api_key: str
     llama_model: str
@@ -168,6 +172,10 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         context_before_seconds=_int("CONTEXT_BEFORE_SECONDS", 5),
         context_after_seconds=_int("CONTEXT_AFTER_SECONDS", 10),
         max_moment_seconds=_int("MAX_MOMENT_SECONDS", 45),
+        clip_video_codec=os.getenv("CLIP_VIDEO_CODEC", "libx264").strip().lower(),
+        clip_audio_codec=os.getenv("CLIP_AUDIO_CODEC", "aac").strip().lower(),
+        clip_video_preset=os.getenv("CLIP_VIDEO_PRESET", "veryfast").strip().lower(),
+        clip_video_crf=_int("CLIP_VIDEO_CRF", 23),
         llama_base_url=os.getenv("LLAMA_BASE_URL", "http://127.0.0.1:8080/v1"),
         llama_api_key=os.getenv("LLAMA_API_KEY", ""),
         llama_model=os.getenv("LLAMA_MODEL", "Qwen3-VL-2B-Instruct"),
@@ -176,9 +184,14 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
             "ANALYSIS_PROMPT",
             (
                 "Find short, precious indoor moments of my daughter in the living room. "
-                "Look for scenes where she is playing with her grandma, moving around, or interacting clearly. "
+                "There are three family members at home: my daughter (a young girl), her mom "
+                "(a young adult woman, NOT the grandma), and her grandma (an older woman) - "
+                "these are three distinct people, do not confuse mom with grandma. "
+                "Look for scenes where my daughter is visible and active: playing with her mom, "
+                "playing with her grandma, moving around, or interacting clearly with someone. "
                 "Only keep clips where my daughter is visible and the scene is indoors. "
                 "Skip empty rooms, outdoor views, pets-only, blurry frames, and background activity with no child. "
+                "When describing the scene, name the family members correctly: daughter, mom, or grandma. "
                 "Prefer genuine childhood moments but keep clips concise. "
                 "Return JSON only with keep, title, summary, tags, confidence, start_offset_seconds, and end_offset_seconds."
             ),

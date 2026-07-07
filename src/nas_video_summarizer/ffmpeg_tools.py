@@ -297,8 +297,36 @@ async def extract_clip(
             str(input_path),
             "-t",
             f"{duration_seconds:.3f}",
-            "-c",
-            "copy",
+        ]
+
+        # Saved clips are served to browsers via /api/moments/{id}/video.
+        # 4K RTSP cameras usually emit HEVC video, which Chrome/Firefox/
+        # Edge cannot decode (Safari can, on macOS only). With -c copy the
+        # mp4 ends up HEVC + AAC, so browsers play audio only. Default to
+        # re-encoding to H.264 yuv420p + AAC with +faststart so the moov
+        # atom sits at the front for byte-range seeking. Set
+        # CLIP_VIDEO_CODEC=copy / CLIP_AUDIO_CODEC=copy to skip re-encode
+        # and preserve the original RTSP codec.
+        if settings.clip_video_codec == "copy":
+            command += ["-c:v", "copy"]
+        else:
+            command += [
+                "-c:v",
+                settings.clip_video_codec,
+                "-preset",
+                settings.clip_video_preset,
+                "-crf",
+                str(settings.clip_video_crf),
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        if settings.clip_audio_codec == "copy":
+            command += ["-c:a", "copy"]
+        else:
+            command += ["-c:a", settings.clip_audio_codec, "-b:a", "192k"]
+        command += [
+            "-movflags",
+            "+faststart",
             "-avoid_negative_ts",
             "make_zero",
             str(output_path),
