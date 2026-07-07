@@ -101,6 +101,47 @@ service nas_video start
 service nas_video status
 ```
 
+### llama.cpp server (rc.d)
+
+If the local llama.cpp vision model runs in the same jail (or a
+separate jail dedicated to inference), use the bundled rc.d template
+to start `llama-server` under `daemon(8)`.
+
+```sh
+cp deploy/freebsd/llama_server /usr/local/etc/rc.d/llama_server
+chmod +x /usr/local/etc/rc.d/llama_server
+```
+
+Add to `/etc/rc.conf` inside that jail:
+
+```sh
+llama_server_enable="YES"
+llama_server_user="root"
+llama_server_bin="/usr/local/bin/llama-server"
+llama_server_model="/mnt/models/Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf"
+llama_server_mmproj="/mnt/models/mmproj-F16.gguf"
+llama_server_threads="2"
+llama_server_batch="256"
+llama_server_ubatch="256"
+llama_server_ctx="2048"
+llama_server_host="0.0.0.0"
+llama_server_port="8892"
+```
+
+Start it:
+
+```sh
+service llama_server start
+service llama_server status
+service llama_server stop
+```
+
+Point `nas_video` at it (in the recorder jail's `.env`):
+
+```text
+LLAMA_BASE_URL=http://llama-jail-ip:8892/v1
+```
+
 ## 5. Operating Notes
 
 - The low-resolution RTSP stream is analyzed for speed.
