@@ -25,6 +25,12 @@ pidfile="/var/run/${name}.pid"
 # to daemon(8) as the program to exec. The uv args are passed inside
 # command_args here so daemon receives a clean option set.
 command="/usr/sbin/daemon"
-command_args="-f -p ${pidfile} -u ${nas_video_user} /bin/sh -c 'export PATH=/usr/local/bin:/usr/bin:/bin; cd ${nas_video_chdir} || exit 1; exec ${nas_video_uv} ${nas_video_run_args}'"
+# Use -P (supervisor pidfile) not -p (child pidfile): rc.subr's
+# check_pidfile matches the pidfile's process against $command
+# (/usr/sbin/daemon). -p records the spawned child (sh/uv), whose comm
+# is not "daemon", so stop/status would report "not running". -P
+# records the daemon supervisor pid, and daemon forwards SIGTERM to
+# the child and removes the pidfile on exit.
+command_args="-f -P ${pidfile} -u ${nas_video_user} /bin/sh -c 'export PATH=/usr/local/bin:/usr/bin:/bin; cd ${nas_video_chdir} || exit 1; exec ${nas_video_uv} ${nas_video_run_args}'"
 
 run_rc_command "$1"
