@@ -91,7 +91,7 @@ nas_video_enable="YES"
 nas_video_user="nasvideo"
 nas_video_chdir="/usr/local/mine_nas_ai_video"
 nas_video_uv="/usr/local/bin/uv"
-nas_video_flags="run nas-video"
+nas_video_run_args="run nas-video"
 ```
 
 Start it:
