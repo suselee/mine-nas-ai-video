@@ -285,28 +285,38 @@ async def extract_clip(
             input_path = Path(temp_dir) / "combined.mp4"
             await concat_segments(settings, segment_paths, input_path)
 
+        # Saved clips are served to browsers via /api/moments/{id}/video.
+        # Fast path (default): -c copy preserves the RTSP codec untouched,
+        # which is fast and lossless but may emit HEVC, which Chrome/
+        # Firefox/Edge cannot decode - browsers would play audio only.
+        # To make clips browser-friendly, set CLIP_VIDEO_CODEC=libx264
+        # (and CLIP_AUDIO_CODEC=aac) to re-encode at extract time.
+        reencoding_video = settings.clip_video_codec != "copy"
+        reencoding_audio = settings.clip_audio_codec != "copy"
+
         command = [
             settings.ffmpeg_bin,
             "-hide_banner",
             "-loglevel",
             "error",
             "-y",
-            "-ss",
-            f"{max(start_offset_seconds, 0):.3f}",
-            "-i",
-            str(input_path),
-            "-t",
-            f"{duration_seconds:.3f}",
         ]
+        # For -c copy use input seeking (fast, keyframe-aligned). When
+        # re-encoding, use output seeking (decode from 0, trim with -ss
+        # after -i) so the encoder starts on a clean keyframe and the
+        # output has correct timestamps for player compatibility.
+        if not reencoding_video and not reencoding_audio:
+            command += ["-ss", f"{max(start_offset_seconds, 0):.3f}"]
+            command += ["-i", str(input_path), "-t", f"{duration_seconds:.3f}"]
+        else:
+            command += ["-i", str(input_path)]
+            command += [
+                "-ss",
+                f"{max(start_offset_seconds, 0):.3f}",
+                "-t",
+                f"{duration_seconds:.3f}",
+            ]
 
-        # Saved clips are served to browsers via /api/moments/{id}/video.
-        # 4K RTSP cameras usually emit HEVC video, which Chrome/Firefox/
-        # Edge cannot decode (Safari can, on macOS only). With -c copy the
-        # mp4 ends up HEVC + AAC, so browsers play audio only. Default to
-        # re-encoding to H.264 yuv420p + AAC with +faststart so the moov
-        # atom sits at the front for byte-range seeking. Set
-        # CLIP_VIDEO_CODEC=copy / CLIP_AUDIO_CODEC=copy to skip re-encode
-        # and preserve the original RTSP codec.
         if settings.clip_video_codec == "copy":
             command += ["-c:v", "copy"]
         else:
@@ -324,13 +334,14 @@ async def extract_clip(
             command += ["-c:a", "copy"]
         else:
             command += ["-c:a", settings.clip_audio_codec, "-b:a", "192k"]
-        command += [
-            "-movflags",
-            "+faststart",
-            "-avoid_negative_ts",
-            "make_zero",
-            str(output_path),
-        ]
+        command += ["-avoid_negative_ts", "make_zero"]
+        # +faststart moves the moov atom to the front so byte-range
+        # seeking works for browser playback. Skip it for -c copy: it
+        # requires a second pass that would fragment HEVC streams, and
+        # browsers won't play HEVC anyway.
+        if reencoding_video or reencoding_audio:
+            command += ["-movflags", "+faststart"]
+        command += [str(output_path)]
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.DEVNULL,
