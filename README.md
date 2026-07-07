@@ -1,0 +1,86 @@
+# Mine NAS AI Video
+
+Local FreeBSD-jail service for saving meaningful moments from a home RTSP camera.
+
+The service records a low-resolution RTSP stream for analysis, records a 4K RTSP stream as the quality source, asks a local llama.cpp OpenAI-compatible endpoint whether a segment is worth saving, then writes selected clips and metadata into a Nextcloud-visible folder.
+
+For slow local vision models such as Qwen3-VL-2B in llama.cpp, the default analyzer sends one low-resolution contact sheet per segment instead of many separate images. This keeps model calls bounded while still showing several moments in chronological order.
+
+## Quick Start
+
+```sh
+pkg install python311 py311-sqlite3 ffmpeg
+uv sync --no-dev
+cp .env.example .env
+uv run nas-video-check
+uv run nas-video
+```
+
+Open `http://NAS-JAIL-IP:8000`.
+
+The app starts even when RTSP URLs are blank. Fill `.env` with the camera URLs and llama.cpp endpoint before enabling real recording.
+
+## Configuration
+
+Runtime settings live in `.env`.
+
+Important values:
+
+- `RTSP_LOW_URL`: the camera's small stream, for frame sampling and model analysis.
+- `RTSP_HIGH_URL`: the camera's 4K stream, for saved clips.
+- `RTSP_USERNAME` / `RTSP_PASSWORD`: optional shared credentials for both RTSP streams.
+- `NEXTCLOUD_OUTPUT_DIR`: a folder mounted into this jail and exposed to Nextcloud.
+- `LLAMA_BASE_URL`: your llama.cpp jail's OpenAI-compatible base URL, usually ending in `/v1`.
+- `LLAMA_MODEL`: the multimodal model name served by llama.cpp.
+- `RETENTION_HOURS`: how long raw rolling-buffer segments remain on disk.
+- `MAX_MOMENT_SECONDS`: maximum saved clip length after adding before/after context.
+- `ANALYSIS_IMAGE_MODE`: `contact_sheet` by default; use `frames` only when the model is fast enough.
+- `ANALYSIS_FRAME_WIDTH`: width of each sampled frame before it is sent or placed into the contact sheet.
+
+## Camera Stream Advice
+
+Keep the camera's low stream at `640x360` for the first jail test. It matches the 16:9 shape of the 4K stream and preserves enough context for family moments.
+
+For cameras that require authentication, prefer this form:
+
+```env
+RTSP_USERNAME=your-camera-user
+RTSP_PASSWORD=your-camera-password
+RTSP_LOW_URL=rtsp://camera-ip/low-stream
+RTSP_HIGH_URL=rtsp://camera-ip/4k-stream
+```
+
+The app will pass `rtsp://user:password@camera-ip/...` to `ffmpeg` internally, but preflight and the dashboard only show redacted URLs. Direct URLs like `rtsp://user:password@camera-ip/...` still work if your camera vendor documents them that way.
+
+If the password contains spaces, `#`, `&`, or other shell-like characters, quote it in `.env`:
+
+```env
+RTSP_PASSWORD="your#complex&password"
+```
+
+Recommended default for Qwen3-VL-2B in llama.cpp:
+
+```env
+SEGMENT_SECONDS=120
+ANALYSIS_IMAGE_MODE=contact_sheet
+ANALYSIS_FRAME_WIDTH=320
+CONTACT_SHEET_COLUMNS=2
+SAMPLE_FRAME_COUNT=4
+SAMPLE_EVERY_SECONDS=30
+RETENTION_HOURS=168
+```
+
+If analysis still falls behind badly, try the camera low stream at `352x288` and set `ANALYSIS_FRAME_WIDTH=320`. Use `320x240` only after confirming the model can still recognize the important actions.
+
+## Design Notes
+
+- Python runs orchestration, state, UI, and HTTP model calls.
+- Python 3.11 or newer is supported; Python 3.12 is not required.
+- Runtime Python dependencies are intentionally zero; the web server and llama.cpp HTTP client use the Python standard library to avoid Pydantic/Rust builds on FreeBSD.
+- `ffmpeg` does all RTSP recording, segmentation, frame extraction, and clip concatenation.
+- The rolling buffer is stored on disk, not in memory.
+- Analysis is deliberately high-recall: low-confidence but promising moments are saved instead of discarded.
+
+## FreeBSD Service Sketch
+
+See [docs/freebsd-jail.md](docs/freebsd-jail.md) for jail setup, storage layout, and an `rc.d` template.

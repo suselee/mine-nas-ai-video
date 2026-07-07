@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
+
+
+def _bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return int(value)
+
+
+def _float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
+
+def _path(name: str, default: str) -> Path:
+    return Path(os.getenv(name, default)).expanduser()
+
+
+def _parse_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+        if value:
+            value = value.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
+    return value
+
+
+def load_env_file(env_file: str | Path) -> None:
+    path = Path(env_file)
+    if not path.exists():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").strip()
+        if "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if not name or name in os.environ:
+            continue
+        os.environ[name] = _parse_env_value(value)
+
+
+def with_rtsp_credentials(url: str, username: str, password: str) -> str:
+    if not url or not username:
+        return url
+
+    parts = urlsplit(url)
+    if parts.username or parts.password:
+        return url
+
+    userinfo = quote(username, safe="")
+    if password:
+        userinfo = f"{userinfo}:{quote(password, safe='')}"
+    netloc = f"{userinfo}@{parts.netloc}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+@dataclass(frozen=True)
+class Settings:
+    app_host: str
+    app_port: int
+    workers_enabled: bool
+    data_dir: Path
+    buffer_dir: Path
+    output_dir: Path
+    database_path: Path
+    camera_name: str
+    rtsp_username: str
+    rtsp_password: str
+    rtsp_low_url: str
+    rtsp_high_url: str
+    rtsp_transport: str
+    ffmpeg_bin: str
+    ffprobe_bin: str
+    segment_seconds: int
+    segment_stable_seconds: int
+    retention_hours: int
+    analysis_enabled: bool
+    analysis_delay_seconds: int
+    analysis_interval_seconds: int
+    analysis_max_attempts: int
+    analysis_image_mode: str
+    analysis_frame_width: int
+    contact_sheet_columns: int
+    contact_sheet_padding: int
+    sample_frame_count: int
+    sample_every_seconds: int
+    moment_keep_threshold: float
+    context_before_seconds: int
+    context_after_seconds: int
+    max_moment_seconds: int
+    llama_base_url: str
+    llama_api_key: str
+    llama_model: str
+    llama_timeout_seconds: int
+    analysis_prompt: str
+
+    @property
+    def low_buffer_dir(self) -> Path:
+        return self.buffer_dir / self.camera_name / "low"
+
+    @property
+    def high_buffer_dir(self) -> Path:
+        return self.buffer_dir / self.camera_name / "high"
+
+    @property
+    def rtsp_low_url_for_ffmpeg(self) -> str:
+        return with_rtsp_credentials(self.rtsp_low_url, self.rtsp_username, self.rtsp_password)
+
+    @property
+    def rtsp_high_url_for_ffmpeg(self) -> str:
+        return with_rtsp_credentials(self.rtsp_high_url, self.rtsp_username, self.rtsp_password)
+
+
+def load_settings(env_file: str | Path = ".env") -> Settings:
+    load_env_file(env_file)
+
+    return Settings(
+        app_host=os.getenv("APP_HOST", "0.0.0.0"),
+        app_port=_int("APP_PORT", 8000),
+        workers_enabled=_bool("WORKERS_ENABLED", True),
+        data_dir=_path("DATA_DIR", "./var"),
+        buffer_dir=_path("BUFFER_DIR", "./var/buffer"),
+        output_dir=_path("NEXTCLOUD_OUTPUT_DIR", "./var/nextcloud_moments"),
+        database_path=_path("DATABASE_PATH", "./var/app.sqlite3"),
+        camera_name=os.getenv("CAMERA_NAME", "home-camera"),
+        rtsp_username=os.getenv("RTSP_USERNAME", ""),
+        rtsp_password=os.getenv("RTSP_PASSWORD", ""),
+        rtsp_low_url=os.getenv("RTSP_LOW_URL", ""),
+        rtsp_high_url=os.getenv("RTSP_HIGH_URL", ""),
+        rtsp_transport=os.getenv("RTSP_TRANSPORT", "tcp"),
+        ffmpeg_bin=os.getenv("FFMPEG_BIN", "ffmpeg"),
+        ffprobe_bin=os.getenv("FFPROBE_BIN", "ffprobe"),
+        segment_seconds=_int("SEGMENT_SECONDS", 120),
+        segment_stable_seconds=_int("SEGMENT_STABLE_SECONDS", 8),
+        retention_hours=_int("RETENTION_HOURS", 168),
+        analysis_enabled=_bool("ANALYSIS_ENABLED", True),
+        analysis_delay_seconds=_int("ANALYSIS_DELAY_SECONDS", 300),
+        analysis_interval_seconds=_int("ANALYSIS_INTERVAL_SECONDS", 15),
+        analysis_max_attempts=_int("ANALYSIS_MAX_ATTEMPTS", 3),
+        analysis_image_mode=os.getenv("ANALYSIS_IMAGE_MODE", "contact_sheet").strip().lower(),
+        analysis_frame_width=_int("ANALYSIS_FRAME_WIDTH", 320),
+        contact_sheet_columns=_int("CONTACT_SHEET_COLUMNS", 2),
+        contact_sheet_padding=_int("CONTACT_SHEET_PADDING", 8),
+        sample_frame_count=_int("SAMPLE_FRAME_COUNT", 4),
+        sample_every_seconds=_int("SAMPLE_EVERY_SECONDS", 30),
+        moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.25),
+        context_before_seconds=_int("CONTEXT_BEFORE_SECONDS", 5),
+        context_after_seconds=_int("CONTEXT_AFTER_SECONDS", 10),
+        max_moment_seconds=_int("MAX_MOMENT_SECONDS", 45),
+        llama_base_url=os.getenv("LLAMA_BASE_URL", "http://127.0.0.1:8080/v1"),
+        llama_api_key=os.getenv("LLAMA_API_KEY", ""),
+        llama_model=os.getenv("LLAMA_MODEL", "Qwen3-VL-2B-Instruct"),
+        llama_timeout_seconds=_int("LLAMA_TIMEOUT_SECONDS", 120),
+        analysis_prompt=os.getenv(
+            "ANALYSIS_PROMPT",
+            (
+                "Find short, precious indoor moments of my daughter in the living room. "
+                "Look for scenes where she is playing with her grandma, moving around, or interacting clearly. "
+                "Only keep clips where my daughter is visible and the scene is indoors. "
+                "Skip empty rooms, outdoor views, pets-only, blurry frames, and background activity with no child. "
+                "Prefer genuine childhood moments but keep clips concise. "
+                "Return JSON only with keep, title, summary, tags, confidence, start_offset_seconds, and end_offset_seconds."
+            ),
+        ),
+    )
+
+
+def ensure_directories(settings: Settings) -> None:
+    for path in (
+        settings.data_dir,
+        settings.buffer_dir,
+        settings.output_dir,
+        settings.database_path.parent,
+        settings.low_buffer_dir,
+        settings.high_buffer_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,487 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import shutil
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from .config import Settings
+from .database import Database, utc_now_iso
+from .ffmpeg_tools import (
+    build_contact_sheet,
+    build_recorder_command,
+    extract_clip,
+    ffmpeg_available,
+    ffprobe_available,
+    parse_segment_filename,
+    sample_frames,
+    segment_time_window,
+)
+from .llm import AnalysisResult, LlamaAnalyzer
+
+
+def _now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
+    return slug[:64] or "family-moment"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"could not allocate unique path for {path}")
+
+
+def _append_daily_summary(
+    *,
+    day_dir: Path,
+    clip_path: Path,
+    result: AnalysisResult,
+    clip_start: datetime,
+    clip_end: datetime,
+) -> Path:
+    summary_path = day_dir / "summary.md"
+    if not summary_path.exists():
+        summary_path.write_text(
+            f"# Family Moments - {clip_start.strftime('%Y-%m-%d')}\n\n",
+            encoding="utf-8",
+        )
+
+    tags = ", ".join(result.tags) if result.tags else "untagged"
+    entry = (
+        f"## {clip_start.strftime('%H:%M:%S')} - {result.title}\n\n"
+        f"- Clip: [{clip_path.name}]({clip_path.name})\n"
+        f"- Time: {clip_start.isoformat(timespec='seconds')} to {clip_end.isoformat(timespec='seconds')}\n"
+        f"- Confidence: {result.confidence:.2f}\n"
+        f"- Tags: {tags}\n\n"
+        f"{result.summary}\n\n"
+    )
+    with summary_path.open("a", encoding="utf-8") as handle:
+        handle.write(entry)
+    return summary_path
+
+
+class Supervisor:
+    def __init__(self, settings: Settings, database: Database):
+        self.settings = settings
+        self.database = database
+        self.stop_event = asyncio.Event()
+        self.tasks: list[asyncio.Task[None]] = []
+        self.state: dict[str, Any] = {
+            "started_at": utc_now_iso(),
+            "recorders": {
+                "low": {"status": "not-started"},
+                "high": {"status": "not-started"},
+            },
+            "scanner": {"status": "not-started"},
+            "analyzer": {"status": "not-started"},
+            "cleanup": {"status": "not-started"},
+        }
+
+    async def start(self) -> None:
+        if not self.settings.workers_enabled:
+            self.state["workers"] = "disabled"
+            return
+
+        self.tasks.append(asyncio.create_task(self._scan_loop(), name="segment-scanner"))
+        self.tasks.append(asyncio.create_task(self._cleanup_loop(), name="buffer-cleanup"))
+        self.tasks.append(asyncio.create_task(self._analyzer_loop(), name="segment-analyzer"))
+
+        low_rtsp_url = self.settings.rtsp_low_url_for_ffmpeg
+        high_rtsp_url = self.settings.rtsp_high_url_for_ffmpeg
+
+        if low_rtsp_url:
+            self.tasks.append(
+                asyncio.create_task(
+                    self._recorder_loop("low", low_rtsp_url),
+                    name="recorder-low",
+                )
+            )
+        else:
+            self.state["recorders"]["low"] = {"status": "disabled", "reason": "RTSP_LOW_URL is empty"}
+
+        if high_rtsp_url:
+            self.tasks.append(
+                asyncio.create_task(
+                    self._recorder_loop("high", high_rtsp_url),
+                    name="recorder-high",
+                )
+            )
+        else:
+            self.state["recorders"]["high"] = {"status": "disabled", "reason": "RTSP_HIGH_URL is empty"}
+
+    async def stop(self) -> None:
+        self.stop_event.set()
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    def snapshot(self) -> dict[str, Any]:
+        return self.state
+
+    async def _recorder_loop(self, role: str, rtsp_url: str) -> None:
+        while not self.stop_event.is_set():
+            if not ffmpeg_available(self.settings):
+                self.state["recorders"][role] = {
+                    "status": "error",
+                    "message": f"{self.settings.ffmpeg_bin} not found on PATH",
+                    "updated_at": utc_now_iso(),
+                }
+                await asyncio.sleep(30)
+                continue
+
+            command = build_recorder_command(self.settings, role, rtsp_url)
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            self.state["recorders"][role] = {
+                "status": "running",
+                "pid": process.pid,
+                "updated_at": utc_now_iso(),
+            }
+            try:
+                while process.returncode is None and not self.stop_event.is_set():
+                    await asyncio.sleep(1)
+                    if process.returncode is None:
+                        process.returncode
+                if self.stop_event.is_set() and process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                    return
+                return_code = await process.wait()
+                self.state["recorders"][role] = {
+                    "status": "restarting",
+                    "return_code": return_code,
+                    "updated_at": utc_now_iso(),
+                }
+                self.database.add_event("recorder", f"{role} recorder exited with code {return_code}")
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                raise
+
+    async def _scan_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                count = await asyncio.to_thread(self._scan_once)
+                self.state["scanner"] = {
+                    "status": "ok",
+                    "last_scan_at": utc_now_iso(),
+                    "segments_seen": count,
+                }
+            except Exception as exc:
+                self.state["scanner"] = {
+                    "status": "error",
+                    "message": str(exc),
+                    "updated_at": utc_now_iso(),
+                }
+                self.database.add_event("scanner-error", str(exc))
+            await asyncio.sleep(10)
+
+    def _scan_once(self) -> int:
+        now = _now()
+        seen = 0
+        for directory, role in (
+            (self.settings.low_buffer_dir, "low"),
+            (self.settings.high_buffer_dir, "high"),
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            for path in sorted(directory.glob("*.mp4")):
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                file_age = now.timestamp() - stat.st_mtime
+                if file_age < self.settings.segment_stable_seconds:
+                    continue
+
+                parsed = parse_segment_filename(path)
+                if parsed is None:
+                    started_at = datetime.fromtimestamp(stat.st_mtime).astimezone()
+                    camera_name = self.settings.camera_name
+                else:
+                    camera_name, parsed_role, started_at = parsed
+                    if parsed_role != role:
+                        continue
+
+                started, ended = segment_time_window(started_at, self.settings.segment_seconds)
+                self.database.upsert_segment(
+                    camera_name=camera_name,
+                    stream_role=role,
+                    path=path,
+                    started_at=started.isoformat(timespec="seconds"),
+                    ended_at=ended.isoformat(timespec="seconds"),
+                    duration_seconds=self.settings.segment_seconds,
+                    size_bytes=stat.st_size,
+                )
+                seen += 1
+        return seen
+
+    async def _analyzer_loop(self) -> None:
+        analyzer = LlamaAnalyzer(self.settings)
+        while not self.stop_event.is_set():
+            if not self.settings.analysis_enabled:
+                self.state["analyzer"] = {"status": "disabled", "reason": "ANALYSIS_ENABLED=false"}
+                await asyncio.sleep(self.settings.analysis_interval_seconds)
+                continue
+            if not ffmpeg_available(self.settings):
+                self.state["analyzer"] = {
+                    "status": "waiting",
+                    "message": f"{self.settings.ffmpeg_bin} not found on PATH",
+                    "updated_at": utc_now_iso(),
+                }
+                await asyncio.sleep(self.settings.analysis_interval_seconds)
+                continue
+
+            ready_before = (_now() - timedelta(seconds=self.settings.analysis_delay_seconds)).isoformat(
+                timespec="seconds"
+            )
+            segments = self.database.get_pending_low_segments(
+                ready_before=ready_before,
+                max_attempts=self.settings.analysis_max_attempts,
+                limit=1,
+            )
+            if not segments:
+                self.state["analyzer"] = {
+                    "status": "idle",
+                    "updated_at": utc_now_iso(),
+                }
+                await asyncio.sleep(self.settings.analysis_interval_seconds)
+                continue
+
+            segment = segments[0]
+            self.state["analyzer"] = {
+                "status": "analyzing",
+                "segment": segment["path"],
+                "updated_at": utc_now_iso(),
+            }
+            try:
+                result = await self._analyze_segment(analyzer, segment)
+                if result.should_save(self.settings.moment_keep_threshold):
+                    moment_id = await self._save_moment(segment, result)
+                    self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
+                self.database.mark_segment_processed(int(segment["id"]))
+                self.state["analyzer"] = {
+                    "status": "ok",
+                    "last_segment": segment["path"],
+                    "last_keep": result.should_save(self.settings.moment_keep_threshold),
+                    "updated_at": utc_now_iso(),
+                }
+            except Exception as exc:
+                attempt = int(segment["analysis_attempts"]) + 1
+                final = attempt >= self.settings.analysis_max_attempts
+                self.database.record_analysis_error(int(segment["id"]), str(exc), final=final)
+                self.state["analyzer"] = {
+                    "status": "error",
+                    "message": str(exc),
+                    "final": final,
+                    "updated_at": utc_now_iso(),
+                }
+                self.database.add_event("analysis-error", str(exc))
+                await asyncio.sleep(self.settings.analysis_interval_seconds)
+
+    async def _analyze_segment(self, analyzer: LlamaAnalyzer, segment: dict[str, Any]) -> AnalysisResult:
+        with tempfile.TemporaryDirectory(prefix="nas-video-frames-") as temp_dir:
+            duration_seconds = int(segment["duration_seconds"])
+            if self.settings.analysis_image_mode == "frames":
+                image_paths = await sample_frames(
+                    self.settings,
+                    Path(segment["path"]),
+                    Path(temp_dir),
+                    duration_seconds=duration_seconds,
+                )
+            else:
+                image_paths = [
+                    await build_contact_sheet(
+                        self.settings,
+                        Path(segment["path"]),
+                        Path(temp_dir),
+                        duration_seconds=duration_seconds,
+                    )
+                ]
+            return await analyzer.analyze(
+                video_path=Path(segment["path"]),
+                image_paths=image_paths,
+                duration_seconds=duration_seconds,
+            )
+
+    async def _save_moment(self, segment: dict[str, Any], result: AnalysisResult) -> int:
+        source_started = _parse_iso(segment["started_at"])
+        source_ended = _parse_iso(segment["ended_at"])
+
+        wanted_start = source_started + timedelta(
+            seconds=max(0, result.start_offset_seconds - self.settings.context_before_seconds)
+        )
+        wanted_end = source_started + timedelta(
+            seconds=result.end_offset_seconds + self.settings.context_after_seconds
+        )
+        max_end = wanted_start + timedelta(seconds=self.settings.max_moment_seconds)
+        wanted_end = min(wanted_end, max_end)
+
+        high_segments = self.database.find_segments_between(
+            stream_role="high",
+            started_before=wanted_end.isoformat(timespec="seconds"),
+            ended_after=wanted_start.isoformat(timespec="seconds"),
+        )
+        source_rows = [row for row in high_segments if Path(row["path"]).exists()]
+        if source_rows:
+            source_paths = [Path(row["path"]) for row in source_rows]
+            first_started = _parse_iso(source_rows[0]["started_at"])
+            last_ended = _parse_iso(source_rows[-1]["ended_at"])
+        else:
+            source_paths = [Path(segment["path"])]
+            first_started = source_started
+            last_ended = source_ended
+
+        clip_start = max(wanted_start, first_started)
+        clip_end = min(wanted_end, last_ended)
+        if clip_end <= clip_start:
+            clip_start = first_started
+            clip_end = min(last_ended, first_started + timedelta(seconds=self.settings.segment_seconds))
+
+        start_offset_seconds = (clip_start - first_started).total_seconds()
+        duration_seconds = max(1.0, (clip_end - clip_start).total_seconds())
+        if duration_seconds > self.settings.max_moment_seconds:
+            clip_end = clip_start + timedelta(seconds=self.settings.max_moment_seconds)
+            duration_seconds = float(self.settings.max_moment_seconds)
+
+        day_dir = self.settings.output_dir / source_started.strftime("%Y-%m-%d")
+        title_slug = _slugify(result.title)
+        clip_path = _unique_path(day_dir / f"{source_started.strftime('%H%M%S')}_{title_slug}.mp4")
+        metadata_path = clip_path.with_suffix(".json")
+
+        await extract_clip(
+            self.settings,
+            source_paths,
+            clip_path,
+            start_offset_seconds=start_offset_seconds,
+            duration_seconds=duration_seconds,
+        )
+
+        metadata = {
+            "camera_name": segment["camera_name"],
+            "title": result.title,
+            "summary": result.summary,
+            "tags": result.tags,
+            "confidence": result.confidence,
+            "source_low_segment": segment["path"],
+            "source_started_at": source_started.isoformat(timespec="seconds"),
+            "source_ended_at": source_ended.isoformat(timespec="seconds"),
+            "wanted_start": wanted_start.isoformat(timespec="seconds"),
+            "wanted_end": wanted_end.isoformat(timespec="seconds"),
+            "clip_start": clip_start.isoformat(timespec="seconds"),
+            "clip_end": clip_end.isoformat(timespec="seconds"),
+            "clip_duration_seconds": duration_seconds,
+            "source_paths": [str(path) for path in source_paths],
+            "model_raw": result.raw,
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+        daily_summary_path = _append_daily_summary(
+            day_dir=day_dir,
+            clip_path=clip_path,
+            result=result,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+        metadata["daily_summary_path"] = str(daily_summary_path)
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+
+        return self.database.create_moment(
+            camera_name=segment["camera_name"],
+            title=result.title,
+            summary=result.summary,
+            tags=result.tags,
+            confidence=result.confidence,
+            source_low_segment_id=int(segment["id"]),
+            source_started_at=source_started.isoformat(timespec="seconds"),
+            source_ended_at=source_ended.isoformat(timespec="seconds"),
+            clip_path=clip_path,
+            metadata_path=metadata_path,
+        )
+
+    async def _cleanup_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                cutoff = (_now() - timedelta(hours=self.settings.retention_hours)).isoformat(
+                    timespec="seconds"
+                )
+                deleted = await asyncio.to_thread(self._cleanup_once, cutoff)
+                self.state["cleanup"] = {
+                    "status": "ok",
+                    "deleted": deleted,
+                    "updated_at": utc_now_iso(),
+                }
+            except Exception as exc:
+                self.state["cleanup"] = {
+                    "status": "error",
+                    "message": str(exc),
+                    "updated_at": utc_now_iso(),
+                }
+                self.database.add_event("cleanup-error", str(exc))
+            await asyncio.sleep(300)
+
+    def _cleanup_once(self, cutoff_iso: str) -> int:
+        deleted = 0
+        for segment in self.database.expired_segments(cutoff_iso):
+            path = Path(segment["path"])
+            try:
+                path.unlink(missing_ok=True)
+            finally:
+                self.database.mark_segment_deleted(int(segment["id"]))
+                deleted += 1
+        return deleted
+
+
+def health_snapshot(settings: Settings, database: Database, supervisor: Supervisor | None) -> dict[str, Any]:
+    disk = shutil.disk_usage(settings.data_dir)
+    return {
+        "configured": {
+            "low_rtsp": bool(settings.rtsp_low_url),
+            "high_rtsp": bool(settings.rtsp_high_url),
+            "rtsp_credentials": bool(settings.rtsp_username or settings.rtsp_password),
+            "llama_base_url": settings.llama_base_url,
+            "model": settings.llama_model,
+            "analysis_image_mode": settings.analysis_image_mode,
+            "analysis_frame_width": settings.analysis_frame_width,
+            "sample_frame_count": settings.sample_frame_count,
+            "output_dir": str(settings.output_dir),
+            "buffer_dir": str(settings.buffer_dir),
+        },
+        "tools": {
+            "ffmpeg": ffmpeg_available(settings),
+            "ffprobe": ffprobe_available(settings),
+        },
+        "storage": {
+            "total_bytes": disk.total,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+        },
+        "segments": {
+            "pending_low": database.count_pending_segments(),
+            "latest_low": database.latest_segment("low"),
+            "latest_high": database.latest_segment("high"),
+        },
+        "workers": supervisor.snapshot() if supervisor else {"status": "not-started"},
+        "events": database.recent_events(limit=10),
+    }
