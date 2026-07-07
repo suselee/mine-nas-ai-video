@@ -28,6 +28,18 @@ def _now() -> datetime:
     return datetime.now().astimezone()
 
 
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+
+
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
@@ -161,11 +173,8 @@ class Supervisor:
             try:
                 while process.returncode is None and not self.stop_event.is_set():
                     await asyncio.sleep(1)
-                    if process.returncode is None:
-                        process.returncode
                 if self.stop_event.is_set() and process.returncode is None:
-                    process.terminate()
-                    await process.wait()
+                    await _stop_process(process)
                     return
                 return_code = await process.wait()
                 self.state["recorders"][role] = {
@@ -176,9 +185,7 @@ class Supervisor:
                 self.database.add_event("recorder", f"{role} recorder exited with code {return_code}")
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
-                if process.returncode is None:
-                    process.terminate()
-                    await process.wait()
+                await _stop_process(process)
                 raise
 
     async def _scan_loop(self) -> None:

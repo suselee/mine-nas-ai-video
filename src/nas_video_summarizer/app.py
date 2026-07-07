@@ -4,6 +4,7 @@ import asyncio
 import errno
 import json
 import mimetypes
+import signal
 import threading
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -346,10 +347,23 @@ def run() -> None:
     BoundHandler.state = state
     server = ThreadingHTTPServer((state.settings.app_host, state.settings.app_port), BoundHandler)
     print(f"NAS Video Moments running on http://{state.settings.app_host}:{state.settings.app_port}")
+
+    # Daemon(8) forwards SIGTERM to this Python process. Python's default
+    # SIGTERM disposition exits immediately WITHOUT running finally
+    # blocks or letting Supervisor.stop() cancel the recorder tasks, so
+    # spawned ffmpeg children would be orphaned and keep recording.
+    # Install handlers that trigger server.shutdown() so serve_forever
+    # returns and the finally block can run runtime.stop() -> Supervisor
+    # .stop() -> recorder task -> process.terminate() on ffmpeg.
+    def _request_shutdown(_signum: int, _frame: Any) -> None:
+        threading.Thread(target=server.shutdown, name="nas-video-shutdown", daemon=True).start()
+
+    previous_sigterm = signal.signal(signal.SIGTERM, _request_shutdown)
+    previous_sigint = signal.signal(signal.SIGINT, _request_shutdown)
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        pass
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
         server.server_close()
         runtime.stop()
