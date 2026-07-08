@@ -1,4 +1,8 @@
-from nas_video_summarizer.ffmpeg_tools import contact_sheet_layout, sample_offsets
+from nas_video_summarizer.ffmpeg_tools import (
+    _motion_aware_offsets,
+    contact_sheet_layout,
+    sample_offsets,
+)
 
 
 def test_sample_offsets_are_evenly_distributed():
@@ -16,4 +20,41 @@ def test_sample_offsets_respect_minimum_spacing_limit():
 def test_contact_sheet_layout_caps_columns_to_frame_count():
     assert contact_sheet_layout(frame_count=4, preferred_columns=2) == (2, 2)
     assert contact_sheet_layout(frame_count=1, preferred_columns=2) == (1, 1)
+
+
+def test_motion_aware_offsets_keeps_static_baseline():
+    # 120s segment, motion only in seconds 30-60, 6 frames.
+    # At least one sampled offset must land in a static region (0-25 or
+    # 65-120) so a child sitting still outside the motion window is still
+    # captured instead of being dropped.
+    motion_ts = [32.0, 35.0, 40.0, 50.0, 55.0]
+    offsets = _motion_aware_offsets(120, motion_ts, 6, bucket_count=12)
+
+    assert len(offsets) == 6
+    assert any(o < 25 or o > 65 for o in offsets), offsets
+
+
+def test_motion_aware_offsets_prefers_high_motion_buckets():
+    # Motion concentrated in buckets 3 (30-40s) and 4 (40-50s).
+    # Every motion timestamp should become a candidate frame, so the
+    # 30-50s region gets at least 3 frames (one per timestamp), while
+    # pure even sampling over 120s with 6 frames would put only ~1
+    # frame in that region.
+    motion_ts = [35.0, 40.0, 45.0]
+    offsets = _motion_aware_offsets(120, motion_ts, 6, bucket_count=12)
+
+    assert any(30 <= o < 40 for o in offsets), offsets
+    assert any(40 <= o < 50 for o in offsets), offsets
+    motion_region_count = sum(1 for o in offsets if 30 <= o < 50)
+    assert motion_region_count >= len(motion_ts), offsets
+
+
+def test_motion_aware_offsets_all_static_falls_back_to_even():
+    # No motion timestamps at all: still produce frame_count offsets
+    # spread across the segment (every bucket gets 1 frame).
+    offsets = _motion_aware_offsets(120, [], 6, bucket_count=12)
+
+    assert len(offsets) == 6
+    assert offsets[0] > 0
+    assert offsets[-1] < 120
 

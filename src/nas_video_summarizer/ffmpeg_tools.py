@@ -7,6 +7,7 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .config import Settings
 
@@ -81,6 +82,136 @@ def sample_offsets(duration_seconds: int, frame_count: int, minimum_spacing_seco
     return [min(last_offset, max(0.0, step * (index + 1))) for index in range(count)]
 
 
+_SHOWINFO_PTS_RE = re.compile(r"pts_time:\s*([0-9.]+)")
+
+
+async def _detect_motion_timestamps(
+    settings: Settings,
+    video_path: Path,
+    threshold: float,
+) -> list[float]:
+    """Run ffmpeg with scene detection to find timestamps of frames with motion.
+
+    Uses select='gt(scene,THRESH)' + showinfo: ffmpeg decodes the segment
+    (no JPEG output, only lightweight filtering), and prints a showinfo line
+    for each frame whose scene score exceeds the threshold. We parse pts_time
+    from those lines. CPU cost is far below extracting JPEG frames because no
+    image is written to disk.
+    """
+    command = [
+        settings.ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-i",
+        str(video_path),
+        "-an",
+        "-vf",
+        f"select='gt(scene\\,{threshold})',showinfo",
+        "-f",
+        "null",
+        "-",
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    # showinfo writes to stderr; non-zero return code is tolerated because
+    # some segments may be partially written - we just return whatever
+    # timestamps we parsed and let the caller fall back if empty.
+    text = stderr.decode("utf-8", errors="replace")
+    timestamps: list[float] = []
+    for line in text.splitlines():
+        if "showinfo" not in line:
+            continue
+        match = _SHOWINFO_PTS_RE.search(line)
+        if match:
+            timestamps.append(float(match.group(1)))
+    timestamps.sort()
+    return timestamps
+
+
+def _bucket_index(offset: float, bucket_seconds: float) -> int:
+    return int(offset // bucket_seconds)
+
+
+def _motion_aware_offsets(
+    duration_seconds: int,
+    motion_timestamps: list[float],
+    frame_count: int,
+    bucket_count: int = 12,
+) -> list[float]:
+    """Choose frame offsets that cover motion and keep static baselines.
+
+    Treats each motion timestamp as a candidate frame (so a bucket with
+    several motion peaks can yield more than one frame), and fills the
+    remaining budget with static baseline frames spread across buckets
+    that had no motion - so a child sitting still drawing is still
+    captured, but an empty static room gets fewer frames and the LLM
+    can more reliably judge keep=false. With no motion at all this
+    degrades to roughly even sampling across the segment.
+    """
+    if duration_seconds <= 0 or frame_count <= 0:
+        return []
+
+    bucket_count = max(1, min(bucket_count, duration_seconds))
+    bucket_seconds = duration_seconds / bucket_count
+
+    # Motion candidates: unique timestamps clamped into range.
+    motion_candidates: list[float] = []
+    seen = set()
+    for ts in motion_timestamps:
+        clamped = max(0.0, min(ts, duration_seconds - 1))
+        key = round(clamped, 3)
+        if key not in seen:
+            seen.add(key)
+            motion_candidates.append(clamped)
+    motion_candidates.sort()
+
+    # Static candidates: midpoint of each bucket that has no motion.
+    motion_buckets = {_bucket_index(ts, bucket_seconds) for ts in motion_candidates}
+    static_candidates: list[float] = []
+    for i in range(bucket_count):
+        if i not in motion_buckets:
+            static_candidates.append(min((i + 0.5) * bucket_seconds, duration_seconds - 1))
+
+    if len(motion_candidates) >= frame_count:
+        # Plenty of motion: subsample it evenly across the segment so we
+        # don't cluster all frames in one burst of motion.
+        chosen_motion = _even_subsample(motion_candidates, frame_count)
+        offsets = chosen_motion
+    else:
+        # Take all motion candidates, then fill remaining slots with
+        # static baselines spread across the segment.
+        remaining = frame_count - len(motion_candidates)
+        chosen_static = _even_subsample(static_candidates, remaining)
+        offsets = sorted(motion_candidates + chosen_static)
+
+    # Dedupe + top up if rounding shrank the list below frame_count.
+    offsets = sorted(set(offsets))
+    if len(offsets) < frame_count:
+        even = sample_offsets(duration_seconds, frame_count, 1)
+        for o in even:
+            if o not in offsets:
+                offsets.append(o)
+                if len(offsets) >= frame_count:
+                    break
+        offsets = sorted(offsets)
+    return offsets[:frame_count]
+
+
+def _even_subsample(candidates: list[float], count: int) -> list[float]:
+    """Pick `count` items from `candidates` spread evenly by index."""
+    if count <= 0 or not candidates:
+        return []
+    if count >= len(candidates):
+        return list(candidates)
+    step = len(candidates) / count
+    return [candidates[int(step * i)] for i in range(count)]
+
+
 def contact_sheet_layout(frame_count: int, preferred_columns: int) -> tuple[int, int]:
     if frame_count <= 0:
         return 0, 0
@@ -149,11 +280,32 @@ async def sample_frames(
     duration_seconds: int,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    offsets = sample_offsets(
-        duration_seconds,
-        settings.sample_frame_count,
-        settings.sample_every_seconds,
-    )
+    if settings.sample_mode == "motion_aware":
+        try:
+            motion_ts = await _detect_motion_timestamps(
+                settings,
+                video_path,
+                settings.motion_threshold,
+            )
+            offsets = _motion_aware_offsets(
+                duration_seconds,
+                motion_ts,
+                settings.sample_frame_count,
+            )
+        except Exception:
+            # Corrupt segment or ffmpeg hiccup: fall back to even sampling
+            # so the segment is still analyzed rather than skipped.
+            offsets = sample_offsets(
+                duration_seconds,
+                settings.sample_frame_count,
+                settings.sample_every_seconds,
+            )
+    else:
+        offsets = sample_offsets(
+            duration_seconds,
+            settings.sample_frame_count,
+            settings.sample_every_seconds,
+        )
     frame_paths: list[Path] = []
     for index, offset in enumerate(offsets, start=1):
         frame_path = output_dir / f"frame_{index:03d}.jpg"

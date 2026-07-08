@@ -105,6 +105,8 @@ class Settings:
     contact_sheet_padding: int
     sample_frame_count: int
     sample_every_seconds: int
+    sample_mode: str
+    motion_threshold: float
     moment_keep_threshold: float
     context_before_seconds: int
     context_after_seconds: int
@@ -166,8 +168,10 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         analysis_frame_width=_int("ANALYSIS_FRAME_WIDTH", 320),
         contact_sheet_columns=_int("CONTACT_SHEET_COLUMNS", 2),
         contact_sheet_padding=_int("CONTACT_SHEET_PADDING", 8),
-        sample_frame_count=_int("SAMPLE_FRAME_COUNT", 4),
+        sample_frame_count=_int("SAMPLE_FRAME_COUNT", 6),
         sample_every_seconds=_int("SAMPLE_EVERY_SECONDS", 30),
+        sample_mode=os.getenv("SAMPLE_MODE", "even").strip().lower(),
+        motion_threshold=_float("MOTION_THRESHOLD", 0.02),
         moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.55),
         context_before_seconds=_int("CONTEXT_BEFORE_SECONDS", 5),
         context_after_seconds=_int("CONTEXT_AFTER_SECONDS", 10),
