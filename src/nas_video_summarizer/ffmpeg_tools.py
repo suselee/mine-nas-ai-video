@@ -92,11 +92,11 @@ async def _detect_motion_timestamps(
 ) -> list[float]:
     """Run ffmpeg with scene detection to find timestamps of frames with motion.
 
-    Uses select='gt(scene,THRESH)' + showinfo: ffmpeg decodes the segment
-    (no JPEG output, only lightweight filtering), and prints a showinfo line
-    for each frame whose scene score exceeds the threshold. We parse pts_time
-    from those lines. CPU cost is far below extracting JPEG frames because no
-    image is written to disk.
+    Uses scale=160:-2,fps=1 before select to minimize CPU on 4K HEVC sources:
+    the decode still happens at full resolution, but the scene-detection filter
+    chain operates on tiny 160px frames at 1fps instead of full-res 30fps,
+    which dramatically cuts filter overhead. Scene detection at 160px/1fps is
+    sufficient for detecting a person walking in a room. No JPEG is written.
     """
     command = [
         settings.ffmpeg_bin,
@@ -107,7 +107,7 @@ async def _detect_motion_timestamps(
         str(video_path),
         "-an",
         "-vf",
-        f"select='gt(scene\\,{threshold})',showinfo",
+        f"scale=160:-2,fps=1,select='gt(scene\\,{threshold})',showinfo",
         "-f",
         "null",
         "-",
