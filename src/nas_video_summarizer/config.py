@@ -168,7 +168,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         contact_sheet_padding=_int("CONTACT_SHEET_PADDING", 8),
         sample_frame_count=_int("SAMPLE_FRAME_COUNT", 4),
         sample_every_seconds=_int("SAMPLE_EVERY_SECONDS", 30),
-        moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.25),
+        moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.55),
         context_before_seconds=_int("CONTEXT_BEFORE_SECONDS", 5),
         context_after_seconds=_int("CONTEXT_AFTER_SECONDS", 10),
         max_moment_seconds=_int("MAX_MOMENT_SECONDS", 45),
@@ -187,12 +187,15 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
                 "There are three family members at home: my daughter (a young girl), her mom "
                 "(a young adult woman, NOT the grandma), and her grandma (an older woman) - "
                 "these are three distinct people, do not confuse mom with grandma. "
-                "Look for scenes where my daughter is visible and active: playing with her mom, "
-                "playing with her grandma, moving around, or interacting clearly with someone. "
-                "Only keep clips where my daughter is visible and the scene is indoors. "
-                "Skip empty rooms, outdoor views, pets-only, blurry frames, and background activity with no child. "
-                "When describing the scene, name the family members correctly: daughter, mom, or grandma. "
-                "Prefer genuine childhood moments but keep clips concise. "
+                "ONLY keep clips where my daughter is BOTH visible AND moving or actively "
+                "interacting with her mom or her grandma. A frame that is empty, static, or "
+                "shows only furniture/toys/a quiet room with no child is keep=false, no matter "
+                "how warm the scene looks - do not infer a child off-screen. If you cannot see "
+                "my daughter clearly in a frame, that frame is keep=false. "
+                "Skip empty rooms, static rooms, outdoor views, pets-only, blurry frames, and "
+                "background activity with no child. "
+                "When describing the scene, name the family members correctly: daughter, mom, "
+                "or grandma. Keep clips concise. "
                 "Return JSON only with keep, title, summary, tags, confidence, start_offset_seconds, and end_offset_seconds."
             ),
         ),

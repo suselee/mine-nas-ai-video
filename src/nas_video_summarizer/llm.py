@@ -24,7 +24,12 @@ class AnalysisResult:
     raw: dict[str, Any]
 
     def should_save(self, threshold: float) -> bool:
-        return self.keep or self.confidence >= threshold
+        # The model returns both keep (boolean intent) and confidence
+        # (0..1). Both are required: a low-confidence "keep=true" from a
+        # 2B vision model on a low-res contact sheet is unreliable - it
+        # tends to see toys/furniture and assume a child is present. An
+        # AND gate makes the threshold filter out those weak guesses.
+        return self.keep and self.confidence >= threshold
 
 
 def _image_content(path: Path) -> dict[str, Any]:
@@ -132,10 +137,14 @@ class LlamaAnalyzer:
             "- end_offset_seconds: integer offset inside the segment\n\n"
             "Tighten start_offset_seconds and end_offset_seconds around the actual highlight; "
             "do not span the whole segment unless every frame is a genuine moment.\n\n"
+            "Be strict about keep=false: an empty or quiet room with no child visible is "
+            "keep=false regardless of furniture, toys, lighting, or audio. If you are unsure "
+            "whether my daughter is visible and active, set keep=false and confidence below 0.5. "
+            "Only set keep=true when you can clearly identify my daughter in motion or in a "
+            "genuine interaction.\n\n"
             f"Segment file: {video_path.name}\n"
             f"Segment duration seconds: {duration_seconds}\n"
-            f"Number of provided images: {len(image_paths)}\n"
-            "Save ordinary but warm childhood moments when unsure."
+            f"Number of provided images: {len(image_paths)}"
         )
 
         user_content: list[dict[str, Any]] = [{"type": "text", "text": instructions}]
