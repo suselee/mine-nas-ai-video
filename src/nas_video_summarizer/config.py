@@ -92,6 +92,7 @@ class Settings:
     rtsp_transport: str
     ffmpeg_bin: str
     ffprobe_bin: str
+    ffmpeg_hwaccel: str
     segment_seconds: int
     segment_stable_seconds: int
     retention_hours: int
@@ -160,6 +161,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         rtsp_transport=os.getenv("RTSP_TRANSPORT", "tcp"),
         ffmpeg_bin=os.getenv("FFMPEG_BIN", "ffmpeg"),
         ffprobe_bin=os.getenv("FFPROBE_BIN", "ffprobe"),
+        ffmpeg_hwaccel=os.getenv("FFMPEG_HWACCEL", "").strip().lower(),
         segment_seconds=_int("SEGMENT_SECONDS", 120),
         segment_stable_seconds=_int("SEGMENT_STABLE_SECONDS", 8),
         retention_hours=_int("RETENTION_HOURS", 168),

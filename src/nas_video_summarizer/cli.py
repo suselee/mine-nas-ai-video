@@ -63,6 +63,12 @@ def build_checks(settings: Settings) -> list[Check]:
             settings.ffprobe_bin,
         ),
         Check(
+            "ffmpeg hwaccel",
+            not settings.ffmpeg_hwaccel or settings.ffmpeg_hwaccel in ("vaapi", "auto", "none"),
+            settings.ffmpeg_hwaccel or "disabled (software decode)",
+            required=False,
+        ),
+        Check(
             "low RTSP stream",
             bool(settings.rtsp_low_url),
             _redact_url(settings.rtsp_low_url_for_ffmpeg) or "RTSP_LOW_URL is empty",

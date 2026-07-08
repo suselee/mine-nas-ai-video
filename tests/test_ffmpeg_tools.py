@@ -1,8 +1,10 @@
 from nas_video_summarizer.ffmpeg_tools import (
+    _hwaccel_args,
     _motion_aware_offsets,
     contact_sheet_layout,
     sample_offsets,
 )
+from nas_video_summarizer.config import Settings, load_settings
 
 
 def test_sample_offsets_are_evenly_distributed():
@@ -57,4 +59,22 @@ def test_motion_aware_offsets_all_static_falls_back_to_even():
     assert len(offsets) == 6
     assert offsets[0] > 0
     assert offsets[-1] < 120
+
+
+def _settings_with_hwaccel(hwaccel: str) -> Settings:
+    import os
+    os.environ["FFMPEG_HWACCEL"] = hwaccel
+    return load_settings("/nonexistent.env")
+
+
+def test_hwaccel_args_empty_when_disabled():
+    settings = _settings_with_hwaccel("")
+    assert _hwaccel_args(settings) == []
+
+
+def test_hwaccel_args_vaapi():
+    import os
+    os.environ["FFMPEG_HWACCEL"] = "vaapi"
+    settings = load_settings("/nonexistent.env")
+    assert _hwaccel_args(settings) == ["-hwaccel", "vaapi"]
 

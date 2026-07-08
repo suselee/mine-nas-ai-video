@@ -15,6 +15,24 @@ from .config import Settings
 SEGMENT_RE = re.compile(r"^(?P<camera>.+)_(?P<role>low|high)_(?P<stamp>\d{8}T\d{6})\.mp4$")
 
 
+def _hwaccel_args(settings: Settings) -> list[str]:
+    """Return ffmpeg input-level hwaccel flags, or empty list if disabled.
+
+    With FFMPEG_HWACCEL=vaapi the flags -hwaccel vaapi are prepended
+    before -i so the HEVC decode runs on the Intel GPU. Frames are
+    copied back to system memory for software filters (scale, select,
+    showinfo), which keeps all existing filters working without needing
+    VAAPI-specific filter chains. Set FFMPEG_HWACCEL to empty (default)
+    for pure software decoding.
+    """
+    accel = settings.ffmpeg_hwaccel
+    if not accel or accel == "none" or accel == "auto":
+        if accel == "auto":
+            return ["-hwaccel", "auto"]
+        return []
+    return ["-hwaccel", accel]
+
+
 def ffmpeg_available(settings: Settings) -> bool:
     return shutil.which(settings.ffmpeg_bin) is not None
 
@@ -103,6 +121,7 @@ async def _detect_motion_timestamps(
         "-hide_banner",
         "-loglevel",
         "info",
+        *_hwaccel_args(settings),
         "-i",
         str(video_path),
         "-an",
@@ -257,6 +276,7 @@ async def _extract_frame(settings: Settings, video_path: Path, output_path: Path
         "-loglevel",
         "error",
         "-y",
+        *_hwaccel_args(settings),
         "-ss",
         f"{offset_seconds:.3f}",
         "-i",
@@ -457,10 +477,13 @@ async def extract_clip(
         # re-encoding, use output seeking (decode from 0, trim with -ss
         # after -i) so the encoder starts on a clean keyframe and the
         # output has correct timestamps for player compatibility.
+        # hwaccel only helps when decoding (re-encode path); -c copy
+        # never decodes so it's omitted there.
         if not reencoding_video and not reencoding_audio:
             command += ["-ss", f"{max(start_offset_seconds, 0):.3f}"]
             command += ["-i", str(input_path), "-t", f"{duration_seconds:.3f}"]
         else:
+            command += _hwaccel_args(settings)
             command += ["-i", str(input_path)]
             command += [
                 "-ss",
