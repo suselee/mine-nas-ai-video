@@ -125,9 +125,10 @@ class Database:
             row = conn.execute("SELECT id FROM segments WHERE path = ?", (str(path),)).fetchone()
             return int(row["id"])
 
-    def get_pending_low_segments(
+    def get_pending_segments(
         self,
         *,
+        stream_role: str,
         ready_before: str,
         max_attempts: int,
         limit: int,
@@ -137,7 +138,7 @@ class Database:
                 """
                 SELECT *
                 FROM segments
-                WHERE stream_role = 'low'
+                WHERE stream_role = ?
                   AND deleted_at IS NULL
                   AND processed_at IS NULL
                   AND analysis_attempts < ?
@@ -145,9 +146,23 @@ class Database:
                 ORDER BY started_at ASC
                 LIMIT ?
                 """,
-                (max_attempts, ready_before, limit),
+                (stream_role, max_attempts, ready_before, limit),
             ).fetchall()
             return [row_to_dict(row) for row in rows]
+
+    def get_pending_low_segments(
+        self,
+        *,
+        ready_before: str,
+        max_attempts: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return self.get_pending_segments(
+            stream_role="low",
+            ready_before=ready_before,
+            max_attempts=max_attempts,
+            limit=limit,
+        )
 
     def mark_segment_processed(self, segment_id: int) -> None:
         with self.connect() as conn:
@@ -273,16 +288,17 @@ class Database:
         with self.connect() as conn:
             conn.execute("DELETE FROM moments WHERE id = ?", (moment_id,))
 
-    def count_pending_segments(self) -> int:
+    def count_pending_segments(self, *, stream_role: str = "low") -> int:
         with self.connect() as conn:
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS count
                 FROM segments
-                WHERE stream_role = 'low'
+                WHERE stream_role = ?
                   AND deleted_at IS NULL
                   AND processed_at IS NULL
-                """
+                """,
+                (stream_role,),
             ).fetchone()
             return int(row["count"])
 

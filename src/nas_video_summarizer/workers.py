@@ -40,6 +40,30 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
+def _in_analysis_window(now: datetime, start: str, end: str) -> bool:
+    """Check whether `now` falls inside the [start, end) time window.
+
+    start/end are "HH:MM" strings. If either is empty, the window is
+    disabled and the function returns True (analyze all day). Handles
+    windows that cross midnight (e.g. 21:15 -> 06:00).
+    """
+    if not start or not end:
+        return True
+
+    def _to_minutes(value: str) -> int:
+        parts = value.split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+
+    now_min = now.hour * 60 + now.minute
+    start_min = _to_minutes(start)
+    end_min = _to_minutes(end)
+
+    if start_min <= end_min:
+        return start_min <= now_min < end_min
+    # Crosses midnight: e.g. 21:15 -> 06:00.
+    return now_min >= start_min or now_min < end_min
+
+
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
@@ -252,6 +276,19 @@ class Supervisor:
                 self.state["analyzer"] = {"status": "disabled", "reason": "ANALYSIS_ENABLED=false"}
                 await asyncio.sleep(self.settings.analysis_interval_seconds)
                 continue
+            if not _in_analysis_window(
+                _now(),
+                self.settings.analysis_window_start,
+                self.settings.analysis_window_end,
+            ):
+                self.state["analyzer"] = {
+                    "status": "waiting_for_window",
+                    "window_start": self.settings.analysis_window_start,
+                    "window_end": self.settings.analysis_window_end,
+                    "updated_at": utc_now_iso(),
+                }
+                await asyncio.sleep(60)
+                continue
             if not ffmpeg_available(self.settings):
                 self.state["analyzer"] = {
                     "status": "waiting",
@@ -264,7 +301,8 @@ class Supervisor:
             ready_before = (_now() - timedelta(seconds=self.settings.analysis_delay_seconds)).isoformat(
                 timespec="seconds"
             )
-            segments = self.database.get_pending_low_segments(
+            segments = self.database.get_pending_segments(
+                stream_role=self.settings.analysis_stream_role,
                 ready_before=ready_before,
                 max_attempts=self.settings.analysis_max_attempts,
                 limit=1,
@@ -346,20 +384,27 @@ class Supervisor:
         max_end = wanted_start + timedelta(seconds=self.settings.max_moment_seconds)
         wanted_end = min(wanted_end, max_end)
 
-        high_segments = self.database.find_segments_between(
-            stream_role="high",
-            started_before=wanted_end.isoformat(timespec="seconds"),
-            ended_after=wanted_start.isoformat(timespec="seconds"),
-        )
-        source_rows = [row for row in high_segments if Path(row["path"]).exists()]
-        if source_rows:
-            source_paths = [Path(row["path"]) for row in source_rows]
-            first_started = _parse_iso(source_rows[0]["started_at"])
-            last_ended = _parse_iso(source_rows[-1]["ended_at"])
-        else:
+        if self.settings.analysis_stream_role == "high":
+            # Analyzing the high stream directly: the segment itself is
+            # the 4K source - no need to cross-reference another stream.
             source_paths = [Path(segment["path"])]
             first_started = source_started
             last_ended = source_ended
+        else:
+            high_segments = self.database.find_segments_between(
+                stream_role="high",
+                started_before=wanted_end.isoformat(timespec="seconds"),
+                ended_after=wanted_start.isoformat(timespec="seconds"),
+            )
+            source_rows = [row for row in high_segments if Path(row["path"]).exists()]
+            if source_rows:
+                source_paths = [Path(row["path"]) for row in source_rows]
+                first_started = _parse_iso(source_rows[0]["started_at"])
+                last_ended = _parse_iso(source_rows[-1]["ended_at"])
+            else:
+                source_paths = [Path(segment["path"])]
+                first_started = source_started
+                last_ended = source_ended
 
         clip_start = max(wanted_start, first_started)
         clip_end = min(wanted_end, last_ended)
@@ -472,6 +517,9 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "analysis_image_mode": settings.analysis_image_mode,
             "analysis_frame_width": settings.analysis_frame_width,
             "sample_frame_count": settings.sample_frame_count,
+            "analysis_stream_role": settings.analysis_stream_role,
+            "analysis_window_start": settings.analysis_window_start,
+            "analysis_window_end": settings.analysis_window_end,
             "output_dir": str(settings.output_dir),
             "buffer_dir": str(settings.buffer_dir),
         },
@@ -485,7 +533,8 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "free_bytes": disk.free,
         },
         "segments": {
-            "pending_low": database.count_pending_segments(),
+            "pending_low": database.count_pending_segments(stream_role="low"),
+            "pending_high": database.count_pending_segments(stream_role="high"),
             "latest_low": database.latest_segment("low"),
             "latest_high": database.latest_segment("high"),
         },

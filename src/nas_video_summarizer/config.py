@@ -99,6 +99,9 @@ class Settings:
     analysis_delay_seconds: int
     analysis_interval_seconds: int
     analysis_max_attempts: int
+    analysis_stream_role: str
+    analysis_window_start: str
+    analysis_window_end: str
     analysis_image_mode: str
     analysis_frame_width: int
     contact_sheet_columns: int
@@ -164,6 +167,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         analysis_delay_seconds=_int("ANALYSIS_DELAY_SECONDS", 300),
         analysis_interval_seconds=_int("ANALYSIS_INTERVAL_SECONDS", 15),
         analysis_max_attempts=_int("ANALYSIS_MAX_ATTEMPTS", 3),
+        analysis_stream_role=os.getenv("ANALYSIS_STREAM_ROLE", "low").strip().lower(),
+        analysis_window_start=os.getenv("ANALYSIS_WINDOW_START", "").strip(),
+        analysis_window_end=os.getenv("ANALYSIS_WINDOW_END", "").strip(),
         analysis_image_mode=os.getenv("ANALYSIS_IMAGE_MODE", "contact_sheet").strip().lower(),
         analysis_frame_width=_int("ANALYSIS_FRAME_WIDTH", 320),
         contact_sheet_columns=_int("CONTACT_SHEET_COLUMNS", 2),
@@ -191,11 +197,22 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
                 "There are three family members at home: my daughter (a young girl), her mom "
                 "(a young adult woman, NOT the grandma), and her grandma (an older woman) - "
                 "these are three distinct people, do not confuse mom with grandma. "
-                "ONLY keep clips where my daughter is BOTH visible AND moving or actively "
-                "interacting with her mom or her grandma. A frame that is empty, static, or "
-                "shows only furniture/toys/a quiet room with no child is keep=false, no matter "
-                "how warm the scene looks - do not infer a child off-screen. If you cannot see "
-                "my daughter clearly in a frame, that frame is keep=false. "
+                "ONLY keep clips where my daughter is ACTIVELY doing something with energy: "
+                "playing, crawling, walking, running, laughing, talking, dancing, exploring, "
+                "or visibly responding to play. Passive presence of my daughter is not enough - "
+                "she must be the active, energetic subject of the moment. "
+                "EXCLUDE these low-value scenes even if my daughter is visible - they are NOT "
+                "worth saving: "
+                "child being held/carried/rocked to sleep (passive, sleepy); "
+                "child sleeping or drowsy; "
+                "child being fed passively (bottle/spoon, no play); "
+                "child sitting alone doing nothing (blank, idle, staring); "
+                "child watching a screen (TV/iPad/phone, passive consumption); "
+                "adult doing chores while child is merely present but not playing; "
+                "child crying or tantrum without playful context. "
+                "A frame that is empty, static, or shows only furniture/toys/a quiet room with "
+                "no child is keep=false - do not infer a child off-screen. If you cannot see my "
+                "daughter clearly in a frame, that frame is keep=false. "
                 "Skip empty rooms, static rooms, outdoor views, pets-only, blurry frames, and "
                 "background activity with no child. "
                 "When describing the scene, name the family members correctly: daughter, mom, "

@@ -36,6 +36,9 @@ def test_load_settings_from_env_file(tmp_path):
     assert settings.analysis_frame_width == 320
     assert settings.contact_sheet_columns == 2
     assert settings.max_moment_seconds == 180
+    assert settings.analysis_stream_role == "low"
+    assert settings.analysis_window_start == ""
+    assert settings.analysis_window_end == ""
 
 
 def test_with_rtsp_credentials_does_not_override_embedded_credentials():
