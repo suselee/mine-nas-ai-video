@@ -113,6 +113,7 @@ class Settings:
     sample_mode: str
     motion_threshold: float
     moment_keep_threshold: float
+    moment_cooldown_seconds: int
     context_before_seconds: int
     context_after_seconds: int
     max_moment_seconds: int
@@ -183,6 +184,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         sample_mode=os.getenv("SAMPLE_MODE", "even").strip().lower(),
         motion_threshold=_float("MOTION_THRESHOLD", 0.02),
         moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.55),
+        moment_cooldown_seconds=_int("MOMENT_COOLDOWN_SECONDS", 0),
         context_before_seconds=_int("CONTEXT_BEFORE_SECONDS", 5),
         context_after_seconds=_int("CONTEXT_AFTER_SECONDS", 10),
         max_moment_seconds=_int("MAX_MOMENT_SECONDS", 45),

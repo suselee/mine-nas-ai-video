@@ -215,3 +215,45 @@ class LlamaAnalyzer:
             end_offset_seconds=end_offset,
             raw=data,
         )
+
+    async def verify_daughter_visible(self, frame_path: Path) -> bool:
+        """Quick yes/no check: does the frame clearly show the daughter?"""
+        endpoint = self.settings.llama_base_url.rstrip("/") + "/chat/completions"
+        instructions = (
+            "You are verifying a saved family video frame. Look carefully. "
+            "Is there a young girl (my daughter) clearly visible in this frame? "
+            "Answer JSON only with has_daughter (boolean) and confidence (0 to 1). "
+            "Only set has_daughter=true if you can clearly see a young girl. "
+            "Shadows, furniture, toys, or vague shapes do not count."
+        )
+        user_content: list[dict[str, Any]] = [
+            {"type": "text", "text": instructions},
+            _image_content(frame_path),
+        ]
+        headers = {"Content-Type": "application/json"}
+        if self.settings.llama_api_key:
+            headers["Authorization"] = f"Bearer {self.settings.llama_api_key}"
+        payload = {
+            "model": self.settings.llama_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a strict visual verifier. Return JSON only.",
+                },
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+        }
+        body = await asyncio.to_thread(
+            _post_json,
+            endpoint,
+            headers,
+            payload,
+            self.settings.llama_timeout_seconds,
+        )
+        content = body["choices"][0]["message"]["content"]
+        data = _extract_json(_extract_message_text(content))
+        has_daughter = _coerce_bool(data.get("has_daughter"))
+        confidence = max(0.0, min(_coerce_float(data.get("confidence"), 0.0), 1.0))
+        return has_daughter and confidence >= 0.7

@@ -12,6 +12,7 @@ from typing import Any
 from .config import Settings
 from .database import Database, utc_now_iso
 from .ffmpeg_tools import (
+    _extract_frame,
     build_contact_sheet,
     build_recorder_command,
     extract_clip,
@@ -120,6 +121,7 @@ class Supervisor:
         self.database = database
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
+        self._last_moment_saved_at: datetime | None = None
         self.state: dict[str, Any] = {
             "started_at": utc_now_iso(),
             "recorders": {
@@ -269,6 +271,13 @@ class Supervisor:
                 seen += 1
         return seen
 
+    def _moment_cooldown_active(self) -> bool:
+        if self.settings.moment_cooldown_seconds <= 0:
+            return False
+        if self._last_moment_saved_at is None:
+            return False
+        return (_now() - self._last_moment_saved_at).total_seconds() < self.settings.moment_cooldown_seconds
+
     async def _analyzer_loop(self) -> None:
         analyzer = LlamaAnalyzer(self.settings)
         while not self.stop_event.is_set():
@@ -324,8 +333,15 @@ class Supervisor:
             try:
                 result = await self._analyze_segment(analyzer, segment)
                 if result.should_save(self.settings.moment_keep_threshold):
-                    moment_id = await self._save_moment(segment, result)
-                    self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
+                    if self._moment_cooldown_active():
+                        self.database.add_event(
+                            "moment-cooldown",
+                            f"skipped '{result.title}' due to cooldown",
+                        )
+                    else:
+                        moment_id = await self._save_moment(segment, result, analyzer)
+                        if moment_id >= 0:
+                            self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
                 self.database.mark_segment_processed(int(segment["id"]))
                 self.state["analyzer"] = {
                     "status": "ok",
@@ -374,7 +390,12 @@ class Supervisor:
                 duration_seconds=duration_seconds,
             )
 
-    async def _save_moment(self, segment: dict[str, Any], result: AnalysisResult) -> int:
+    async def _save_moment(
+        self,
+        segment: dict[str, Any],
+        result: AnalysisResult,
+        analyzer: LlamaAnalyzer,
+    ) -> int:
         source_started = _parse_iso(segment["started_at"])
         source_ended = _parse_iso(segment["ended_at"])
 
@@ -443,6 +464,17 @@ class Supervisor:
             duration_seconds=duration_seconds,
         )
 
+        # Post-save verification: confirm the clip actually contains the daughter.
+        # This catches LLM hallucinations where keep=true but the clip is empty.
+        verified = await self._verify_saved_clip(analyzer, clip_path, duration_seconds)
+        if not verified:
+            clip_path.unlink(missing_ok=True)
+            self.database.add_event(
+                "moment-verify-failed",
+                f"deleted false positive clip: {result.title}",
+            )
+            return -1
+
         metadata = {
             "camera_name": segment["camera_name"],
             "title": result.title,
@@ -471,6 +503,8 @@ class Supervisor:
         metadata["daily_summary_path"] = str(daily_summary_path)
         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
 
+        self._last_moment_saved_at = _now()
+
         return self.database.create_moment(
             camera_name=segment["camera_name"],
             title=result.title,
@@ -483,6 +517,26 @@ class Supervisor:
             clip_path=clip_path,
             metadata_path=metadata_path,
         )
+
+    async def _verify_saved_clip(
+        self,
+        analyzer: LlamaAnalyzer,
+        clip_path: Path,
+        duration_seconds: float,
+    ) -> bool:
+        """Extract a frame from the saved clip and verify it contains the daughter."""
+        try:
+            with tempfile.TemporaryDirectory(prefix="nas-video-verify-") as temp_dir:
+                frame_path = Path(temp_dir) / "verify.jpg"
+                middle_offset = max(0.0, duration_seconds / 2 - 1.0)
+                await _extract_frame(self.settings, clip_path, frame_path, middle_offset)
+                if not frame_path.exists():
+                    return False
+                return await analyzer.verify_daughter_visible(frame_path)
+        except Exception as exc:
+            self.database.add_event("verify-error", str(exc))
+            # If verification itself fails, be conservative and keep the clip.
+            return True
 
     async def _cleanup_loop(self) -> None:
         while not self.stop_event.is_set():
