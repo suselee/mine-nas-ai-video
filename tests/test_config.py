@@ -40,6 +40,7 @@ def test_load_settings_from_env_file(tmp_path):
     assert settings.analysis_window_start == ""
     assert settings.analysis_window_end == ""
     assert settings.ffmpeg_hwaccel == ""
+    assert settings.analysis_cooldown_seconds == 5
 
 
 def test_with_rtsp_credentials_does_not_override_embedded_credentials():

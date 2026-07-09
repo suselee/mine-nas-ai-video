@@ -345,6 +345,9 @@ class Supervisor:
                 }
                 self.database.add_event("analysis-error", str(exc))
                 await asyncio.sleep(self.settings.analysis_interval_seconds)
+            finally:
+                if self.settings.analysis_cooldown_seconds > 0:
+                    await asyncio.sleep(self.settings.analysis_cooldown_seconds)
 
     async def _analyze_segment(self, analyzer: LlamaAnalyzer, segment: dict[str, Any]) -> AnalysisResult:
         with tempfile.TemporaryDirectory(prefix="nas-video-frames-") as temp_dir:

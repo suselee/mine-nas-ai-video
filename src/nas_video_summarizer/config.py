@@ -100,6 +100,7 @@ class Settings:
     analysis_delay_seconds: int
     analysis_interval_seconds: int
     analysis_max_attempts: int
+    analysis_cooldown_seconds: int
     analysis_stream_role: str
     analysis_window_start: str
     analysis_window_end: str
@@ -169,6 +170,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         analysis_delay_seconds=_int("ANALYSIS_DELAY_SECONDS", 300),
         analysis_interval_seconds=_int("ANALYSIS_INTERVAL_SECONDS", 15),
         analysis_max_attempts=_int("ANALYSIS_MAX_ATTEMPTS", 3),
+        analysis_cooldown_seconds=_int("ANALYSIS_COOLDOWN_SECONDS", 5),
         analysis_stream_role=os.getenv("ANALYSIS_STREAM_ROLE", "low").strip().lower(),
         analysis_window_start=os.getenv("ANALYSIS_WINDOW_START", "").strip(),
         analysis_window_end=os.getenv("ANALYSIS_WINDOW_END", "").strip(),
