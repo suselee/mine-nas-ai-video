@@ -96,6 +96,18 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
+def _estimated_offsets(duration_seconds: int, count: int) -> list[float]:
+    if duration_seconds <= 0 or count <= 0:
+        return []
+    return [i * duration_seconds / (count + 1) for i in range(1, count + 1)]
+
+
+def _format_seconds(value: float) -> str:
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
 def _post_json(endpoint: str, headers: dict[str, str], payload: dict[str, Any], timeout: int) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     req = request.Request(endpoint, data=body, headers=headers, method="POST")
@@ -113,7 +125,14 @@ class LlamaAnalyzer:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    async def analyze(self, *, video_path: Path, image_paths: list[Path], duration_seconds: int) -> AnalysisResult:
+    async def analyze(
+        self,
+        *,
+        video_path: Path,
+        image_paths: list[Path],
+        duration_seconds: int,
+        frame_offsets_seconds: list[float] | None = None,
+    ) -> AnalysisResult:
         if not image_paths:
             raise ValueError("no sampled images available for analysis")
 
@@ -124,10 +143,15 @@ class LlamaAnalyzer:
             if self.settings.analysis_image_mode == "contact_sheet"
             else "The images are sampled video frames in chronological order."
         )
-        frame_count = len(image_paths)
+        annotation_offsets = (
+            frame_offsets_seconds
+            if frame_offsets_seconds
+            else _estimated_offsets(duration_seconds, len(image_paths))
+        )
+        annotation_label = "cell" if self.settings.analysis_image_mode == "contact_sheet" else "frame"
         frame_offsets = ", ".join(
-            f"frame #{i}: ~{int(i * duration_seconds / (frame_count + 1))}s"
-            for i in range(1, frame_count + 1)
+            f"{annotation_label} #{index}: ~{_format_seconds(offset)}s"
+            for index, offset in enumerate(annotation_offsets, start=1)
         )
         instructions = (
             f"{self.settings.analysis_prompt}\n\n"
@@ -154,16 +178,17 @@ class LlamaAnalyzer:
             "be a genuine moment if my daughter is visible and engaged in a quiet activity "
             "(e.g. sitting and drawing). Judge each frame by whether my daughter is visible, "
             "not by whether pixels changed.\n\n"
-            "Use the frame time annotations below to set start_offset_seconds and "
-            "end_offset_seconds accurately. Count frames from the beginning: frame #1 is "
-            "near the start of the segment and the last frame is near the end. If my daughter "
-            "is clearly active in frame #4 of 8 in a 120s segment, start_offset_seconds "
-            "should be around 54s, NOT 0-5s. Getting the offset wrong means the saved clip "
-            "will miss my daughter entirely, so be precise.\n\n"
+            "Use the time annotations below to set start_offset_seconds and "
+            "end_offset_seconds accurately. These annotations are the actual sampled video "
+            "times; motion-aware sampling means they may not be evenly spaced. Count frames "
+            "or contact-sheet cells from the beginning: #1 is near the first listed time. "
+            "If my daughter is clearly active in frame/cell #4, start_offset_seconds should "
+            "be near the listed #4 time, NOT 0-5s. Getting the offset wrong means the saved "
+            "clip will miss my daughter entirely, so be precise.\n\n"
             f"Segment file: {video_path.name}\n"
             f"Segment duration seconds: {duration_seconds}\n"
             f"Number of provided images: {len(image_paths)}\n"
-            f"Frame time annotations: {frame_offsets}" 
+            f"Time annotations: {frame_offsets}"
         )
 
         user_content: list[dict[str, Any]] = [{"type": "text", "text": instructions}]

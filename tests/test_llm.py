@@ -1,4 +1,9 @@
+import asyncio
+from dataclasses import replace
+
+from nas_video_summarizer.config import load_settings
 from nas_video_summarizer.llm import AnalysisResult, _extract_json
+from nas_video_summarizer.llm import LlamaAnalyzer
 
 
 def _result(keep: bool, confidence: float) -> AnalysisResult:
@@ -38,3 +43,46 @@ def test_should_save_requires_both_keep_and_confidence():
     # Even very high confidence does not override an explicit keep=false.
     assert not _result(keep=False, confidence=0.99).should_save(0.55)
 
+
+def test_analyze_prompt_uses_actual_motion_offsets(tmp_path, monkeypatch):
+    settings = replace(load_settings("/nonexistent.env"), analysis_image_mode="frames")
+    frame_paths = []
+    for index in range(3):
+        frame_path = tmp_path / f"frame_{index}.jpg"
+        frame_path.write_bytes(b"jpeg")
+        frame_paths.append(frame_path)
+
+    captured: dict[str, str] = {}
+
+    def fake_post_json(endpoint, headers, payload, timeout):
+        captured["instructions"] = payload["messages"][1]["content"][0]["text"]
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"keep": false, "title": "quiet", "summary": "none", '
+                            '"tags": [], "confidence": 0.1, '
+                            '"start_offset_seconds": 0, "end_offset_seconds": 1}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("nas_video_summarizer.llm._post_json", fake_post_json)
+
+    asyncio.run(
+        LlamaAnalyzer(settings).analyze(
+            video_path=tmp_path / "segment.mp4",
+            image_paths=frame_paths,
+            duration_seconds=120,
+            frame_offsets_seconds=[12.4, 70.6, 97.2],
+        )
+    )
+
+    instructions = captured["instructions"]
+    assert "frame #1: ~12.4s" in instructions
+    assert "frame #2: ~70.6s" in instructions
+    assert "frame #3: ~97.2s" in instructions
+    assert "frame #2: ~60s" not in instructions

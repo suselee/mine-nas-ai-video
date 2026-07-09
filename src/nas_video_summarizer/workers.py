@@ -13,13 +13,13 @@ from .config import Settings
 from .database import Database, utc_now_iso
 from .ffmpeg_tools import (
     _extract_frame,
-    build_contact_sheet,
+    build_contact_sheet_with_offsets,
     build_recorder_command,
     extract_clip,
     ffmpeg_available,
     ffprobe_available,
     parse_segment_filename,
-    sample_frames,
+    sample_frames_with_offsets,
     segment_time_window,
 )
 from .llm import AnalysisResult, LlamaAnalyzer
@@ -369,25 +369,28 @@ class Supervisor:
         with tempfile.TemporaryDirectory(prefix="nas-video-frames-") as temp_dir:
             duration_seconds = int(segment["duration_seconds"])
             if self.settings.analysis_image_mode == "frames":
-                image_paths = await sample_frames(
+                sampled_frames = await sample_frames_with_offsets(
                     self.settings,
                     Path(segment["path"]),
                     Path(temp_dir),
                     duration_seconds=duration_seconds,
                 )
+                image_paths = [frame.path for frame in sampled_frames]
+                frame_offsets_seconds = [frame.offset_seconds for frame in sampled_frames]
             else:
-                image_paths = [
-                    await build_contact_sheet(
-                        self.settings,
-                        Path(segment["path"]),
-                        Path(temp_dir),
-                        duration_seconds=duration_seconds,
-                    )
-                ]
+                sheet = await build_contact_sheet_with_offsets(
+                    self.settings,
+                    Path(segment["path"]),
+                    Path(temp_dir),
+                    duration_seconds=duration_seconds,
+                )
+                image_paths = [sheet.path]
+                frame_offsets_seconds = sheet.frame_offsets_seconds
             return await analyzer.analyze(
                 video_path=Path(segment["path"]),
                 image_paths=image_paths,
                 duration_seconds=duration_seconds,
+                frame_offsets_seconds=frame_offsets_seconds,
             )
 
     async def _save_moment(

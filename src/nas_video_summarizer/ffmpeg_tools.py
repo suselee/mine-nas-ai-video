@@ -5,6 +5,7 @@ import math
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,18 @@ from .config import Settings
 
 
 SEGMENT_RE = re.compile(r"^(?P<camera>.+)_(?P<role>low|high)_(?P<stamp>\d{8}T\d{6})\.mp4$")
+
+
+@dataclass(frozen=True)
+class SampledFrame:
+    path: Path
+    offset_seconds: float
+
+
+@dataclass(frozen=True)
+class ContactSheet:
+    path: Path
+    frame_offsets_seconds: list[float]
 
 
 def _hwaccel_args(settings: Settings) -> list[str]:
@@ -292,13 +305,13 @@ async def _extract_frame(settings: Settings, video_path: Path, output_path: Path
     await _run_command(command, "ffmpeg frame extraction failed")
 
 
-async def sample_frames(
+async def sample_frames_with_offsets(
     settings: Settings,
     video_path: Path,
     output_dir: Path,
     *,
     duration_seconds: int,
-) -> list[Path]:
+) -> list[SampledFrame]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if settings.sample_mode == "motion_aware":
         try:
@@ -326,36 +339,54 @@ async def sample_frames(
             settings.sample_frame_count,
             settings.sample_every_seconds,
         )
-    frame_paths: list[Path] = []
+    frames: list[SampledFrame] = []
     for index, offset in enumerate(offsets, start=1):
         frame_path = output_dir / f"frame_{index:03d}.jpg"
         await _extract_frame(settings, video_path, frame_path, offset)
         if frame_path.exists():
-            frame_paths.append(frame_path)
-    return frame_paths
+            frames.append(SampledFrame(path=frame_path, offset_seconds=offset))
+    return frames
 
 
-async def build_contact_sheet(
+async def sample_frames(
     settings: Settings,
     video_path: Path,
     output_dir: Path,
     *,
     duration_seconds: int,
-) -> Path:
+) -> list[Path]:
+    frames = await sample_frames_with_offsets(
+        settings,
+        video_path,
+        output_dir,
+        duration_seconds=duration_seconds,
+    )
+    return [frame.path for frame in frames]
+
+
+async def build_contact_sheet_with_offsets(
+    settings: Settings,
+    video_path: Path,
+    output_dir: Path,
+    *,
+    duration_seconds: int,
+) -> ContactSheet:
     frames_dir = output_dir / "frames"
-    frame_paths = await sample_frames(
+    sampled_frames = await sample_frames_with_offsets(
         settings,
         video_path,
         frames_dir,
         duration_seconds=duration_seconds,
     )
+    frame_paths = [frame.path for frame in sampled_frames]
+    offsets = [frame.offset_seconds for frame in sampled_frames]
     if not frame_paths:
         raise RuntimeError("no frames available for contact sheet")
 
     sheet_path = output_dir / "contact_sheet.jpg"
     if len(frame_paths) == 1:
         await asyncio.to_thread(shutil.copy2, frame_paths[0], sheet_path)
-        return sheet_path
+        return ContactSheet(path=sheet_path, frame_offsets_seconds=offsets)
 
     columns, _ = contact_sheet_layout(len(frame_paths), settings.contact_sheet_columns)
     padding = max(settings.contact_sheet_padding, 0)
@@ -384,7 +415,23 @@ async def build_contact_sheet(
         ]
     )
     await _run_command(command, "ffmpeg contact sheet failed")
-    return sheet_path
+    return ContactSheet(path=sheet_path, frame_offsets_seconds=offsets)
+
+
+async def build_contact_sheet(
+    settings: Settings,
+    video_path: Path,
+    output_dir: Path,
+    *,
+    duration_seconds: int,
+) -> Path:
+    sheet = await build_contact_sheet_with_offsets(
+        settings,
+        video_path,
+        output_dir,
+        duration_seconds=duration_seconds,
+    )
+    return sheet.path
 
 
 def _concat_escape(path: Path) -> str:
