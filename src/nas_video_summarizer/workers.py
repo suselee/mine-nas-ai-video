@@ -379,7 +379,7 @@ class Supervisor:
         source_ended = _parse_iso(segment["ended_at"])
 
         wanted_start = source_started + timedelta(
-            seconds=max(0, result.start_offset_seconds - self.settings.context_before_seconds)
+            seconds=result.start_offset_seconds - self.settings.context_before_seconds
         )
         wanted_end = source_started + timedelta(
             seconds=result.end_offset_seconds + self.settings.context_after_seconds
@@ -401,9 +401,18 @@ class Supervisor:
             )
             source_rows = [row for row in high_segments if Path(row["path"]).exists()]
             if source_rows:
-                source_paths = [Path(row["path"]) for row in source_rows]
-                first_started = _parse_iso(source_rows[0]["started_at"])
-                last_ended = _parse_iso(source_rows[-1]["ended_at"])
+
+                def _overlap_seconds(row: dict[str, Any]) -> float:
+                    row_start = _parse_iso(row["started_at"])
+                    row_end = _parse_iso(row["ended_at"])
+                    overlap_start = max(row_start, wanted_start)
+                    overlap_end = min(row_end, wanted_end)
+                    return max(0.0, (overlap_end - overlap_start).total_seconds())
+
+                best_row = max(source_rows, key=_overlap_seconds)
+                source_paths = [Path(best_row["path"])]
+                first_started = _parse_iso(best_row["started_at"])
+                last_ended = _parse_iso(best_row["ended_at"])
             else:
                 source_paths = [Path(segment["path"])]
                 first_started = source_started

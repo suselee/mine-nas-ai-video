@@ -124,6 +124,11 @@ class LlamaAnalyzer:
             if self.settings.analysis_image_mode == "contact_sheet"
             else "The images are sampled video frames in chronological order."
         )
+        frame_count = len(image_paths)
+        frame_offsets = ", ".join(
+            f"frame #{i}: ~{int(i * duration_seconds / (frame_count + 1))}s"
+            for i in range(1, frame_count + 1)
+        )
         instructions = (
             f"{self.settings.analysis_prompt}\n\n"
             f"{image_note}\n\n"
@@ -149,9 +154,16 @@ class LlamaAnalyzer:
             "be a genuine moment if my daughter is visible and engaged in a quiet activity "
             "(e.g. sitting and drawing). Judge each frame by whether my daughter is visible, "
             "not by whether pixels changed.\n\n"
+            "Use the frame time annotations below to set start_offset_seconds and "
+            "end_offset_seconds accurately. Count frames from the beginning: frame #1 is "
+            "near the start of the segment and the last frame is near the end. If my daughter "
+            "is clearly active in frame #4 of 8 in a 120s segment, start_offset_seconds "
+            "should be around 54s, NOT 0-5s. Getting the offset wrong means the saved clip "
+            "will miss my daughter entirely, so be precise.\n\n"
             f"Segment file: {video_path.name}\n"
             f"Segment duration seconds: {duration_seconds}\n"
-            f"Number of provided images: {len(image_paths)}"
+            f"Number of provided images: {len(image_paths)}\n"
+            f"Frame time annotations: {frame_offsets}" 
         )
 
         user_content: list[dict[str, Any]] = [{"type": "text", "text": instructions}]
