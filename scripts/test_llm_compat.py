@@ -59,10 +59,11 @@ def find_good_video(buffer_dir: str) -> Path | None:
 
 def post_chat(payload: dict) -> dict:
     url = BASE_URL.rstrip("/") + "/chat/completions"
+    timeout = payload.pop("_timeout", 120)
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -80,6 +81,7 @@ def run_test(name: str, payload: dict):
     print(f"\n{'='*70}")
     print(f"TEST: {name}")
     print(f"{'='*70}")
+    timeout = payload.get("_timeout", 120)
     print(f"  payload keys: {list(payload.keys())}")
     if "response_format" in payload:
         print(f"  response_format: {payload['response_format']}")
@@ -179,38 +181,34 @@ def main():
             "Return exactly one JSON object with: keep (boolean), title, summary, tags (array), "
             "confidence (0-1), start_offset_seconds (int), end_offset_seconds (int). "
             "The images are sampled video frames in chronological order. "
-            "Frame #1: ~15s, Frame #2: ~30s, Frame #3: ~45s, Frame #4: ~60s, "
-            "Frame #5: ~75s, Frame #6: ~90s, Frame #7: ~105s, Frame #8: ~120s. "
-            "Segment duration: 120s"
         )
-        full_content = [{"type": "text", "text": full_prompt}]
-        full_content.extend(img_content(f) for f in frames)
-        full_msg = [{"role": "user", "content": full_content}]
 
-        # Test 5: full prompt + 8 images + response_format
-        run_test("5. full prompt + 8 images + response_format", {
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a careful family video curator. Return JSON only."},
-                {"role": "user", "content": full_content},
-            ],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-        })
+        # Test different image counts to find the sweet spot
+        for img_count in [2, 3, 4]:
+            frame_labels = ", ".join(
+                f"Frame #{i+1}: ~{15*(i+1)}s"
+                for i in range(img_count)
+            )
+            prompt_text = full_prompt + frame_labels + f"\nSegment duration: 120s"
+            content = [{"type": "text", "text": prompt_text}]
+            content.extend(img_content(f) for f in frames[:img_count])
 
-        # Test 6: full prompt + 8 images, no response_format
-        run_test("6. full prompt + 8 images, no response_format", {
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a careful family video curator. Return JSON only."},
-                {"role": "user", "content": full_content},
-            ],
-            "temperature": 0.2,
-        })
+            run_test(f"{img_count}. {img_count} images + response_format (timeout=300s)", {
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are a careful family video curator. Return JSON only."},
+                    {"role": "user", "content": content},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+                "_timeout": 300,
+            })
 
     print("\n" + "=" * 70)
-    print("SUMMARY: If tests 3/5 return '{}' but tests 4/6 return meaningful JSON,")
-    print("then response_format + images is the root cause.")
+    print("SUMMARY:")
+    print("  Tests 1-4 already ran. Tests 5-6 (8 images) timed out at 120s.")
+    print("  Tests 2/3/4 test with 2-3-4 images at 300s timeout.")
+    print("  Goal: find max image count that completes within 300s.")
     print("=" * 70)
 
 
