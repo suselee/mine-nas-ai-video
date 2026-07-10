@@ -126,6 +126,10 @@ class Settings:
     llama_model: str
     llama_timeout_seconds: int
     analysis_prompt: str
+    person_filter_enabled: bool
+    person_filter_url: str
+    person_filter_threshold: float
+    person_filter_sample_count: int
 
     @property
     def low_buffer_dir(self) -> Path:
@@ -226,6 +230,10 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
                 "Return JSON only with keep, title, summary, tags, confidence, start_offset_seconds, and end_offset_seconds."
             ),
         ),
+        person_filter_enabled=_bool("PERSON_FILTER_ENABLED", False),
+        person_filter_url=os.getenv("PERSON_FILTER_URL", ""),
+        person_filter_threshold=_float("PERSON_FILTER_THRESHOLD", 0.3),
+        person_filter_sample_count=_int("PERSON_FILTER_SAMPLE_COUNT", 12),
     )
 
 

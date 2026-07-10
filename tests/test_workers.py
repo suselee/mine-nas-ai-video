@@ -82,7 +82,7 @@ def test_analyze_segment_passes_actual_frame_offsets(tmp_path, monkeypatch):
     frame_path.write_bytes(b"jpeg")
     captured: dict[str, list[float]] = {}
 
-    async def fake_sample_frames_with_offsets(settings, video_path, output_dir, *, duration_seconds):
+    async def fake_sample_frames_with_offsets(settings, video_path, output_dir, *, duration_seconds, sample_count=None):
         return [SampledFrame(path=frame_path, offset_seconds=73.5)]
 
     class FakeAnalyzer:

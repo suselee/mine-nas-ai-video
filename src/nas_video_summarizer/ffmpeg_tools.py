@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import math
 import re
 import shutil
@@ -9,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib import error as url_error
+from urllib import request as url_request
 
 from .config import Settings
 
@@ -311,8 +315,10 @@ async def sample_frames_with_offsets(
     output_dir: Path,
     *,
     duration_seconds: int,
+    sample_count: int | None = None,
 ) -> list[SampledFrame]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    count = sample_count if sample_count is not None else settings.sample_frame_count
     if settings.sample_mode == "motion_aware":
         try:
             motion_ts = await _detect_motion_timestamps(
@@ -323,20 +329,20 @@ async def sample_frames_with_offsets(
             offsets = _motion_aware_offsets(
                 duration_seconds,
                 motion_ts,
-                settings.sample_frame_count,
+                count,
             )
         except Exception:
             # Corrupt segment or ffmpeg hiccup: fall back to even sampling
             # so the segment is still analyzed rather than skipped.
             offsets = sample_offsets(
                 duration_seconds,
-                settings.sample_frame_count,
+                count,
                 settings.sample_every_seconds,
             )
     else:
         offsets = sample_offsets(
             duration_seconds,
-            settings.sample_frame_count,
+            count,
             settings.sample_every_seconds,
         )
     frames: list[SampledFrame] = []
@@ -577,3 +583,48 @@ async def extract_clip(
 
 def segment_time_window(started_at: datetime, duration_seconds: int) -> tuple[datetime, datetime]:
     return started_at, started_at + timedelta(seconds=duration_seconds)
+
+
+def _person_filter_request(settings: Settings, images_b64: list[str]) -> list[dict[str, object]]:
+    url = settings.person_filter_url.rstrip("/") + "/detect/batch"
+    payload = json.dumps({"images": images_b64}).encode("utf-8")
+    req = url_request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with url_request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (url_error.HTTPError, url_error.URLError, OSError) as exc:
+        raise RuntimeError(f"person filter request failed: {exc}") from exc
+    return data.get("scores", [])
+
+
+async def filter_frames_by_person_detection(
+    settings: Settings,
+    frames: list[SampledFrame],
+) -> list[SampledFrame]:
+    if not settings.person_filter_url or not frames:
+        return frames
+
+    images_b64: list[str] = []
+    for frame in frames:
+        images_b64.append(base64.b64encode(frame.path.read_bytes()).decode("ascii"))
+
+    try:
+        scores = await asyncio.to_thread(_person_filter_request, settings, images_b64)
+    except RuntimeError:
+        return frames
+
+    if not scores:
+        return frames
+
+    max_person = max(s.get("person_score", 0.0) for s in scores)
+    if max_person < settings.person_filter_threshold:
+        return []
+
+    for s in scores:
+        s["_combined"] = s.get("person_score", 0.0) * 0.6 + s.get("face_score", 0.0) * 0.4
+
+    scores.sort(key=lambda s: s["_combined"], reverse=True)
+    top_n = min(len(scores), settings.sample_frame_count)
+    selected_indices = {int(s["idx"]) for s in scores[:top_n]}
+
+    return [f for i, f in enumerate(frames) if i in selected_indices]

@@ -18,12 +18,16 @@ from .ffmpeg_tools import (
     extract_clip,
     ffmpeg_available,
     ffprobe_available,
+    filter_frames_by_person_detection,
     parse_segment_filename,
     sample_frames_with_offsets,
     segment_time_window,
 )
 from .llm import AnalysisResult, LlamaAnalyzer
 
+
+class PersonFilterSkip(Exception):
+    """Raised when person filter detects no person in any sampled frame."""
 
 def _now() -> datetime:
     return datetime.now().astimezone()
@@ -365,6 +369,16 @@ class Supervisor:
                     "last_keep": result.should_save(self.settings.moment_keep_threshold),
                     "updated_at": utc_now_iso(),
                 }
+            except PersonFilterSkip:
+                self.state["analyzer"] = {
+                    "status": "ok",
+                    "last_segment": segment["path"],
+                    "last_keep": False,
+                    "updated_at": utc_now_iso(),
+                }
+                if self.settings.analysis_cooldown_seconds > 0:
+                    await asyncio.sleep(self.settings.analysis_cooldown_seconds)
+                continue
             except Exception as exc:
                 attempt = int(segment["analysis_attempts"]) + 1
                 final = attempt >= self.settings.analysis_max_attempts
@@ -385,12 +399,32 @@ class Supervisor:
         with tempfile.TemporaryDirectory(prefix="nas-video-frames-") as temp_dir:
             duration_seconds = int(segment["duration_seconds"])
             if self.settings.analysis_image_mode == "frames":
+                sample_count = (
+                    self.settings.person_filter_sample_count
+                    if self.settings.person_filter_enabled
+                    else self.settings.sample_frame_count
+                )
                 sampled_frames = await sample_frames_with_offsets(
                     self.settings,
                     Path(segment["path"]),
                     Path(temp_dir),
                     duration_seconds=duration_seconds,
+                    sample_count=sample_count,
                 )
+
+                if self.settings.person_filter_enabled:
+                    sampled_frames = await filter_frames_by_person_detection(
+                        self.settings,
+                        sampled_frames,
+                    )
+                    if not sampled_frames:
+                        self.database.add_event(
+                            "person-filter-skip",
+                            "no person detected in any frame",
+                        )
+                        self.database.mark_segment_processed(int(segment["id"]))
+                        raise PersonFilterSkip()
+
                 image_paths = [frame.path for frame in sampled_frames]
                 frame_offsets_seconds = [frame.offset_seconds for frame in sampled_frames]
             else:
