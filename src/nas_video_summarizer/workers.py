@@ -342,6 +342,21 @@ class Supervisor:
                         moment_id = await self._save_moment(segment, result, analyzer)
                         if moment_id >= 0:
                             self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
+                if not result.should_save(self.settings.moment_keep_threshold):
+                    self.database.add_event(
+                        "analysis-skip",
+                        json.dumps(
+                            {
+                                "keep": result.keep,
+                                "confidence": result.confidence,
+                                "title": result.title,
+                                "tags": result.tags,
+                                "start_offset": result.start_offset_seconds,
+                                "end_offset": result.end_offset_seconds,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
                 self.database.mark_segment_processed(int(segment["id"]))
                 self.state["analyzer"] = {
                     "status": "ok",
