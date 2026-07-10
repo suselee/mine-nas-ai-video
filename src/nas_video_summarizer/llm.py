@@ -209,7 +209,6 @@ class LlamaAnalyzer:
                 {"role": "user", "content": user_content},
             ],
             "temperature": 0.2,
-            "response_format": {"type": "json_object"},
         }
 
         body = await asyncio.to_thread(
@@ -271,7 +270,6 @@ class LlamaAnalyzer:
                 {"role": "user", "content": user_content},
             ],
             "temperature": 0.1,
-            "response_format": {"type": "json_object"},
         }
         body = await asyncio.to_thread(
             _post_json,
