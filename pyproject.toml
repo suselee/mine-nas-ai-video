@@ -11,14 +11,6 @@ nas-video = "nas_video_summarizer.app:run"
 nas-video-check = "nas_video_summarizer.cli:check_main"
 person-filter-server = "nas_video_summarizer.person_filter_server:main"
 
-[project.optional-dependencies]
-filter = [
-    "mediapipe>=0.10.0,<0.10.20",
-    "opencv-python-headless>=4.8.0",
-    "flask>=3.0.0",
-    "numpy>=1.24.0",
-]
-
 [dependency-groups]
 dev = [
     "pytest>=8.2,<9.0",

@@ -23,7 +23,7 @@ sudo apt install -y python3.11-venv python3.11-dev
 git clone https://github.com/suselee/mine-nas-ai-video.git /opt/mine-nas-ai-video
 cd /opt/mine-nas-ai-video
 python3 -m venv .venv
-.venv/bin/pip install .[filter]
+.venv/bin/pip install -r requirements-filter.txt
 ```
 
 If pip can't find a pre-built mediapipe wheel for ARM64, install it
