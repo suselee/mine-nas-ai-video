@@ -22,6 +22,7 @@ class AnalysisResult:
     start_offset_seconds: int
     end_offset_seconds: int
     raw: dict[str, Any]
+    raw_text: str = ""
 
     def should_save(self, threshold: float) -> bool:
         # The model returns both keep (boolean intent) and confidence
@@ -220,7 +221,8 @@ class LlamaAnalyzer:
         )
 
         content = body["choices"][0]["message"]["content"]
-        data = _extract_json(_extract_message_text(content))
+        raw_text = _extract_message_text(content)
+        data = _extract_json(raw_text)
 
         confidence = max(0.0, min(_coerce_float(data.get("confidence"), 0.0), 1.0))
         start_offset = max(0, _coerce_int(data.get("start_offset_seconds"), 0))
@@ -239,6 +241,7 @@ class LlamaAnalyzer:
             start_offset_seconds=start_offset,
             end_offset_seconds=end_offset,
             raw=data,
+            raw_text=raw_text,
         )
 
     async def verify_daughter_visible(self, frame_path: Path) -> bool:

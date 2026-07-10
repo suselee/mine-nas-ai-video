@@ -353,6 +353,7 @@ class Supervisor:
                                 "tags": result.tags,
                                 "start_offset": result.start_offset_seconds,
                                 "end_offset": result.end_offset_seconds,
+                                "raw_text": result.raw_text[:1000],
                             },
                             ensure_ascii=False,
                         ),
