@@ -21,6 +21,7 @@ import urllib.error
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 BASE_URL = os.getenv("LLAMA_BASE_URL", "http://192.168.123.202:8892/v1")
 MODEL = os.getenv("LLAMA_MODEL", "gemma-4-E2B-it-qat")
@@ -79,7 +80,7 @@ def run_test(name: str, payload: dict):
     print(f"\n{'='*70}")
     print(f"TEST: {name}")
     print(f"{'='*70}")
-    print(f"  payload keys: {list(payload.keys()}")
+    print(f"  payload keys: {list(payload.keys())}")
     if "response_format" in payload:
         print(f"  response_format: {payload['response_format']}")
     print(f"  has images: {any('image_url' in str(m.get('content','')) for m in payload.get('messages',[]))}")
