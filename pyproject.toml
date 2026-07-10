@@ -13,9 +13,9 @@ person-filter-server = "nas_video_summarizer.person_filter_server:main"
 
 [project.optional-dependencies]
 filter = [
-    "mediapipe>=0.10.0",
     "opencv-python-headless>=4.8.0",
     "flask>=3.0.0",
+    "numpy>=1.24.0",
 ]
 
 [dependency-groups]

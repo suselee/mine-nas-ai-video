@@ -1,14 +1,21 @@
 # Person Filter — Armbian Deployment
 
-Deploy the MediaPipe person+face detection pre-filter on an Armbian
-box.  The service receives batched JPEG frames over HTTP and returns
-per-frame detection scores so that the NAS can skip empty-room segments
-without calling the LLM.
+Deploy the person detection pre-filter on an Armbian box.  The service
+receives batched JPEG frames over HTTP and returns per-frame detection
+scores so that the NAS can skip empty-room segments without calling the
+LLM.
 
 ## Hardware
 
 Any ARM64 Linux board (tested on Amlogic S905D).  512 MB RAM is enough;
 ~100 MB extra disk for Python + models.
+
+## Prerequisites
+
+```bash
+sudo apt update
+sudo apt install -y python3.11-venv python3.11-dev
+```
 
 ## Install
 
@@ -19,19 +26,23 @@ python3 -m venv .venv
 .venv/bin/pip install .[filter]
 ```
 
+On first run the service downloads MobileNet-SSD Caffe model files (~22 MB)
+from GitHub to `src/nas_video_summarizer/_person_filter_models/`.
+
 ## Run (persistent via systemd)
 
 ```bash
-cp deploy/armbian/person-filter-server.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now person-filter-server
-systemctl status person-filter-server
+sudo cp deploy/armbian/person-filter-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now person-filter-server
+sudo systemctl status person-filter-server
 ```
 
 To run manually for debugging:
 
 ```bash
-person-filter-server --host 0.0.0.0 --port 5000
+.venv/bin/python3 -m nas_video_summarizer.person_filter_server \
+    --host 0.0.0.0 --port 5000
 ```
 
 ## Configuration (environment or CLI)
@@ -40,8 +51,7 @@ person-filter-server --host 0.0.0.0 --port 5000
 |----------------------------|---------|---------------------------------|
 | `PERSON_FILTER_HOST`       | 0.0.0.0 | Listen address                  |
 | `PERSON_FILTER_PORT`       | 5000    | Listen port                     |
-| `PERSON_FILTER_OBJECT_THRESHOLD` | 0.2 | Min confidence for person (COCO class 0) |
-| `PERSON_FILTER_FACE_THRESHOLD`   | 0.3 | Min confidence for face         |
+| `PERSON_FILTER_OBJECT_THRESHOLD` | 0.2 | Min confidence for person       |
 
 ## Verify
 
@@ -67,12 +77,7 @@ PERSON_FILTER_SAMPLE_COUNT=12
   segment is skipped (no LLM call) and a `person-filter-skip` event is
   logged.
 
-## Models
+## Model
 
-| Model by `model_selection` | Name                | Speed (A53) | Size  |
-|----------------------------|---------------------|-------------|-------|
-| 0 (default)                | EfficientDet-Lite0  | ~300 ms/frm | 12 MB |
-| 1                          | EfficientDet-Lite1  | ~400 ms/frm | 16 MB |
-
-Change `model_selection` in `person_filter.py` if needed.
-BlazeFace-Short (face) is fixed and always runs.
+MobileNet-SSD Caffe model.  Class 15 = person.  Runs ~400 ms/frame on
+A53 @ 1.5 GHz.  Model files (~22 MB) are auto-downloaded on first run.

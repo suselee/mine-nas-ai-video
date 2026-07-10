@@ -1,57 +1,91 @@
 from __future__ import annotations
 
 import base64
-from typing import Any
+import os
+from pathlib import Path
+from urllib import request
+
+
+_MODEL_DIR = Path(__file__).resolve().parent / "_person_filter_models"
+_PROTOTXT_URL = (
+    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/"
+    "master/deploy.prototxt"
+)
+_CAFFEMODEL_URL = (
+    "https://github.com/chuanqi305/MobileNet-SSD/raw/"
+    "master/mobilenet_iter_73000.caffemodel"
+)
+# MobileNet-SSD class 15 = COCO "person"
+_PERSON_CLASS_ID = 15
+
+
+def _ensure_models() -> tuple[Path, Path]:
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    prototxt = _MODEL_DIR / "deploy.prototxt"
+    caffemodel = _MODEL_DIR / "mobilenet_iter_73000.caffemodel"
+
+    if not prototxt.exists():
+        _download(_PROTOTXT_URL, prototxt)
+    if not caffemodel.exists():
+        _download(_CAFFEMODEL_URL, caffemodel)
+
+    return prototxt, caffemodel
+
+
+def _download(url: str, dest: Path) -> None:
+    print(f"Downloading {dest.name} ...")
+    with request.urlopen(url) as resp:
+        dest.write_bytes(resp.read())
 
 
 class PersonFilter:
-    """MediaPipe Object Detection + Face Detection for person-presence check.
+    """Lightweight person detection using OpenCV DNN + MobileNet-SSD.
 
-    Uses EfficientDet-Lite0 for person detection and BlazeFace-Short for
-    face detection. Both run on CPU ~300-400ms/frame combined on ARM A53.
+    No GPU required.  Works on any ARM64 Linux board with opencv-python-headless.
     """
 
-    def __init__(self, object_threshold: float = 0.2, face_threshold: float = 0.3):
+    def __init__(self, threshold: float = 0.2):
+        self._threshold = threshold
+        self._net = None
+        self._cv2 = None
+        self._np = None
+
+    def _init_net(self):
+        if self._net is not None:
+            return
         import cv2
-        import mediapipe as mp
         import numpy as np
 
         self._cv2 = cv2
         self._np = np
-
-        self._object_detector = mp.solutions.object_detection.ObjectDetection(
-            model_selection=0,
-            min_detection_confidence=object_threshold,
-        )
-        self._face_detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=face_threshold,
-        )
+        prototxt, caffemodel = _ensure_models()
+        self._net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
 
     def detect(self, image_b64: str) -> dict[str, float]:
+        self._init_net()
+
         img_bytes = base64.b64decode(image_b64)
         arr = self._np.frombuffer(img_bytes, dtype=self._np.uint8)
         img = self._cv2.imdecode(arr, self._cv2.IMREAD_COLOR)
-        rgb = self._cv2.cvtColor(img, self._cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
 
-        obj_result = self._object_detector.process(rgb)
+        blob = self._cv2.dnn.blobFromImage(
+            img, 0.007843, (300, 300), 127.5, swapRB=False
+        )
+        self._net.setInput(blob)
+        detections = self._net.forward()
+
         person_score = 0.0
-        if obj_result.detections:
-            for det in obj_result.detections:
-                if det.label_id[0] == 0:
-                    person_score = max(person_score, det.score[0])
-
-        face_result = self._face_detector.process(rgb)
-        face_score = 0.0
-        face_bbox_area = 0.0
-        if face_result.detections:
-            for det in face_result.detections:
-                face_score = max(face_score, det.score[0])
-                bbox = det.location_data.relative_bounding_box
-                face_bbox_area = max(face_bbox_area, bbox.width * bbox.height)
+        for i in range(detections.shape[2]):
+            confidence = float(detections[0, 0, i, 2])
+            if confidence < self._threshold:
+                continue
+            class_id = int(detections[0, 0, i, 1])
+            if class_id == _PERSON_CLASS_ID:
+                person_score = max(person_score, confidence)
 
         return {
-            "person_score": float(person_score),
-            "face_score": float(face_score),
-            "face_bbox_area": float(face_bbox_area),
+            "person_score": person_score,
+            "face_score": 0.0,
+            "face_bbox_area": 0.0,
         }
