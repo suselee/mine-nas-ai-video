@@ -13,34 +13,24 @@ Any ARM64 Linux board (tested on Amlogic S905D).  512 MB RAM is enough;
 ## Install
 
 ```bash
-git clone https://github.com/suselee/mine-nas-ai-video.git
-cd mine-nas-ai-video
+git clone https://github.com/suselee/mine-nas-ai-video.git /opt/mine-nas-ai-video
+cd /opt/mine-nas-ai-video
 pip install .[filter]
 ```
 
-## Run
+## Run (persistent via systemd)
+
+```bash
+cp deploy/armbian/person-filter-server.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now person-filter-server
+systemctl status person-filter-server
+```
+
+To run manually for debugging:
 
 ```bash
 person-filter-server --host 0.0.0.0 --port 5000
-```
-
-Or via systemd:
-
-```ini
-[Unit]
-Description=Person Filter Detection Server
-After=network.target
-
-[Service]
-Type=simple
-User=armbian
-WorkingDirectory=/home/armbian/mine-nas-ai-video
-ExecStart=/usr/bin/python3 -m nas_video_summarizer.person_filter_server --host 0.0.0.0 --port 5000
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
 ```
 
 ## Configuration (environment or CLI)
