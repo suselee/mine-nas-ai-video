@@ -8,7 +8,8 @@ Type=simple
 User=nobody
 Group=nogroup
 WorkingDirectory=/opt/mine-nas-ai-video
-ExecStart=/usr/bin/python3 -m nas_video_summarizer.person_filter_server \
+ExecStart=/opt/mine-nas-ai-video/.venv/bin/python3 \
+    -m nas_video_summarizer.person_filter_server \
     --host 0.0.0.0 --port 5000
 Restart=always
 RestartSec=10

@@ -15,7 +15,8 @@ Any ARM64 Linux board (tested on Amlogic S905D).  512 MB RAM is enough;
 ```bash
 git clone https://github.com/suselee/mine-nas-ai-video.git /opt/mine-nas-ai-video
 cd /opt/mine-nas-ai-video
-pip install .[filter]
+python3 -m venv .venv
+.venv/bin/pip install .[filter]
 ```
 
 ## Run (persistent via systemd)
