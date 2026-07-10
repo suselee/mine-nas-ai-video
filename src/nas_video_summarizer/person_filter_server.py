@@ -5,7 +5,7 @@ Start:  person-filter-server [--host 0.0.0.0] [--port 5000]
 
 Endpoints:
     GET  /health          — liveness check
-    POST /detect/batch    — bulk person+face detection
+    POST /detect/batch    — bulk person detection
 """
 from __future__ import annotations
 
@@ -43,22 +43,14 @@ def main():
     parser.add_argument("--host", default=os.getenv("PERSON_FILTER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PERSON_FILTER_PORT", "5000")))
     parser.add_argument(
-        "--object-threshold",
+        "--threshold",
         type=float,
-        default=float(os.getenv("PERSON_FILTER_OBJECT_THRESHOLD", "0.2")),
-    )
-    parser.add_argument(
-        "--face-threshold",
-        type=float,
-        default=float(os.getenv("PERSON_FILTER_FACE_THRESHOLD", "0.3")),
+        default=float(os.getenv("PERSON_FILTER_THRESHOLD", "0.2")),
     )
     args = parser.parse_args()
 
     global _filter
-    _filter = PersonFilter(
-        object_threshold=args.object_threshold,
-        face_threshold=args.face_threshold,
-    )
+    _filter = PersonFilter(threshold=args.threshold)
 
     logging.basicConfig(level=logging.INFO)
     logging.info("person-filter-server starting on %s:%d", args.host, args.port)

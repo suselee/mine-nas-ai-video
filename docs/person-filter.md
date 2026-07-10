@@ -1,14 +1,14 @@
 # Person Filter — Armbian Deployment
 
-Deploy the MediaPipe person+face detection pre-filter on an Armbian
-box.  The service receives batched JPEG frames over HTTP and returns
-per-frame detection scores so that the NAS can skip empty-room segments
-without calling the LLM.
+Deploy the person detection pre-filter on an Armbian box.  The service
+receives batched JPEG frames over HTTP and returns per-frame detection
+scores so that the NAS can skip empty-room segments without calling the
+LLM.
 
 ## Hardware
 
-Any ARM64 Linux board (tested on Amlogic S905D).  512 MB RAM is enough;
-~100 MB extra disk for Python + models.
+Any ARM64 Linux board (tested on Amlogic S905D).  512 MB RAM is enough;
+~100 MB extra disk for Python + models.
 
 ## Prerequisites
 
@@ -26,9 +26,8 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements-filter.txt
 ```
 
-If pip can't find a pre-built mediapipe wheel for ARM64, install it
-separately from a known-good source or build from source.  mediapipe
-on ARM64 may require bazel and several build dependencies.
+On first run the service downloads MobileNet-SSD Caffe model files (~22 MB)
+from GitHub to `src/nas_video_summarizer/_person_filter_models/`.
 
 ## Run (persistent via systemd)
 
@@ -52,8 +51,7 @@ To run manually for debugging:
 |----------------------------|---------|---------------------------------|
 | `PERSON_FILTER_HOST`       | 0.0.0.0 | Listen address                  |
 | `PERSON_FILTER_PORT`       | 5000    | Listen port                     |
-| `PERSON_FILTER_OBJECT_THRESHOLD` | 0.2 | Min confidence for person (COCO class 0) |
-| `PERSON_FILTER_FACE_THRESHOLD`   | 0.3 | Min confidence for face         |
+| `PERSON_FILTER_OBJECT_THRESHOLD` | 0.2 | Min confidence for person       |
 
 ## Verify
 
@@ -79,11 +77,7 @@ PERSON_FILTER_SAMPLE_COUNT=12
   segment is skipped (no LLM call) and a `person-filter-skip` event is
   logged.
 
-## Models
+## Model
 
-| Task | Model | Speed (A53) | Size |
-|------|-------|-------------|------|
-| Person detection | EfficientDet-Lite0 | ~300 ms/frm | 12 MB |
-| Face detection | BlazeFace-Short | ~100 ms/frm | 0.3 MB |
-
-Change `model_selection` in `person_filter.py` if needed (0=Lite0, 1=Lite1).
+MobileNet-SSD Caffe model.  Class 15 = person.  Runs ~400 ms/frame on
+A53 @ 1.5 GHz.  Model files (~22 MB) are auto-downloaded on first run.
