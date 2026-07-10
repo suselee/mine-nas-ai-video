@@ -9,7 +9,6 @@ dependencies = []
 [project.scripts]
 nas-video = "nas_video_summarizer.app:run"
 nas-video-check = "nas_video_summarizer.cli:check_main"
-person-filter-server = "nas_video_summarizer.person_filter_server:main"
 
 [dependency-groups]
 dev = [

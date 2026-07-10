@@ -19,6 +19,7 @@ from .ffmpeg_tools import (
     ffmpeg_available,
     ffprobe_available,
     filter_frames_by_person_detection,
+    filter_out_blank_frames,
     parse_segment_filename,
     sample_frames_with_offsets,
     segment_time_window,
@@ -45,11 +46,11 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-def _in_analysis_window(now: datetime, start: str, end: str) -> bool:
+def _in_time_window(now: datetime, start: str, end: str) -> bool:
     """Check whether `now` falls inside the [start, end) time window.
 
     start/end are "HH:MM" strings. If either is empty, the window is
-    disabled and the function returns True (analyze all day). Handles
+    disabled and the function returns True (always active). Handles
     windows that cross midnight (e.g. 21:15 -> 06:00).
     """
     if not start or not end:
@@ -67,6 +68,14 @@ def _in_analysis_window(now: datetime, start: str, end: str) -> bool:
         return start_min <= now_min < end_min
     # Crosses midnight: e.g. 21:15 -> 06:00.
     return now_min >= start_min or now_min < end_min
+
+
+def _in_analysis_window(now: datetime, start: str, end: str) -> bool:
+    return _in_time_window(now, start, end)
+
+
+def _in_record_window(now: datetime, start: str, end: str) -> bool:
+    return _in_time_window(now, start, end)
 
 
 def _parse_iso(value: str) -> datetime:
@@ -189,6 +198,20 @@ class Supervisor:
                 await asyncio.sleep(30)
                 continue
 
+            if not _in_record_window(
+                _now(),
+                self.settings.record_window_start,
+                self.settings.record_window_end,
+            ):
+                self.state["recorders"][role] = {
+                    "status": "waiting_for_record_window",
+                    "window_start": self.settings.record_window_start,
+                    "window_end": self.settings.record_window_end,
+                    "updated_at": utc_now_iso(),
+                }
+                await asyncio.sleep(60)
+                continue
+
             command = build_recorder_command(self.settings, role, rtsp_url)
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -282,6 +305,40 @@ class Supervisor:
             return False
         return (_now() - self._last_moment_saved_at).total_seconds() < self.settings.moment_cooldown_seconds
 
+    def _daily_cap_eviction_target(self, segment: dict[str, Any], result: AnalysisResult):
+        """Return the weakest moment to evict for the daily cap, or a decision.
+
+        Returns:
+          * ``None``      — under the cap, save normally (no eviction).
+          * a dict       — at the cap and this new clip is better; evict this
+                           weakest moment, then save the new one.
+          * ``False``    — at the cap and the new clip is not better; skip it.
+        """
+        cap = self.settings.max_moments_per_day
+        if cap <= 0:
+            return None
+        day = str(segment.get("started_at", ""))[:10]
+        if not day:
+            return None
+        if self.database.count_moments_on_day(day) < cap:
+            return None
+        weakest = self.database.weakest_moment_on_day(day)
+        if weakest is None:
+            return None
+        if result.confidence > float(weakest["confidence"]):
+            return weakest
+        return False
+
+    def _evict_moment(self, moment: dict[str, Any]) -> None:
+        for key in ("clip_path", "metadata_path"):
+            path = Path(str(moment[key]))
+            path.unlink(missing_ok=True)
+        self.database.delete_moment_by_clip(str(moment["clip_path"]))
+        self.database.add_event(
+            "daily-cap-evict",
+            f"replaced weakest '{moment['title']}' (confidence {float(moment['confidence']):.2f})",
+        )
+
     async def _analyzer_loop(self) -> None:
         analyzer = LlamaAnalyzer(self.settings)
         while not self.stop_event.is_set():
@@ -343,9 +400,19 @@ class Supervisor:
                             f"skipped '{result.title}' due to cooldown",
                         )
                     else:
-                        moment_id = await self._save_moment(segment, result, analyzer)
-                        if moment_id >= 0:
-                            self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
+                        evict = self._daily_cap_eviction_target(segment, result)
+                        if evict is False:
+                            self.database.add_event(
+                                "daily-cap",
+                                f"skipped '{result.title}' (daily limit {self.settings.max_moments_per_day} reached, "
+                                f"confidence {result.confidence:.2f} not above weakest)",
+                            )
+                        else:
+                            if evict is not None:
+                                self._evict_moment(evict)
+                            moment_id = await self._save_moment(segment, result, analyzer)
+                            if moment_id >= 0:
+                                self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
                 if not result.should_save(self.settings.moment_keep_threshold):
                     self.database.add_event(
                         "analysis-skip",
@@ -411,6 +478,17 @@ class Supervisor:
                     duration_seconds=duration_seconds,
                     sample_count=sample_count,
                 )
+
+                sampled_frames = await filter_out_blank_frames(
+                    self.settings, sampled_frames
+                )
+                if not sampled_frames:
+                    self.database.add_event(
+                        "blank-frame-skip",
+                        "all sampled frames are near-black (camera masked/off?)",
+                    )
+                    self.database.mark_segment_processed(int(segment["id"]))
+                    raise PersonFilterSkip()
 
                 if self.settings.person_filter_enabled:
                     sampled_frames = await filter_frames_by_person_detection(

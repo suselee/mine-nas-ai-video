@@ -1,7 +1,13 @@
+from pathlib import Path
+
+import asyncio
+
 from nas_video_summarizer.ffmpeg_tools import (
+    SampledFrame,
     _hwaccel_args,
     _motion_aware_offsets,
     contact_sheet_layout,
+    filter_out_blank_frames,
     sample_offsets,
 )
 from nas_video_summarizer.config import Settings, load_settings
@@ -77,4 +83,54 @@ def test_hwaccel_args_vaapi():
     os.environ["FFMPEG_HWACCEL"] = "vaapi"
     settings = load_settings("/nonexistent.env")
     assert _hwaccel_args(settings) == ["-hwaccel", "vaapi"]
+
+
+class _FakeProc:
+    def __init__(self, stderr):
+        self._stderr = stderr.encode() if isinstance(stderr, str) else stderr
+
+    async def communicate(self):
+        return (b"", self._stderr)
+
+
+def _fake_spawn(monkeypatch, luma):
+    async def _spawn(*args, **kwargs):
+        return _FakeProc(f"lavfi.signalstats.1.luma_average={luma}")
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _spawn)
+
+
+def test_is_blank_frame_black(monkeypatch):
+    from nas_video_summarizer import ffmpeg_tools as ft
+
+    _fake_spawn(monkeypatch, 2.34)
+    settings = load_settings("/nonexistent.env")
+    assert asyncio.run(ft._is_blank_frame(settings, Path("/nope.jpg"))) is True
+
+
+def test_is_blank_frame_normal(monkeypatch):
+    from nas_video_summarizer import ffmpeg_tools as ft
+
+    _fake_spawn(monkeypatch, 120.5)
+    settings = load_settings("/nonexistent.env")
+    assert asyncio.run(ft._is_blank_frame(settings, Path("/nope.jpg"))) is False
+
+
+def test_filter_out_blank_frames_drops_all_blank(monkeypatch):
+    from nas_video_summarizer import ffmpeg_tools as ft
+
+    _fake_spawn(monkeypatch, 1.0)
+    settings = load_settings("/nonexistent.env")
+    frames = [SampledFrame(path=Path(f"/f{i}.jpg"), offset_seconds=i) for i in range(3)]
+    out = asyncio.run(filter_out_blank_frames(settings, frames))
+    assert out == []
+
+
+def test_filter_out_blank_frames_keeps_mixed(monkeypatch):
+    from nas_video_summarizer import ffmpeg_tools as ft
+
+    _fake_spawn(monkeypatch, 100.0)
+    settings = load_settings("/nonexistent.env")
+    frames = [SampledFrame(path=Path("/f.jpg"), offset_seconds=0)]
+    out = asyncio.run(filter_out_blank_frames(settings, frames))
+    assert len(out) == 1
 

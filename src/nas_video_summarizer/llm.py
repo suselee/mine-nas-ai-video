@@ -284,4 +284,4 @@ class LlamaAnalyzer:
         data = _extract_json(_extract_message_text(content))
         has_daughter = _coerce_bool(data.get("has_daughter"))
         confidence = max(0.0, min(_coerce_float(data.get("confidence"), 0.0), 1.0))
-        return has_daughter and confidence >= 0.7
+        return has_daughter and confidence >= 0.5

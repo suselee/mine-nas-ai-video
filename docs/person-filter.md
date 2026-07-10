@@ -1,83 +1,75 @@
-# Person Filter — Armbian Deployment
+# Person Filter — Local Deployment
 
-Deploy the person detection pre-filter on an Armbian box.  The service
-receives batched JPEG frames over HTTP and returns per-frame detection
-scores so that the NAS can skip empty-room segments without calling the
-LLM.
+The person detection pre-filter runs **inline on the NAS** (no separate
+service, no HTTP).  Sampled frames are scored with a local OpenCV DNN model
+so the NAS can skip empty-room segments without calling the LLM.
 
-## Hardware
+## Backends
 
-Any ARM64 Linux board (tested on Amlogic S905D).  512 MB RAM is enough;
-~100 MB extra disk for Python + models.
+All backends run via OpenCV DNN, so the **only** runtime dependency is
+`opencv` — no `onnxruntime` / `torch` needed.
 
-## Prerequisites
+| Backend          | Model            | Accuracy | Weight  | Notes                                   |
+|------------------|------------------|----------|---------|-----------------------------------------|
+| `yolov11n` (default) | `yolo11n.onnx` | High     | ~5.4 MB | YOLOv11n, fastest + most accurate on CPU. COCO person class 0. |
+| `yolov26n`       | `yolo26n.onnx`   | Highest  | ~10 MB  | YOLO26n, ~30% faster than v11n on CPU, more accurate. **Optional** — see caveat below. |
+| `yolov8n`        | `yolov8n.onnx`   | High     | ~12 MB  | Older but well-proven YOLOv8n.         |
+| `mobilenet_ssd`  | Caffe sample     | Lower    | ~22 MB  | Older model, more false positives.     |
 
-```bash
-sudo apt update
-sudo apt install -y python3.11-venv python3.11-dev
-```
+The YOLO ONNX export is downloaded automatically on first run to
+`src/nas_video_summarizer/_person_filter_models/`.  To use a custom export
+(e.g. a different YOLO variant or a quantized build), set
+`PERSON_FILTER_MODEL_URL` to its download URL — it overrides the built-in
+source.  The YOLO decoder auto-detects the export layout (raw `one-to-many`
+head `(1, nc+4, N)` **or** end-to-end `one-to-one` head `(1, 300, 6)`), so
+both work without config changes.
 
-## Install
+### `yolov26n` caveat (OpenCV version)
 
-```bash
-git clone https://github.com/suselee/mine-nas-ai-video.git /opt/mine-nas-ai-video
-cd /opt/mine-nas-ai-video
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-filter.txt
-```
+YOLO26 ONNX is best loaded by **OpenCV 5**.  On **OpenCV 4.x** (what
+`py311-opencv` currently ships on FreeBSD) the ONNX graph may fail to load
+or produce wrong output.  If the filter fails to initialize, the pipeline
+**falls back to keeping all frames** (person pre-filter becomes a no-op) —
+analysis still runs, only without the empty-room skip.  To use `yolov26n`
+safely:
 
-On first run the service downloads MobileNet-SSD Caffe model files (~22 MB)
-from GitHub to `src/nas_video_summarizer/_person_filter_models/`.
+1. Check the OpenCV version on the NAS: `python -c "import cv2; print(cv2.__version__)"`.
+2. If it is 5.x, set `PERSON_FILTER_BACKEND=yolov26n` and verify a run.
+3. If it is 4.x, either stay on `yolov11n` (proven), upgrade to OpenCV 5,
+   or install `onnxruntime` and switch the loader (breaks the zero-extra-dep
+   rule — discuss first).
 
-## Run (persistent via systemd)
-
-```bash
-sudo cp deploy/armbian/person-filter-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now person-filter-server
-sudo systemctl status person-filter-server
-```
-
-To run manually for debugging:
-
-```bash
-.venv/bin/python3 -m nas_video_summarizer.person_filter_server \
-    --host 0.0.0.0 --port 5000
-```
-
-## Configuration (environment or CLI)
-
-| Variable / Flag            | Default | Description                     |
-|----------------------------|---------|---------------------------------|
-| `PERSON_FILTER_HOST`       | 0.0.0.0 | Listen address                  |
-| `PERSON_FILTER_PORT`       | 5000    | Listen port                     |
-| `PERSON_FILTER_OBJECT_THRESHOLD` | 0.2 | Min confidence for person       |
-
-## Verify
+## Prerequisites (FreeBSD)
 
 ```bash
-curl http://localhost:5000/health
-# → {"status":"ok"}
+pkg install py311-opencv py311-numpy
 ```
 
-## NAS side — .env
+`opencv` must be >= 4.7 for YOLOv8 ONNX support (4.8+ recommended).
+
+For non-FreeBSD / local development you can instead pip-install:
+
+```bash
+pip install -r requirements-filter.txt
+```
+
+On first run the model file is downloaded automatically to
+`src/nas_video_summarizer/_person_filter_models/`.
+
+## Configuration (.env)
 
 ```env
 PERSON_FILTER_ENABLED=true
-PERSON_FILTER_URL=http://armbian-ip:5000
+PERSON_FILTER_BACKEND=yolov8n
 PERSON_FILTER_THRESHOLD=0.3
 PERSON_FILTER_SAMPLE_COUNT=12
 ```
 
-- `PERSON_FILTER_SAMPLE_COUNT=12` means 12 frames are extracted from each
-  segment and sent to Armbian.  After scoring, the top
-  `SAMPLE_FRAME_COUNT` (default 6) frames are selected for LLM analysis.
-
+- `PERSON_FILTER_SAMPLE_COUNT=12` extracts 12 frames per segment and scores
+  them. After scoring, the top `SAMPLE_FRAME_COUNT` (default 6) frames are
+  selected for LLM analysis.
 - If **every** frame has `person_score < PERSON_FILTER_THRESHOLD`, the
   segment is skipped (no LLM call) and a `person-filter-skip` event is
   logged.
-
-## Model
-
-MobileNet-SSD Caffe model.  Class 15 = person.  Runs ~400 ms/frame on
-A53 @ 1.5 GHz.  Model files (~22 MB) are auto-downloaded on first run.
+- If `opencv` is not installed or detection fails, the filter falls back to
+  keeping all frames so analysis still runs.

@@ -104,6 +104,8 @@ class Settings:
     analysis_stream_role: str
     analysis_window_start: str
     analysis_window_end: str
+    record_window_start: str
+    record_window_end: str
     analysis_image_mode: str
     analysis_frame_width: int
     contact_sheet_columns: int
@@ -113,6 +115,7 @@ class Settings:
     sample_mode: str
     motion_threshold: float
     moment_keep_threshold: float
+    max_moments_per_day: int
     moment_cooldown_seconds: int
     context_before_seconds: int
     context_after_seconds: int
@@ -127,7 +130,8 @@ class Settings:
     llama_timeout_seconds: int
     analysis_prompt: str
     person_filter_enabled: bool
-    person_filter_url: str
+    person_filter_backend: str
+    person_filter_model_url: str
     person_filter_threshold: float
     person_filter_sample_count: int
 
@@ -179,6 +183,8 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         analysis_stream_role=os.getenv("ANALYSIS_STREAM_ROLE", "low").strip().lower(),
         analysis_window_start=os.getenv("ANALYSIS_WINDOW_START", "").strip(),
         analysis_window_end=os.getenv("ANALYSIS_WINDOW_END", "").strip(),
+        record_window_start=os.getenv("RECORD_WINDOW_START", "").strip(),
+        record_window_end=os.getenv("RECORD_WINDOW_END", "").strip(),
         analysis_image_mode=os.getenv("ANALYSIS_IMAGE_MODE", "contact_sheet").strip().lower(),
         analysis_frame_width=_int("ANALYSIS_FRAME_WIDTH", 320),
         contact_sheet_columns=_int("CONTACT_SHEET_COLUMNS", 2),
@@ -187,7 +193,8 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         sample_every_seconds=_int("SAMPLE_EVERY_SECONDS", 30),
         sample_mode=os.getenv("SAMPLE_MODE", "even").strip().lower(),
         motion_threshold=_float("MOTION_THRESHOLD", 0.02),
-        moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.55),
+        moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.5),
+        max_moments_per_day=_int("MAX_MOMENTS_PER_DAY", 0),
         moment_cooldown_seconds=_int("MOMENT_COOLDOWN_SECONDS", 0),
         context_before_seconds=_int("CONTEXT_BEFORE_SECONDS", 5),
         context_after_seconds=_int("CONTEXT_AFTER_SECONDS", 10),
@@ -203,35 +210,37 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         analysis_prompt=os.getenv(
             "ANALYSIS_PROMPT",
             (
-                "Find short, precious indoor moments of my daughter in the living room. "
-                "There are three family members at home: my daughter (a young girl), her mom "
+                "Find short, precious everyday moments of my ~1.5-year-old daughter at home. "
+                "There are three family members: my daughter (a toddler girl), her mom "
                 "(a young adult woman, NOT the grandma), and her grandma (an older woman) - "
-                "these are three distinct people, do not confuse mom with grandma. "
-                "ONLY keep clips where my daughter is ACTIVELY doing something with energy: "
-                "playing, crawling, walking, running, laughing, talking, dancing, exploring, "
-                "or visibly responding to play. Passive presence of my daughter is not enough - "
-                "she must be the active, energetic subject of the moment. "
-                "EXCLUDE these low-value scenes even if my daughter is visible - they are NOT "
-                "worth saving: "
-                "child being held/carried/rocked to sleep (passive, sleepy); "
-                "child sleeping or drowsy; "
-                "child being fed passively (bottle/spoon, no play); "
-                "child sitting alone doing nothing (blank, idle, staring); "
-                "child watching a screen (TV/iPad/phone, passive consumption); "
-                "adult doing chores while child is merely present but not playing; "
-                "child crying or tantrum without playful context. "
-                "A frame that is empty, static, or shows only furniture/toys/a quiet room with "
-                "no child is keep=false - do not infer a child off-screen. If you cannot see my "
-                "daughter clearly in a frame, that frame is keep=false. "
-                "Skip empty rooms, static rooms, outdoor views, pets-only, blurry frames, and "
-                "background activity with no child. "
-                "When describing the scene, name the family members correctly: daughter, mom, "
-                "or grandma. Keep clips concise. "
+                "distinct people, do not confuse mom with grandma. "
+                "KEEP a clip when my daughter is clearly visible AND something real is happening: "
+                "she is interacting with family (playing, talking, cuddling, reading, eating "
+                "together, being washed/dressed with engagement, reacting to someone) or doing "
+                "something on her own (playing with a toy, cruising/walking, babbling, exploring, "
+                "laughing, dancing, looking at a book). Warm family interaction IS a highlight - "
+                "high energy is NOT required. A calm but genuine moment with her is worth saving. "
+                "EXCLUDE only these truly low-value scenes: "
+                "an empty or static room with NO child visible (do not invent a child off-screen); "
+                "child sleeping or drowsy/being rocked to sleep (passive, no engagement); "
+                "child being fed with zero interaction (bottle propped, no eye contact/play); "
+                "child sitting totally blank, idle, staring at nothing; "
+                "child watching a screen (TV/iPad/phone) as passive consumption; "
+                "blurry or black/empty frames; "
+                "an adult doing chores while the child is merely present in the background and "
+                "NOT engaging with them. "
+                "If you cannot see my daughter clearly in a frame, that frame is keep=false. "
+                "Skip outdoor views and pets-only scenes. "
+                "When describing the scene, name people correctly: daughter, mom, or grandma. "
+                "Keep clips concise. Aim to capture a balanced, joyful record of her day - "
+                "around 10-20 good clips per day is the goal, so keep genuine interactions and "
+                "her own activities, and only drop the empty/low-value ones. "
                 "Return JSON only with keep, title, summary, tags, confidence, start_offset_seconds, and end_offset_seconds."
             ),
         ),
         person_filter_enabled=_bool("PERSON_FILTER_ENABLED", False),
-        person_filter_url=os.getenv("PERSON_FILTER_URL", ""),
+        person_filter_backend=os.getenv("PERSON_FILTER_BACKEND", "yolov11n").strip().lower(),
+        person_filter_model_url=os.getenv("PERSON_FILTER_MODEL_URL", "").strip(),
         person_filter_threshold=_float("PERSON_FILTER_THRESHOLD", 0.3),
         person_filter_sample_count=_int("PERSON_FILTER_SAMPLE_COUNT", 12),
     )

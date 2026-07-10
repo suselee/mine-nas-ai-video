@@ -11,10 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib import error as url_error
-from urllib import request as url_request
 
 from .config import Settings
+from .person_filter import PersonFilter
 
 
 SEGMENT_RE = re.compile(r"^(?P<camera>.+)_(?P<role>low|high)_(?P<stamp>\d{8}T\d{6})\.mp4$")
@@ -585,23 +584,11 @@ def segment_time_window(started_at: datetime, duration_seconds: int) -> tuple[da
     return started_at, started_at + timedelta(seconds=duration_seconds)
 
 
-def _person_filter_request(settings: Settings, images_b64: list[str]) -> list[dict[str, object]]:
-    url = settings.person_filter_url.rstrip("/") + "/detect/batch"
-    payload = json.dumps({"images": images_b64}).encode("utf-8")
-    req = url_request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        with url_request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (url_error.HTTPError, url_error.URLError, OSError) as exc:
-        raise RuntimeError(f"person filter request failed: {exc}") from exc
-    return data.get("scores", [])
-
-
 async def filter_frames_by_person_detection(
     settings: Settings,
     frames: list[SampledFrame],
 ) -> list[SampledFrame]:
-    if not settings.person_filter_url or not frames:
+    if not settings.person_filter_enabled or not frames:
         return frames
 
     images_b64: list[str] = []
@@ -609,8 +596,10 @@ async def filter_frames_by_person_detection(
         images_b64.append(base64.b64encode(frame.path.read_bytes()).decode("ascii"))
 
     try:
-        scores = await asyncio.to_thread(_person_filter_request, settings, images_b64)
-    except RuntimeError:
+        scores = await asyncio.to_thread(_run_person_filter, settings, images_b64)
+    except Exception:
+        # Detection unavailable (e.g. opencv not installed) — fall back to
+        # keeping all frames so analysis still runs instead of skipping.
         return frames
 
     if not scores:
@@ -628,3 +617,82 @@ async def filter_frames_by_person_detection(
     selected_indices = {int(s["idx"]) for s in scores[:top_n]}
 
     return [f for i, f in enumerate(frames) if i in selected_indices]
+
+
+_PERSON_FILTER: PersonFilter | None = None
+
+
+def _run_person_filter(
+    settings: Settings, images_b64: list[str]
+) -> list[dict[str, object]]:
+    global _PERSON_FILTER
+    if _PERSON_FILTER is None:
+        from .person_filter import PersonFilter
+
+        _PERSON_FILTER = PersonFilter(
+            threshold=settings.person_filter_threshold,
+            backend=settings.person_filter_backend,
+            model_url=settings.person_filter_model_url,
+        )
+    results: list[dict[str, object]] = []
+    for idx, b64 in enumerate(images_b64):
+        info = _PERSON_FILTER.detect(b64)
+        info["idx"] = idx
+        results.append(info)
+    return results
+
+
+# Frames with an average luma at or below this are treated as black/near-black.
+_BLANK_LUMA_THRESHOLD = 10.0
+
+
+async def filter_out_blank_frames(
+    settings: Settings,
+    frames: list[SampledFrame],
+) -> list[SampledFrame]:
+    """Drop near-black frames using ffmpeg's signalstats filter.
+
+    If every frame in a segment is blank, returns an empty list so the caller
+    can skip the segment entirely (e.g. a camera privacy mask at night). Uses
+    only the already-required ffmpeg binary, no extra Python dependencies.
+    """
+    if not frames:
+        return frames
+
+    kept: list[SampledFrame] = []
+    for frame in frames:
+        if not await _is_blank_frame(settings, frame.path):
+            kept.append(frame)
+    return kept
+
+
+async def _is_blank_frame(settings: Settings, path: Path) -> bool:
+    cmd = [
+        settings.ffmpeg_bin,
+        "-i", str(path),
+        "-vf", "signalstats,metadata=print",
+        "-f", "null",
+        "-",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+    except (OSError, ValueError):
+        return False
+
+    text = stderr.decode("utf-8", errors="ignore") if stderr else ""
+    match = re.search(r"luma_average\s*=\s*([\d.]+)", text)
+    if not match:
+        # Could not measure — keep the frame rather than risk dropping real content.
+        return False
+    try:
+        luma = float(match.group(1))
+    except ValueError:
+        return False
+    return luma <= _BLANK_LUMA_THRESHOLD
+
+

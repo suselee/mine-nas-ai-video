@@ -250,6 +250,51 @@ class Database:
             )
             return int(cursor.lastrowid)
 
+    def count_moments_on_day(self, day: str) -> int:
+        """Number of moments whose source started on ``day`` (``YYYY-MM-DD``)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM moments WHERE source_started_at LIKE ?",
+                (f"{day}%",),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def min_confidence_on_day(self, day: str) -> float:
+        """Lowest saved confidence among moments starting on ``day``.
+
+        Returns 1.0 when no moments exist yet, so a new clip always beats it.
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(confidence) FROM moments WHERE source_started_at LIKE ?",
+                (f"{day}%",),
+            ).fetchone()
+            return float(row[0]) if row and row[0] is not None else 1.0
+
+    def weakest_moment_on_day(self, day: str) -> dict[str, Any] | None:
+        """The lowest-confidence moment starting on ``day`` (for daily-cap eviction)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, title, confidence, clip_path, metadata_path
+                FROM moments
+                WHERE source_started_at LIKE ?
+                ORDER BY confidence ASC
+                LIMIT 1
+                """,
+                (f"{day}%",),
+            ).fetchone()
+            if not row:
+                return None
+            keys = ("id", "title", "confidence", "clip_path", "metadata_path")
+            return dict(zip(keys, row))
+
+    def delete_moment_by_clip(self, clip_path: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM moments WHERE clip_path = ?", (str(clip_path),)
+            )
+
     def list_moments(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
