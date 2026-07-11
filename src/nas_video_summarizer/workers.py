@@ -267,11 +267,32 @@ class Supervisor:
                 "updated_at": utc_now_iso(),
             }
             try:
+                window_closed = False
                 while process.returncode is None and not self.stop_event.is_set():
                     await asyncio.sleep(1)
+                    if not _in_record_window(
+                        _now(),
+                        self.settings.record_window_start,
+                        self.settings.record_window_end,
+                    ):
+                        window_closed = True
+                        await _stop_process(process)
+                        break
                 if self.stop_event.is_set() and process.returncode is None:
                     await _stop_process(process)
                     return
+                if window_closed:
+                    self.state["recorders"][role] = {
+                        "status": "waiting_for_record_window",
+                        "window_start": self.settings.record_window_start,
+                        "window_end": self.settings.record_window_end,
+                        "updated_at": utc_now_iso(),
+                    }
+                    self.database.add_event(
+                        "recorder-window",
+                        f"{role} recorder stopped at window end",
+                    )
+                    continue
                 return_code = await process.wait()
                 self.state["recorders"][role] = {
                     "status": "restarting",

@@ -96,6 +96,52 @@ def test_time_window_helpers_and_record_alias():
     assert _in_record_window(_dt(10, 0), "", "") is True
 
 
+def test_running_recorder_stops_when_record_window_closes(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        record_window_start="07:00",
+        record_window_end="21:00",
+    )
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+
+    class FakeProcess:
+        pid = 123
+        returncode = None
+
+        async def wait(self):
+            return self.returncode
+
+    process = FakeProcess()
+    times = iter((_dt(20, 59), _dt(21, 0)))
+
+    async def fake_spawn(*args, **kwargs):
+        return process
+
+    async def fake_stop(proc):
+        proc.returncode = 0
+        supervisor.stop_event.set()
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr("nas_video_summarizer.workers.ffmpeg_available", lambda settings: True)
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.build_recorder_command",
+        lambda settings, role, url: ["ffmpeg"],
+    )
+    monkeypatch.setattr("nas_video_summarizer.workers._now", lambda: next(times))
+    monkeypatch.setattr("nas_video_summarizer.workers._stop_process", fake_stop)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    asyncio.run(supervisor._recorder_loop("low", "rtsp://camera/low"))
+
+    assert supervisor.state["recorders"]["low"]["status"] == "waiting_for_record_window"
+    assert database.recent_events(limit=1)[0]["event_type"] == "recorder-window"
+
+
 class _FakeCapDB:
     def __init__(self, count, weakest, period_count=None):
         self._count = count

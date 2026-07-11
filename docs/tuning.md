@@ -7,7 +7,9 @@ can cross midnight (e.g. `21:15` → `06:00`).
 
 - `RECORD_WINDOW_START` / `RECORD_WINDOW_END` — the recorder pauses
   outside this window: RTSP is **not** pulled and no black buffer is
-  written. When the window opens it resumes automatically. Use this when
+  written. A running ffmpeg process is terminated when the end time is
+  reached and a `recorder-window` event is recorded. When the window opens
+  it resumes automatically. Use this when
   the camera masks itself at night so you stop wasting disk/CPU on
   black video.
 - `ANALYSIS_WINDOW_START` / `ANALYSIS_WINDOW_END` — the analyzer skips
