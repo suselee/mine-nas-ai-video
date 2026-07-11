@@ -9,7 +9,7 @@ from nas_video_summarizer.ffmpeg_tools import (
     PersonFilterDecision,
     SampledFrame,
 )
-from nas_video_summarizer.llm import AnalysisResult
+from nas_video_summarizer.llm import AnalysisResult, DaughterVerification
 from nas_video_summarizer.workers import (
     Supervisor,
     _append_daily_summary,
@@ -346,3 +346,37 @@ def test_adult_only_filter_records_distinct_event(tmp_path, monkeypatch):
     events = database.recent_events(limit=1)
     assert events[0]["event_type"] == "adult-only-filter-skip"
     assert supervisor.state["prefilter"]["status"] == "adult-only"
+
+
+def test_saved_clip_verification_uses_three_frames(tmp_path, monkeypatch):
+    settings = load_settings("/nonexistent.env")
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    offsets = []
+
+    async def fake_extract(settings, clip_path, frame_path, offset):
+        offsets.append(offset)
+        frame_path.write_bytes(b"jpeg")
+
+    class FakeAnalyzer:
+        async def verify_daughter_visible(self, frame_paths):
+            assert len(frame_paths) == 3
+            return DaughterVerification(
+                visible=True,
+                confidence=0.9,
+                description="A young girl is visible.",
+                repaired=False,
+                raw_text="{}",
+            )
+
+    monkeypatch.setattr("nas_video_summarizer.workers._extract_frame", fake_extract)
+
+    verified = asyncio.run(
+        supervisor._verify_saved_clip(
+            FakeAnalyzer(), tmp_path / "clip.mp4", duration_seconds=20
+        )
+    )
+
+    assert verified is True
+    assert offsets == [4.0, 10.0, 16.0]

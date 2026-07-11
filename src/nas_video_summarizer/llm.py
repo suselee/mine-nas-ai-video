@@ -37,8 +37,13 @@ _ACTIVITY_EVIDENCE_TERMS = (
 _EXCLUSION_EVIDENCE_TERMS = (
     "empty room",
     "no child",
+    "no young girl",
+    "no girl",
+    "cannot see",
+    "can't see",
     "adults-only",
     "adult only",
+    "only adults",
     "sleeping",
     "drowsy",
     "screen time",
@@ -83,6 +88,61 @@ class AnalysisResult:
         has_child = any(term in evidence for term in _CHILD_EVIDENCE_TERMS)
         has_activity = any(term in evidence for term in _ACTIVITY_EVIDENCE_TERMS)
         return has_child and has_activity
+
+
+@dataclass(frozen=True)
+class DaughterVerification:
+    visible: bool
+    confidence: float
+    description: str
+    repaired: bool
+    raw_text: str
+
+
+def _snap_highlight_offsets(
+    start: int,
+    end: int,
+    frame_offsets: list[float],
+    duration_seconds: int,
+) -> tuple[int, int]:
+    offsets = sorted(
+        {
+            max(0.0, min(float(offset), float(duration_seconds)))
+            for offset in frame_offsets
+        }
+    )
+    if not offsets:
+        return start, end
+
+    snapped_start = min(offsets, key=lambda offset: abs(offset - start))
+    snapped_end = min(offsets, key=lambda offset: abs(offset - end))
+    if snapped_end <= snapped_start:
+        later = [offset for offset in offsets if offset > snapped_start]
+        snapped_end = later[0] if later else min(duration_seconds, snapped_start + 10)
+    return int(round(snapped_start)), max(
+        int(round(snapped_start)) + 1,
+        int(round(snapped_end)),
+    )
+
+
+def _parse_daughter_verification(data: dict[str, Any], raw_text: str) -> DaughterVerification:
+    has_daughter = _coerce_bool(data.get("has_daughter"))
+    confidence = max(0.0, min(_coerce_float(data.get("confidence"), 0.0), 1.0))
+    description = str(data.get("description") or "").strip()
+    evidence = description.lower()
+    repaired = (
+        not has_daughter
+        and confidence >= _SEMANTIC_REPAIR_MIN_CONFIDENCE
+        and any(term in evidence for term in _CHILD_EVIDENCE_TERMS)
+        and not any(term in evidence for term in _EXCLUSION_EVIDENCE_TERMS)
+    )
+    return DaughterVerification(
+        visible=(has_daughter and confidence >= 0.5) or repaired,
+        confidence=confidence,
+        description=description,
+        repaired=repaired,
+        raw_text=raw_text,
+    )
 
 
 def _image_content(path: Path) -> dict[str, Any]:
@@ -280,6 +340,13 @@ class LlamaAnalyzer:
         start_offset = max(0, _coerce_int(data.get("start_offset_seconds"), 0))
         end_offset = _coerce_int(data.get("end_offset_seconds"), duration_seconds)
         end_offset = max(start_offset + 1, min(end_offset, duration_seconds))
+        if annotation_offsets:
+            start_offset, end_offset = _snap_highlight_offsets(
+                start_offset,
+                end_offset,
+                annotation_offsets,
+                duration_seconds,
+            )
 
         title = str(data.get("title") or "Family moment").strip()[:120]
         summary = str(data.get("summary") or "Saved by the family moment analyzer.").strip()
@@ -296,20 +363,23 @@ class LlamaAnalyzer:
             raw_text=raw_text,
         )
 
-    async def verify_daughter_visible(self, frame_path: Path) -> bool:
-        """Quick yes/no check: does the frame clearly show the daughter?"""
+    async def verify_daughter_visible(
+        self, frame_paths: list[Path]
+    ) -> DaughterVerification:
+        """Check whether any verification frame clearly shows the daughter."""
         endpoint = self.settings.llama_base_url.rstrip("/") + "/chat/completions"
         instructions = (
-            "You are verifying a saved family video frame. Look carefully. "
-            "Is there a young girl (my daughter) clearly visible in this frame? "
-            "Answer JSON only with has_daughter (boolean) and confidence (0 to 1). "
+            "You are verifying three chronological frames from a saved family clip. "
+            "Is there a young girl (my daughter) clearly visible in any frame? "
+            "Answer JSON only with has_daughter (boolean), confidence (0 to 1), "
+            "and a short factual description of what is visible. "
             "Only set has_daughter=true if you can clearly see a young girl. "
             "Shadows, furniture, toys, or vague shapes do not count."
         )
         user_content: list[dict[str, Any]] = [
-            {"type": "text", "text": instructions},
-            _image_content(frame_path),
+            {"type": "text", "text": instructions}
         ]
+        user_content.extend(_image_content(path) for path in frame_paths)
         headers = {"Content-Type": "application/json"}
         if self.settings.llama_api_key:
             headers["Authorization"] = f"Bearer {self.settings.llama_api_key}"
@@ -333,7 +403,6 @@ class LlamaAnalyzer:
             self.settings.llama_timeout_seconds,
         )
         content = body["choices"][0]["message"]["content"]
-        data = _extract_json(_extract_message_text(content))
-        has_daughter = _coerce_bool(data.get("has_daughter"))
-        confidence = max(0.0, min(_coerce_float(data.get("confidence"), 0.0), 1.0))
-        return has_daughter and confidence >= 0.5
+        raw_text = _extract_message_text(content)
+        data = _extract_json(raw_text)
+        return _parse_daughter_verification(data, raw_text)

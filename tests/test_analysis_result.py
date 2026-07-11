@@ -1,4 +1,8 @@
-from nas_video_summarizer.llm import AnalysisResult
+from nas_video_summarizer.llm import (
+    AnalysisResult,
+    _parse_daughter_verification,
+    _snap_highlight_offsets,
+)
 
 
 def _result(*, keep=False, confidence=0.85, title="", summary="", tags=None):
@@ -59,3 +63,39 @@ def test_does_not_repair_explicit_exclusion_or_low_confidence():
 def test_original_true_keep_behavior_is_unchanged():
     assert _result(keep=True, confidence=0.8).should_save(0.5) is True
     assert _result(keep=True, confidence=0.3).should_save(0.5) is False
+
+
+def test_snaps_model_offsets_to_actual_sample_times():
+    offsets = [15.0, 30.0, 50.0, 70.0, 90.0, 110.0]
+
+    assert _snap_highlight_offsets(1, 3, offsets, 120) == (15, 30)
+    assert _snap_highlight_offsets(16, 31, offsets, 120) == (15, 30)
+    assert _snap_highlight_offsets(10, 120, offsets, 120) == (15, 110)
+
+
+def test_repairs_verification_boolean_when_description_sees_child():
+    verification = _parse_daughter_verification(
+        {
+            "has_daughter": False,
+            "confidence": 0.85,
+            "description": "A young girl is visible playing in the room.",
+        },
+        "raw",
+    )
+
+    assert verification.visible is True
+    assert verification.repaired is True
+
+
+def test_verification_negative_description_is_not_repaired():
+    verification = _parse_daughter_verification(
+        {
+            "has_daughter": False,
+            "confidence": 0.9,
+            "description": "No young girl is visible; the room is empty.",
+        },
+        "raw",
+    )
+
+    assert verification.visible is False
+    assert verification.repaired is False

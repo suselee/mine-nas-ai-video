@@ -702,15 +702,45 @@ class Supervisor:
         clip_path: Path,
         duration_seconds: float,
     ) -> bool:
-        """Extract a frame from the saved clip and verify it contains the daughter."""
+        """Verify the saved clip with frames from its beginning, middle, and end."""
         try:
             with tempfile.TemporaryDirectory(prefix="nas-video-verify-") as temp_dir:
-                frame_path = Path(temp_dir) / "verify.jpg"
-                middle_offset = max(0.0, duration_seconds / 2 - 1.0)
-                await _extract_frame(self.settings, clip_path, frame_path, middle_offset)
-                if not frame_path.exists():
+                last_offset = max(0.0, duration_seconds - 0.5)
+                offsets = sorted(
+                    {
+                        min(last_offset, max(0.0, duration_seconds * fraction))
+                        for fraction in (0.2, 0.5, 0.8)
+                    }
+                )
+                frame_paths: list[Path] = []
+                for index, offset in enumerate(offsets, start=1):
+                    frame_path = Path(temp_dir) / f"verify-{index}.jpg"
+                    await _extract_frame(
+                        self.settings, clip_path, frame_path, offset
+                    )
+                    if frame_path.exists():
+                        frame_paths.append(frame_path)
+                if not frame_paths:
                     return False
-                return await analyzer.verify_daughter_visible(frame_path)
+                verification = await analyzer.verify_daughter_visible(frame_paths)
+                if verification.repaired:
+                    self.database.add_event(
+                        "verify-consistency-repair",
+                        "corrected has_daughter=false from verification description",
+                    )
+                if not verification.visible:
+                    self.database.add_event(
+                        "verify-detail",
+                        json.dumps(
+                            {
+                                "confidence": verification.confidence,
+                                "description": verification.description,
+                                "raw_text": verification.raw_text[:1000],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                return verification.visible
         except Exception as exc:
             self.database.add_event("verify-error", str(exc))
             # If verification itself fails, be conservative and keep the clip.

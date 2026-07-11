@@ -52,3 +52,8 @@ summary, and tags explicitly describe a child playing or interacting, the
 service applies a conservative consistency repair. It requires confidence
 >= 0.75 plus both child and activity evidence, rejects exclusion language,
 and still runs the normal post-save daughter-visibility verification.
+
+Model-provided clip offsets are snapped to the nearest actual sampled-frame
+timestamps before extraction. Post-save verification uses three chronological
+frames from the resulting clip instead of only its midpoint, requests a factual
+description, and conservatively repairs the same false-boolean contradiction.
