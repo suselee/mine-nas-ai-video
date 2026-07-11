@@ -12,6 +12,47 @@ from urllib import error, request
 from .config import Settings
 
 
+_SEMANTIC_REPAIR_MIN_CONFIDENCE = 0.75
+_CHILD_EVIDENCE_TERMS = (
+    "daughter",
+    "young girl",
+    "young child",
+    "toddler",
+    "child",
+)
+_ACTIVITY_EVIDENCE_TERMS = (
+    "play",
+    "activity",
+    "interact",
+    "engaged",
+    "explor",
+    "walk",
+    "read",
+    "laugh",
+    "babbl",
+    "cuddl",
+    "danc",
+    "draw",
+)
+_EXCLUSION_EVIDENCE_TERMS = (
+    "empty room",
+    "no child",
+    "adults-only",
+    "adult only",
+    "sleeping",
+    "drowsy",
+    "screen time",
+    "blurry",
+    "black frame",
+    "not clearly visible",
+    "not engaged",
+    "no activity",
+    "merely idle",
+    "sitting idle",
+    "passive",
+)
+
+
 @dataclass(frozen=True)
 class AnalysisResult:
     keep: bool
@@ -25,12 +66,23 @@ class AnalysisResult:
     raw_text: str = ""
 
     def should_save(self, threshold: float) -> bool:
-        # The model returns both keep (boolean intent) and confidence
-        # (0..1). Both are required: a low-confidence "keep=true" from a
-        # 2B vision model on a low-res contact sheet is unreliable - it
-        # tends to see toys/furniture and assume a child is present. An
-        # AND gate makes the threshold filter out those weak guesses.
-        return self.keep and self.confidence >= threshold
+        # Normally both keep and confidence are required. Some small VLMs
+        # emit keep=false while their title/summary confidently describe a
+        # child playing; repair only that narrow contradiction.
+        return self.confidence >= threshold and (
+            self.keep or self.keep_consistency_repaired(threshold)
+        )
+
+    def keep_consistency_repaired(self, threshold: float) -> bool:
+        """Repair a high-confidence false boolean that contradicts the text."""
+        if self.keep or self.confidence < max(threshold, _SEMANTIC_REPAIR_MIN_CONFIDENCE):
+            return False
+        evidence = " ".join([self.title, self.summary, *self.tags]).lower()
+        if any(term in evidence for term in _EXCLUSION_EVIDENCE_TERMS):
+            return False
+        has_child = any(term in evidence for term in _CHILD_EVIDENCE_TERMS)
+        has_activity = any(term in evidence for term in _ACTIVITY_EVIDENCE_TERMS)
+        return has_child and has_activity
 
 
 def _image_content(path: Path) -> dict[str, Any]:

@@ -46,3 +46,9 @@ activities, and explicitly does **not** require high energy. It only
 **excludes** truly low-value scenes (empty room, sleeping, passive feeding,
 blank staring, screen time, blurry/black). Override `ANALYSIS_PROMPT` in
 `.env` if your household differs.
+
+For small VLMs that return `keep=false` while their high-confidence title,
+summary, and tags explicitly describe a child playing or interacting, the
+service applies a conservative consistency repair. It requires confidence
+>= 0.75 plus both child and activity evidence, rejects exclusion language,
+and still runs the normal post-save daughter-visibility verification.

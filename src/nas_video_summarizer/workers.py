@@ -395,7 +395,15 @@ class Supervisor:
             }
             try:
                 result = await self._analyze_segment(analyzer, segment)
-                if result.should_save(self.settings.moment_keep_threshold):
+                should_save = result.should_save(self.settings.moment_keep_threshold)
+                if result.keep_consistency_repaired(
+                    self.settings.moment_keep_threshold
+                ):
+                    self.database.add_event(
+                        "keep-consistency-repair",
+                        f"corrected keep=false for high-confidence child activity: {result.title}",
+                    )
+                if should_save:
                     if self._moment_cooldown_active():
                         self.database.add_event(
                             "moment-cooldown",
@@ -415,7 +423,7 @@ class Supervisor:
                             moment_id = await self._save_moment(segment, result, analyzer)
                             if moment_id >= 0:
                                 self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
-                if not result.should_save(self.settings.moment_keep_threshold):
+                if not should_save:
                     self.database.add_event(
                         "analysis-skip",
                         json.dumps(
@@ -435,7 +443,7 @@ class Supervisor:
                 self.state["analyzer"] = {
                     "status": "ok",
                     "last_segment": segment["path"],
-                    "last_keep": result.should_save(self.settings.moment_keep_threshold),
+                    "last_keep": should_save,
                     "updated_at": utc_now_iso(),
                 }
             except PersonFilterSkip:
@@ -648,6 +656,9 @@ class Supervisor:
             "summary": result.summary,
             "tags": result.tags,
             "confidence": result.confidence,
+            "keep_consistency_repaired": result.keep_consistency_repaired(
+                self.settings.moment_keep_threshold
+            ),
             "source_low_segment": segment["path"],
             "source_started_at": source_started.isoformat(timespec="seconds"),
             "source_ended_at": source_ended.isoformat(timespec="seconds"),
