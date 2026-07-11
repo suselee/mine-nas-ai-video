@@ -57,3 +57,6 @@ Model-provided clip offsets are snapped to the nearest actual sampled-frame
 timestamps before extraction. Post-save verification uses three chronological
 frames from the resulting clip instead of only its midpoint, requests a factual
 description, and conservatively repairs the same false-boolean contradiction.
+A negative verification deletes a clip only at confidence >= 0.75; lower
+confidence is treated as uncertain and kept with a `verify-uncertain-keep`
+event.

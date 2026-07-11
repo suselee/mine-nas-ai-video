@@ -728,6 +728,18 @@ class Supervisor:
                         "verify-consistency-repair",
                         "corrected has_daughter=false from verification description",
                     )
+                if not verification.visible and verification.confidence < 0.75:
+                    self.database.add_event(
+                        "verify-uncertain-keep",
+                        json.dumps(
+                            {
+                                "confidence": verification.confidence,
+                                "description": verification.description,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    return True
                 if not verification.visible:
                     self.database.add_event(
                         "verify-detail",

@@ -380,3 +380,34 @@ def test_saved_clip_verification_uses_three_frames(tmp_path, monkeypatch):
 
     assert verified is True
     assert offsets == [4.0, 10.0, 16.0]
+
+
+def test_low_confidence_negative_verification_keeps_clip(tmp_path, monkeypatch):
+    settings = load_settings("/nonexistent.env")
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+
+    async def fake_extract(settings, clip_path, frame_path, offset):
+        frame_path.write_bytes(b"jpeg")
+
+    class FakeAnalyzer:
+        async def verify_daughter_visible(self, frame_paths):
+            return DaughterVerification(
+                visible=False,
+                confidence=0.1,
+                description="A blurry person, possibly interacting with a child.",
+                repaired=False,
+                raw_text="{}",
+            )
+
+    monkeypatch.setattr("nas_video_summarizer.workers._extract_frame", fake_extract)
+
+    verified = asyncio.run(
+        supervisor._verify_saved_clip(
+            FakeAnalyzer(), tmp_path / "clip.mp4", duration_seconds=20
+        )
+    )
+
+    assert verified is True
+    assert database.recent_events(limit=1)[0]["event_type"] == "verify-uncertain-keep"
