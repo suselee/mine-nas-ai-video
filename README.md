@@ -9,7 +9,8 @@ For slow local vision models such as Qwen3-VL-2B in llama.cpp, the default analy
 ## Quick Start
 
 ```sh
-pkg install python311 py311-sqlite3 ffmpeg
+pkg install python311 py311-sqlite3 py311-opencv py311-numpy ffmpeg
+uv venv --python /usr/local/bin/python3.11 --system-site-packages
 uv sync --no-dev
 cp .env.example .env
 uv run nas-video-check

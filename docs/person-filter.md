@@ -16,9 +16,9 @@ All backends run via OpenCV DNN, so the **only** runtime dependency is
 | `yolov8n`        | `yolov8n.onnx`   | High     | ~12 MB  | Older but well-proven YOLOv8n.         |
 | `mobilenet_ssd`  | Caffe sample     | Lower    | ~22 MB  | Older model, more false positives.     |
 
-The YOLO ONNX export is downloaded automatically on first run to
-`src/nas_video_summarizer/_person_filter_models/`.  To use a custom export
-(e.g. a different YOLO variant or a quantized build), set
+The YOLO ONNX export is downloaded automatically during `nas-video-check` or
+the first analyzed segment to `DATA_DIR/person_filter_models/`. To use a custom
+export (e.g. a different YOLO variant or a quantized build), set
 `PERSON_FILTER_MODEL_URL` to its download URL — it overrides the built-in
 source.  The YOLO decoder auto-detects the export layout (raw `one-to-many`
 head `(1, nc+4, N)` **or** end-to-end `one-to-one` head `(1, 300, 6)`), so
@@ -43,7 +43,13 @@ safely:
 
 ```bash
 pkg install py311-opencv py311-numpy
+uv venv --clear --python /usr/local/bin/python3.11 --system-site-packages
+uv sync --no-dev
 ```
+
+FreeBSD `pkg` installs OpenCV and NumPy into the system Python's
+`site-packages`. A normal isolated virtual environment cannot import them;
+`--system-site-packages` makes those packages visible to `uv run`.
 
 `opencv` must be >= 4.7 for YOLOv8 ONNX support (4.8+ recommended).
 
@@ -53,14 +59,15 @@ For non-FreeBSD / local development you can instead pip-install:
 pip install -r requirements-filter.txt
 ```
 
-On first run the model file is downloaded automatically to
-`src/nas_video_summarizer/_person_filter_models/`.
+Run `uv run nas-video-check` to verify the imports and download/load the model
+before starting the service.
 
 ## Configuration (.env)
 
 ```env
 PERSON_FILTER_ENABLED=true
-PERSON_FILTER_BACKEND=yolov8n
+PERSON_FILTER_BACKEND=yolov11n
+PERSON_FILTER_MODEL_DIR=/var/db/nas-video/person_filter_models
 PERSON_FILTER_THRESHOLD=0.3
 PERSON_FILTER_SAMPLE_COUNT=12
 ```

@@ -51,6 +51,7 @@ def test_new_window_and_quota_defaults():
     assert settings.max_moments_per_day == 0
     assert settings.record_window_start == ""
     assert settings.record_window_end == ""
+    assert settings.person_filter_model_dir == settings.data_dir / "person_filter_models"
 
 
 def test_env_overrides_window_and_quota():

@@ -132,6 +132,7 @@ class Settings:
     person_filter_enabled: bool
     person_filter_backend: str
     person_filter_model_url: str
+    person_filter_model_dir: Path
     person_filter_threshold: float
     person_filter_sample_count: int
 
@@ -154,12 +155,13 @@ class Settings:
 
 def load_settings(env_file: str | Path = ".env") -> Settings:
     load_env_file(env_file)
+    data_dir = _path("DATA_DIR", "./var")
 
     return Settings(
         app_host=os.getenv("APP_HOST", "0.0.0.0"),
         app_port=_int("APP_PORT", 8000),
         workers_enabled=_bool("WORKERS_ENABLED", True),
-        data_dir=_path("DATA_DIR", "./var"),
+        data_dir=data_dir,
         buffer_dir=_path("BUFFER_DIR", "./var/buffer"),
         output_dir=_path("NEXTCLOUD_OUTPUT_DIR", "./var/nextcloud_moments"),
         database_path=_path("DATABASE_PATH", "./var/app.sqlite3"),
@@ -241,6 +243,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         person_filter_enabled=_bool("PERSON_FILTER_ENABLED", False),
         person_filter_backend=os.getenv("PERSON_FILTER_BACKEND", "yolov11n").strip().lower(),
         person_filter_model_url=os.getenv("PERSON_FILTER_MODEL_URL", "").strip(),
+        person_filter_model_dir=_path(
+            "PERSON_FILTER_MODEL_DIR", str(data_dir / "person_filter_models")
+        ),
         person_filter_threshold=_float("PERSON_FILTER_THRESHOLD", 0.3),
         person_filter_sample_count=_int("PERSON_FILTER_SAMPLE_COUNT", 12),
     )
@@ -254,5 +259,6 @@ def ensure_directories(settings: Settings) -> None:
         settings.database_path.parent,
         settings.low_buffer_dir,
         settings.high_buffer_dir,
+        settings.person_filter_model_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)

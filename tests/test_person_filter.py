@@ -6,11 +6,6 @@ cv2 = pytest.importorskip("cv2")
 from nas_video_summarizer import person_filter as pf
 
 
-def test_model_dir_lives_inside_package():
-    assert pf._MODEL_DIR.name == "_person_filter_models"
-    assert pf._MODEL_DIR.parent.name == "nas_video_summarizer"
-
-
 def test_invalid_backend_falls_back_to_yolov11n():
     f = pf.PersonFilter(backend="bogus")
     assert f._backend == "yolov11n"

@@ -2,17 +2,24 @@
 
 This app is meant to run inside a jail as the orchestrator. `ffmpeg` does the RTSP recording and clip cutting; Python handles state, queues, llama.cpp calls, and the web UI.
 
-The runtime path deliberately avoids FastAPI, Pydantic, httpx, and other packages that can force Rust or native extension builds on FreeBSD. Only Python's standard library and `ffmpeg` are required to run the service.
+The runtime path deliberately avoids FastAPI, Pydantic, httpx, and other
+packages that can force Rust or native extension builds on FreeBSD. The core
+service uses Python's standard library and `ffmpeg`; the enabled-by-default
+person filter additionally uses the OpenCV and NumPy packages supplied by
+FreeBSD.
 
 ## 1. Packages
 
-Install Python, SQLite support, `uv`, and `ffmpeg` in the jail.
+Install Python, SQLite support, `uv`, `ffmpeg`, and the person-filter runtime
+packages in the jail.
 
 ```sh
-pkg install python311 py311-sqlite3 ffmpeg
+pkg install python311 py311-sqlite3 py311-opencv py311-numpy ffmpeg
 ```
 
-Python 3.11 or newer is supported. If your jail already uses Python 3.12, install `python312 py312-sqlite3` instead.
+Python 3.11 or newer is supported. If your jail uses Python 3.12, install the
+matching `python312`, `py312-sqlite3`, `py312-opencv`, and `py312-numpy`
+packages and use `/usr/local/bin/python3.12` in the `uv venv` commands.
 
 Install `uv` using your preferred FreeBSD package or Python user install. Confirm it is visible to the service user:
 
@@ -40,8 +47,18 @@ Expose `/mnt/nextcloud-family-moments` to Nextcloud as external storage. Avoid w
 
 ```sh
 cd /usr/local/mine_nas_ai_video
+uv venv --python /usr/local/bin/python3.11 --system-site-packages
 uv sync --no-dev
 cp .env.example .env
+```
+
+The `--system-site-packages` flag is required for the project environment to
+see `py311-opencv` and `py311-numpy` installed by `pkg`. If `.venv` already
+exists without that flag, recreate it once:
+
+```sh
+uv venv --clear --python /usr/local/bin/python3.11 --system-site-packages
+uv sync --no-dev
 ```
 
 Edit `.env`:
@@ -66,6 +83,11 @@ Run the preflight:
 ```sh
 uv run nas-video-check
 ```
+
+With `PERSON_FILTER_ENABLED=true`, preflight imports OpenCV, downloads the
+configured ONNX model, and loads it before reporting success. The model is
+stored under `DATA_DIR/person_filter_models` by default, where the service
+user can write it.
 
 Start manually once:
 

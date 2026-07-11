@@ -633,6 +633,7 @@ def _run_person_filter(
             threshold=settings.person_filter_threshold,
             backend=settings.person_filter_backend,
             model_url=settings.person_filter_model_url,
+            model_dir=settings.person_filter_model_dir,
         )
     results: list[dict[str, object]] = []
     for idx, b64 in enumerate(images_b64):
@@ -694,5 +695,4 @@ async def _is_blank_frame(settings: Settings, path: Path) -> bool:
     except ValueError:
         return False
     return luma <= _BLANK_LUMA_THRESHOLD
-
 

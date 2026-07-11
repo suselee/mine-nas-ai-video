@@ -57,12 +57,14 @@ _YOLO_INPUT_SIZE = 640
 _DEFAULT_MODEL = "yolov11n"
 
 
-def _ensure_models(model_key: str, model_url: str = "") -> Path:
-    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+def _ensure_models(
+    model_key: str, model_url: str = "", model_dir: Path = _MODEL_DIR
+) -> Path:
+    model_dir.mkdir(parents=True, exist_ok=True)
 
     if model_key == "mobilenet_ssd":
-        prototxt = _MODEL_DIR / "deploy.prototxt"
-        caffemodel = _MODEL_DIR / "mobilenet_iter_73000.caffemodel"
+        prototxt = model_dir / "deploy.prototxt"
+        caffemodel = model_dir / "mobilenet_iter_73000.caffemodel"
         if not prototxt.exists():
             _download(_MOBILENET_PROTOTXT_URL, prototxt)
         if not caffemodel.exists():
@@ -70,7 +72,7 @@ def _ensure_models(model_key: str, model_url: str = "") -> Path:
         return caffemodel
 
     spec = _YOLO_NETS[model_key]
-    onnx = _MODEL_DIR / spec["filename"]
+    onnx = model_dir / spec["filename"]
     if not onnx.exists():
         _download(model_url or spec["url"], onnx)
     return onnx
@@ -78,8 +80,14 @@ def _ensure_models(model_key: str, model_url: str = "") -> Path:
 
 def _download(url: str, dest: Path) -> None:
     print(f"Downloading {dest.name} ...")
-    with request.urlopen(url) as resp:
-        dest.write_bytes(resp.read())
+    temporary = dest.with_suffix(f"{dest.suffix}.part")
+    try:
+        with request.urlopen(url) as resp, temporary.open("wb") as output:
+            while chunk := resp.read(1024 * 1024):
+                output.write(chunk)
+        temporary.replace(dest)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class PersonFilter:
@@ -105,17 +113,26 @@ class PersonFilter:
         threshold: float = 0.2,
         backend: str = _DEFAULT_MODEL,
         model_url: str = "",
+        model_dir: Path | None = None,
     ):
         if backend not in _YOLO_NETS and backend != "mobilenet_ssd":
             backend = _DEFAULT_MODEL
         self._backend = backend
         self._threshold = threshold
         self._model_url = model_url
+        self._model_dir = model_dir or _MODEL_DIR
         self._is_yolo = backend != "mobilenet_ssd"
         self._input_size = _YOLO_NETS.get(backend, {}).get("input_size", _YOLO_INPUT_SIZE)
         self._net = None
         self._cv2 = None
         self._np = None
+        self._model_path = None
+
+    def prepare(self) -> Path:
+        """Download and load the configured model, returning its local path."""
+        self._init_net()
+        assert self._model_path is not None
+        return self._model_path
 
     def _init_net(self):
         if self._net is not None:
@@ -126,11 +143,14 @@ class PersonFilter:
         self._cv2 = cv2
         self._np = np
 
-        model_path = _ensure_models(self._backend, self._model_url)
+        model_path = _ensure_models(
+            self._backend, self._model_url, self._model_dir
+        )
+        self._model_path = model_path
         if self._is_yolo:
             self._net = cv2.dnn.readNetFromONNX(str(model_path))
         else:
-            prototxt = _MODEL_DIR / "deploy.prototxt"
+            prototxt = self._model_dir / "deploy.prototxt"
             self._net = cv2.dnn.readNetFromCaffe(str(prototxt), str(model_path))
         self._net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
         self._net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)

@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .config import Settings, ensure_directories, load_settings
 from .database import Database
+from .person_filter import PersonFilter
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,40 @@ def _rtsp_credentials_check(settings: Settings) -> tuple[bool, str]:
     if urlsplit(settings.rtsp_low_url).username or urlsplit(settings.rtsp_high_url).username:
         return True, "embedded in URL"
     return False, "not configured; OK only for cameras without auth"
+
+
+def _person_filter_check(settings: Settings) -> Check:
+    if not settings.person_filter_enabled:
+        return Check("person filter", True, "disabled", required=False)
+
+    try:
+        detector = PersonFilter(
+            threshold=settings.person_filter_threshold,
+            backend=settings.person_filter_backend,
+            model_url=settings.person_filter_model_url,
+            model_dir=settings.person_filter_model_dir,
+        )
+        model_path = detector.prepare()
+        import cv2
+
+        return Check(
+            "person filter",
+            True,
+            f"{settings.person_filter_backend}, OpenCV {cv2.__version__}, {model_path}",
+        )
+    except ImportError as exc:
+        return Check(
+            "person filter",
+            False,
+            f"{exc}; on FreeBSD recreate .venv with uv venv --clear "
+            "--system-site-packages --python /usr/local/bin/python3.11",
+        )
+    except Exception as exc:
+        return Check(
+            "person filter",
+            False,
+            f"{settings.person_filter_backend} initialization failed: {exc}",
+        )
 
 
 def build_checks(settings: Settings) -> list[Check]:
@@ -104,6 +139,7 @@ def build_checks(settings: Settings) -> list[Check]:
             settings.database_path.parent.exists(),
             str(settings.database_path.parent),
         ),
+        _person_filter_check(settings),
     ]
 
 
