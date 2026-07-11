@@ -60,6 +60,8 @@ def _person_filter_check(settings: Settings) -> Check:
             backend=settings.person_filter_backend,
             model_url=settings.person_filter_model_url,
             model_dir=settings.person_filter_model_dir,
+            face_threshold=settings.person_filter_face_threshold,
+            adult_threshold=settings.person_filter_adult_threshold,
         )
         model_path = detector.prepare()
         import cv2

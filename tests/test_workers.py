@@ -4,7 +4,11 @@ from datetime import datetime, timedelta
 
 from nas_video_summarizer.config import load_settings
 from nas_video_summarizer.database import Database
-from nas_video_summarizer.ffmpeg_tools import SampledFrame
+from nas_video_summarizer.ffmpeg_tools import (
+    ContactSheet,
+    PersonFilterDecision,
+    SampledFrame,
+)
 from nas_video_summarizer.llm import AnalysisResult
 from nas_video_summarizer.workers import (
     Supervisor,
@@ -222,3 +226,123 @@ def test_analyze_segment_passes_actual_frame_offsets(tmp_path, monkeypatch):
     )
 
     assert captured["offsets"] == [73.5]
+
+
+def test_contact_sheet_uses_prefiltered_frames(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        analysis_image_mode="contact_sheet",
+        person_filter_enabled=True,
+    )
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    frames = []
+    for index, offset in enumerate((20.0, 80.0)):
+        path = tmp_path / f"frame-{index}.jpg"
+        path.write_bytes(b"jpeg")
+        frames.append(SampledFrame(path=path, offset_seconds=offset))
+    captured = {}
+
+    async def fake_sample(*args, **kwargs):
+        return frames
+
+    async def fake_blank(settings, sampled_frames):
+        return sampled_frames
+
+    async def fake_filter(settings, sampled_frames):
+        return PersonFilterDecision([sampled_frames[1]])
+
+    async def fake_sheet(settings, sampled_frames, output_dir):
+        captured["sheet_frames"] = sampled_frames
+        path = output_dir / "contact_sheet.jpg"
+        path.write_bytes(b"sheet")
+        return ContactSheet(path=path, frame_offsets_seconds=[80.0])
+
+    class FakeAnalyzer:
+        async def analyze(self, **kwargs):
+            captured["image_paths"] = kwargs["image_paths"]
+            captured["offsets"] = kwargs["frame_offsets_seconds"]
+            return _result(0.1)
+
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.sample_frames_with_offsets", fake_sample
+    )
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.filter_out_blank_frames", fake_blank
+    )
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.filter_frames_by_person_detection",
+        fake_filter,
+    )
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.build_contact_sheet_from_frames",
+        fake_sheet,
+    )
+
+    asyncio.run(
+        supervisor._analyze_segment(
+            FakeAnalyzer(),
+            {"path": str(tmp_path / "segment.mp4"), "duration_seconds": 120},
+        )
+    )
+
+    assert captured["sheet_frames"] == [frames[1]]
+    assert captured["offsets"] == [80.0]
+    assert captured["image_paths"][0].name == "contact_sheet.jpg"
+    assert supervisor.state["prefilter"]["status"] == "ready"
+    assert supervisor.state["prefilter"]["input_frames"] == 2
+    assert supervisor.state["prefilter"]["output_frames"] == 1
+
+
+def test_adult_only_filter_records_distinct_event(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        analysis_image_mode="frames",
+        person_filter_enabled=True,
+    )
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    frame_path = tmp_path / "frame.jpg"
+    frame_path.write_bytes(b"jpeg")
+
+    async def fake_sample(*args, **kwargs):
+        return [SampledFrame(path=frame_path, offset_seconds=30.0)]
+
+    async def fake_blank(settings, sampled_frames):
+        return sampled_frames
+
+    async def fake_filter(settings, sampled_frames):
+        return PersonFilterDecision([], "adult-only")
+
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.sample_frames_with_offsets", fake_sample
+    )
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.filter_out_blank_frames", fake_blank
+    )
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.filter_frames_by_person_detection",
+        fake_filter,
+    )
+
+    try:
+        asyncio.run(
+            supervisor._analyze_segment(
+                object(),
+                {
+                    "id": 1,
+                    "path": str(tmp_path / "segment.mp4"),
+                    "duration_seconds": 120,
+                },
+            )
+        )
+    except Exception as exc:
+        assert exc.__class__.__name__ == "PersonFilterSkip"
+    else:
+        raise AssertionError("adult-only segment should skip analysis")
+
+    events = database.recent_events(limit=1)
+    assert events[0]["event_type"] == "adult-only-filter-skip"
+    assert supervisor.state["prefilter"]["status"] == "adult-only"

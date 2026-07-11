@@ -1,12 +1,15 @@
 from pathlib import Path
 
 import asyncio
+from dataclasses import replace
 
 from nas_video_summarizer.ffmpeg_tools import (
     SampledFrame,
+    _select_person_filtered_frames,
     _hwaccel_args,
     _motion_aware_offsets,
     contact_sheet_layout,
+    filter_frames_by_person_detection,
     filter_out_blank_frames,
     sample_offsets,
 )
@@ -134,3 +137,67 @@ def test_filter_out_blank_frames_keeps_mixed(monkeypatch):
     out = asyncio.run(filter_out_blank_frames(settings, frames))
     assert len(out) == 1
 
+
+def _person_filter_frames(tmp_path, count=3):
+    frames = []
+    for index in range(count):
+        path = tmp_path / f"frame-{index}.jpg"
+        path.write_bytes(b"jpeg")
+        frames.append(SampledFrame(path=path, offset_seconds=float(index * 10)))
+    return frames
+
+
+def test_person_filter_skips_when_every_person_frame_is_adult(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"), person_filter_enabled=True
+    )
+    scores = [
+        {"person_score": 0.9, "adult_only": True, "adult_score": 0.98},
+        {"person_score": 0.8, "adult_only": True, "adult_score": 0.95},
+    ]
+    decision = _select_person_filtered_frames(
+        settings, _person_filter_frames(tmp_path, count=2), scores
+    )
+
+    assert decision.frames == []
+    assert decision.skip_reason == "adult-only"
+
+
+def test_person_filter_keeps_and_prioritizes_child_or_uncertain_frames(
+    tmp_path, monkeypatch
+):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        person_filter_enabled=True,
+        sample_frame_count=2,
+    )
+    scores = [
+        {"person_score": 0.95, "adult_only": True, "child_score": 0.01},
+        {"person_score": 0.75, "adult_only": False, "child_score": 0.2},
+        {"person_score": 0.8, "adult_only": False, "child_score": 0.85},
+    ]
+    frames = _person_filter_frames(tmp_path)
+
+    decision = _select_person_filtered_frames(settings, frames, scores)
+
+    assert decision.skip_reason is None
+    assert decision.frames == [frames[1], frames[2]]
+
+
+def test_person_filter_age_failure_is_fail_open(tmp_path, monkeypatch):
+    from nas_video_summarizer import ffmpeg_tools as ft
+
+    settings = replace(
+        load_settings("/nonexistent.env"), person_filter_enabled=True
+    )
+    frames = _person_filter_frames(tmp_path, count=1)
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("age model failed")
+
+    monkeypatch.setattr(ft.asyncio, "to_thread", fail)
+
+    decision = asyncio.run(filter_frames_by_person_detection(settings, frames))
+
+    assert decision.frames == frames
+    assert decision.skip_reason is None

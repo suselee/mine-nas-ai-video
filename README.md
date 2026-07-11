@@ -37,6 +37,8 @@ Important values:
 - `MAX_MOMENT_SECONDS`: maximum saved clip length after adding before/after context.
 - `ANALYSIS_IMAGE_MODE`: `contact_sheet` by default; use `frames` only when the model is fast enough.
 - `ANALYSIS_FRAME_WIDTH`: width of each sampled frame before it is sent or placed into the contact sheet.
+- `PERSON_FILTER_ENABLED`: locally skips frames with no person and segments
+  where every visible person is confidently classified as an adult.
 
 ## Camera Stream Advice
 

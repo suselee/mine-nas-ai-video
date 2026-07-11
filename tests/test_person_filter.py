@@ -57,6 +57,9 @@ def test_yolo_decode_picks_person_and_skips_other_classes():
 
     result = f._detect_yolo(img)
     assert result["person_score"] == pytest.approx(0.9)
+    assert result["person_boxes"] == pytest.approx(
+        [[30 / 640, 10 / 640, 40 / 640, 80 / 640]]
+    )
     # normalized bbox area of the kept 40x80 person box on 640x640 input
     assert result["face_bbox_area"] == pytest.approx((40 * 80) / (640 * 640), rel=1e-3)
 
@@ -102,6 +105,44 @@ def test_mobilenet_decode_picks_person_class():
     result = f._detect_mobilenet(img)
     assert result["person_score"] == pytest.approx(0.85)
     assert result["face_score"] == 0.0
+
+
+def test_age_filter_requires_every_person_to_be_confidently_adult():
+    f = pf.PersonFilter(adult_threshold=0.9)
+    f._cv2 = _FakeCv2()
+    f._face_net = _FakeNet(
+        np.array([[[[0, 0, 0.95, 0.2, 0.1, 0.4, 0.3]]]], dtype=np.float32)
+    )
+    f._age_net = _FakeNet(
+        np.array([[0.01, 0.01, 0.01, 0.2, 0.2, 0.2, 0.17, 0.2]], dtype=np.float32)
+    )
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    result = f._classify_ages(img, [[0.0, 0.0, 1.0, 1.0]])
+
+    assert result["adult_only"] is True
+    assert result["matched_person_count"] == 1
+    assert result["adult_score"] == pytest.approx(0.97)
+
+
+def test_age_filter_is_uncertain_when_a_person_has_no_matching_face():
+    f = pf.PersonFilter(adult_threshold=0.9)
+    f._cv2 = _FakeCv2()
+    f._face_net = _FakeNet(
+        np.array([[[[0, 0, 0.95, 0.1, 0.1, 0.2, 0.2]]]], dtype=np.float32)
+    )
+    f._age_net = _FakeNet(
+        np.array([[0.01, 0.01, 0.01, 0.2, 0.2, 0.2, 0.17, 0.2]], dtype=np.float32)
+    )
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    result = f._classify_ages(
+        img,
+        [[0.0, 0.0, 0.4, 0.5], [0.6, 0.0, 0.4, 0.5]],
+    )
+
+    assert result["adult_only"] is False
+    assert result["matched_person_count"] == 1
 
 
 class _FakeNet:

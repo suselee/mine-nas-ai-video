@@ -33,8 +33,10 @@ that masks mid-day or a brief power-off. No extra Python dependencies.
   beats the weakest clip already saved that day (the weakest is then
   deleted). Set `~20` to bound disk while keeping the best moments.
 - Person pre-filter (`PERSON_FILTER_ENABLED=true`, default `yolov11n`) drops
-  empty-room / no-person segments before they reach the LLM — this is what
-  stops "empty room" clips from ever being saved.
+  empty-room / no-person segments before they reach the LLM. It also uses a
+  local face/age model to drop a segment when every visible person is
+  confidently an adult. Hidden faces and uncertain ages still reach the LLM
+  so a partially visible child is not discarded.
 
 ## Prompt for a toddler (~1.5y)
 

@@ -22,3 +22,29 @@ def test_download_replaces_partial_file_atomically(tmp_path, monkeypatch):
 
     assert destination.read_bytes() == b"complete"
     assert not partial.exists()
+
+
+def test_age_model_assets_use_configured_model_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        pf, "_download", lambda url, destination: destination.write_bytes(b"model")
+    )
+
+    paths = pf._ensure_age_models(tmp_path)
+
+    assert {path.name for path in paths} == {
+        "opencv_face_detector.pbtxt",
+        "opencv_face_detector_uint8.pb",
+        "age_deploy.prototxt",
+        "age_net.caffemodel",
+    }
+    assert all(path.parent == tmp_path and path.exists() for path in paths)
+
+
+def test_face_matches_smallest_containing_person_box():
+    boxes = [
+        [0.0, 0.0, 1.0, 1.0],
+        [0.2, 0.2, 0.3, 0.3],
+    ]
+
+    assert pf.PersonFilter._matching_person((0.3, 0.3), boxes) == 1
+    assert pf.PersonFilter._matching_person((1.2, 0.3), boxes) is None

@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from .config import Settings
 from .database import Database, utc_now_iso
 from .ffmpeg_tools import (
     _extract_frame,
-    build_contact_sheet_with_offsets,
+    build_contact_sheet_from_frames,
     build_recorder_command,
     extract_clip,
     ffmpeg_available,
@@ -142,6 +143,7 @@ class Supervisor:
                 "high": {"status": "not-started"},
             },
             "scanner": {"status": "not-started"},
+            "prefilter": {"status": "not-started"},
             "analyzer": {"status": "not-started"},
             "cleanup": {"status": "not-started"},
         }
@@ -464,62 +466,96 @@ class Supervisor:
 
     async def _analyze_segment(self, analyzer: LlamaAnalyzer, segment: dict[str, Any]) -> AnalysisResult:
         with tempfile.TemporaryDirectory(prefix="nas-video-frames-") as temp_dir:
+            prefilter_started = time.monotonic()
             duration_seconds = int(segment["duration_seconds"])
-            if self.settings.analysis_image_mode == "frames":
-                sample_count = (
-                    self.settings.person_filter_sample_count
-                    if self.settings.person_filter_enabled
-                    else self.settings.sample_frame_count
+            sample_count = (
+                self.settings.person_filter_sample_count
+                if self.settings.person_filter_enabled
+                else self.settings.sample_frame_count
+            )
+            sampled_frames = await sample_frames_with_offsets(
+                self.settings,
+                Path(segment["path"]),
+                Path(temp_dir) / "frames",
+                duration_seconds=duration_seconds,
+                sample_count=sample_count,
+            )
+            extracted_frame_count = len(sampled_frames)
+            sampled_frames = await filter_out_blank_frames(
+                self.settings, sampled_frames
+            )
+            if not sampled_frames:
+                self._record_prefilter(
+                    prefilter_started, "blank", extracted_frame_count, 0
                 )
-                sampled_frames = await sample_frames_with_offsets(
-                    self.settings,
-                    Path(segment["path"]),
-                    Path(temp_dir),
-                    duration_seconds=duration_seconds,
-                    sample_count=sample_count,
+                self.database.add_event(
+                    "blank-frame-skip",
+                    "all sampled frames are near-black (camera masked/off?)",
                 )
+                self.database.mark_segment_processed(int(segment["id"]))
+                raise PersonFilterSkip()
 
-                sampled_frames = await filter_out_blank_frames(
-                    self.settings, sampled_frames
+            decision = await filter_frames_by_person_detection(
+                self.settings,
+                sampled_frames,
+            )
+            sampled_frames = decision.frames
+            if not sampled_frames:
+                outcome = decision.skip_reason or "no-person"
+                self._record_prefilter(
+                    prefilter_started, outcome, extracted_frame_count, 0
                 )
-                if not sampled_frames:
+                if decision.skip_reason == "adult-only":
                     self.database.add_event(
-                        "blank-frame-skip",
-                        "all sampled frames are near-black (camera masked/off?)",
+                        "adult-only-filter-skip",
+                        "all visible people were confidently classified as adults",
                     )
-                    self.database.mark_segment_processed(int(segment["id"]))
-                    raise PersonFilterSkip()
-
-                if self.settings.person_filter_enabled:
-                    sampled_frames = await filter_frames_by_person_detection(
-                        self.settings,
-                        sampled_frames,
+                else:
+                    self.database.add_event(
+                        "person-filter-skip",
+                        "no person detected in any frame",
                     )
-                    if not sampled_frames:
-                        self.database.add_event(
-                            "person-filter-skip",
-                            "no person detected in any frame",
-                        )
-                        self.database.mark_segment_processed(int(segment["id"]))
-                        raise PersonFilterSkip()
+                self.database.mark_segment_processed(int(segment["id"]))
+                raise PersonFilterSkip()
 
+            if self.settings.analysis_image_mode == "frames":
                 image_paths = [frame.path for frame in sampled_frames]
                 frame_offsets_seconds = [frame.offset_seconds for frame in sampled_frames]
             else:
-                sheet = await build_contact_sheet_with_offsets(
+                sheet = await build_contact_sheet_from_frames(
                     self.settings,
-                    Path(segment["path"]),
+                    sampled_frames,
                     Path(temp_dir),
-                    duration_seconds=duration_seconds,
                 )
                 image_paths = [sheet.path]
                 frame_offsets_seconds = sheet.frame_offsets_seconds
+            self._record_prefilter(
+                prefilter_started,
+                "ready",
+                extracted_frame_count,
+                len(sampled_frames),
+            )
             return await analyzer.analyze(
                 video_path=Path(segment["path"]),
                 image_paths=image_paths,
                 duration_seconds=duration_seconds,
                 frame_offsets_seconds=frame_offsets_seconds,
             )
+
+    def _record_prefilter(
+        self,
+        started_at: float,
+        outcome: str,
+        input_frame_count: int,
+        output_frame_count: int,
+    ) -> None:
+        self.state["prefilter"] = {
+            "status": outcome,
+            "seconds": round(time.monotonic() - started_at, 3),
+            "input_frames": input_frame_count,
+            "output_frames": output_frame_count,
+            "updated_at": utc_now_iso(),
+        }
 
     async def _save_moment(
         self,
@@ -714,6 +750,8 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "analysis_image_mode": settings.analysis_image_mode,
             "analysis_frame_width": settings.analysis_frame_width,
             "sample_frame_count": settings.sample_frame_count,
+            "person_filter_face_threshold": settings.person_filter_face_threshold,
+            "person_filter_adult_threshold": settings.person_filter_adult_threshold,
             "analysis_stream_role": settings.analysis_stream_role,
             "analysis_window_start": settings.analysis_window_start,
             "analysis_window_end": settings.analysis_window_end,

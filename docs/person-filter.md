@@ -1,13 +1,14 @@
 # Person Filter — Local Deployment
 
 The person detection pre-filter runs **inline on the NAS** (no separate
-service, no HTTP).  Sampled frames are scored with a local OpenCV DNN model
-so the NAS can skip empty-room segments without calling the LLM.
+service, no HTTP). Sampled frames are scored with local OpenCV DNN models so
+the NAS can skip empty-room and confidently adult-only segments without
+calling the LLM.
 
 ## Backends
 
-All backends run via OpenCV DNN, so the **only** runtime dependency is
-`opencv` — no `onnxruntime` / `torch` needed.
+All models run via OpenCV DNN, so the only runtime packages are `opencv` and
+`numpy` — no `onnxruntime` / `torch` needed.
 
 | Backend          | Model            | Accuracy | Weight  | Notes                                   |
 |------------------|------------------|----------|---------|-----------------------------------------|
@@ -15,6 +16,13 @@ All backends run via OpenCV DNN, so the **only** runtime dependency is
 | `yolov26n`       | `yolo26n.onnx`   | Highest  | ~10 MB  | YOLO26n, ~30% faster than v11n on CPU, more accurate. **Optional** — see caveat below. |
 | `yolov8n`        | `yolov8n.onnx`   | High     | ~12 MB  | Older but well-proven YOLOv8n.         |
 | `mobilenet_ssd`  | Caffe sample     | Lower    | ~22 MB  | Older model, more false positives.     |
+
+When person filtering is enabled, two additional models are loaded:
+
+| Purpose | Model | Weight | Notes |
+|---------|-------|--------|-------|
+| Face detection | OpenCV ResNet-10 SSD | ~3 MB | Matches visible faces to YOLO person boxes. |
+| Age classification | Levi-Hassner age model | ~45 MB | Produces eight coarse age buckets. |
 
 The YOLO ONNX export is downloaded automatically during `nas-video-check` or
 the first analyzed segment to `DATA_DIR/person_filter_models/`. To use a custom
@@ -60,7 +68,8 @@ pip install -r requirements-filter.txt
 ```
 
 Run `uv run nas-video-check` to verify the imports and download/load the model
-before starting the service.
+before starting the service. A fresh setup downloads roughly 50 MB in addition
+to the selected YOLO model.
 
 ## Configuration (.env)
 
@@ -69,6 +78,8 @@ PERSON_FILTER_ENABLED=true
 PERSON_FILTER_BACKEND=yolov11n
 PERSON_FILTER_MODEL_DIR=/var/db/nas-video/person_filter_models
 PERSON_FILTER_THRESHOLD=0.3
+PERSON_FILTER_FACE_THRESHOLD=0.7
+PERSON_FILTER_ADULT_THRESHOLD=0.9
 PERSON_FILTER_SAMPLE_COUNT=12
 ```
 
@@ -78,5 +89,15 @@ PERSON_FILTER_SAMPLE_COUNT=12
 - If **every** frame has `person_score < PERSON_FILTER_THRESHOLD`, the
   segment is skipped (no LLM call) and a `person-filter-skip` event is
   logged.
+- If every detected person has a matched face and every matched face has
+  aggregated adult probability >= `PERSON_FILTER_ADULT_THRESHOLD`, the
+  segment is skipped with an `adult-only-filter-skip` event.
+- Age buckets `0-2`, `4-6`, and `8-12` are treated as child evidence. A
+  hidden face, unmatched person, uncertain age, or possible child keeps the
+  segment for LLM analysis. Child-likely and uncertain frames are selected
+  ahead of confidently adult frames.
+- The same pre-filter runs before both `frames` and `contact_sheet` analysis.
+- `/api/health` exposes the latest `workers.prefilter` status, elapsed seconds,
+  and input/output frame counts for CPU tuning on the NAS.
 - If `opencv` is not installed or detection fails, the filter falls back to
   keeping all frames so analysis still runs.

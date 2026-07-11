@@ -85,9 +85,10 @@ uv run nas-video-check
 ```
 
 With `PERSON_FILTER_ENABLED=true`, preflight imports OpenCV, downloads the
-configured ONNX model, and loads it before reporting success. The model is
-stored under `DATA_DIR/person_filter_models` by default, where the service
-user can write it.
+configured YOLO model plus the local face/age models, and loads them before
+reporting success. The models are stored under `DATA_DIR/person_filter_models`
+by default, where the service user can write them. The face/age assets add
+roughly 50 MB.
 
 Start manually once:
 

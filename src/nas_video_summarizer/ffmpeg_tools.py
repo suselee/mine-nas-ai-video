@@ -31,6 +31,12 @@ class ContactSheet:
     frame_offsets_seconds: list[float]
 
 
+@dataclass(frozen=True)
+class PersonFilterDecision:
+    frames: list[SampledFrame]
+    skip_reason: str | None = None
+
+
 def _hwaccel_args(settings: Settings) -> list[str]:
     """Return ffmpeg input-level hwaccel flags, or empty list if disabled.
 
@@ -383,6 +389,14 @@ async def build_contact_sheet_with_offsets(
         frames_dir,
         duration_seconds=duration_seconds,
     )
+    return await build_contact_sheet_from_frames(settings, sampled_frames, output_dir)
+
+
+async def build_contact_sheet_from_frames(
+    settings: Settings,
+    sampled_frames: list[SampledFrame],
+    output_dir: Path,
+) -> ContactSheet:
     frame_paths = [frame.path for frame in sampled_frames]
     offsets = [frame.offset_seconds for frame in sampled_frames]
     if not frame_paths:
@@ -587,9 +601,9 @@ def segment_time_window(started_at: datetime, duration_seconds: int) -> tuple[da
 async def filter_frames_by_person_detection(
     settings: Settings,
     frames: list[SampledFrame],
-) -> list[SampledFrame]:
+) -> PersonFilterDecision:
     if not settings.person_filter_enabled or not frames:
-        return frames
+        return PersonFilterDecision(frames)
 
     images_b64: list[str] = []
     for frame in frames:
@@ -600,23 +614,49 @@ async def filter_frames_by_person_detection(
     except Exception:
         # Detection unavailable (e.g. opencv not installed) — fall back to
         # keeping all frames so analysis still runs instead of skipping.
-        return frames
+        return PersonFilterDecision(frames)
 
     if not scores:
-        return frames
+        return PersonFilterDecision(frames)
 
-    max_person = max(s.get("person_score", 0.0) for s in scores)
+    return _select_person_filtered_frames(settings, frames, scores)
+
+
+def _select_person_filtered_frames(
+    settings: Settings,
+    frames: list[SampledFrame],
+    scores: list[dict[str, object]],
+) -> PersonFilterDecision:
+
+    max_person = max(float(s.get("person_score", 0.0)) for s in scores)
     if max_person < settings.person_filter_threshold:
-        return []
+        return PersonFilterDecision([], "no-person")
 
-    for s in scores:
-        s["_combined"] = s.get("person_score", 0.0) * 0.6 + s.get("face_score", 0.0) * 0.4
+    person_frames = [
+        score
+        for score in scores
+        if float(score.get("person_score", 0.0)) >= settings.person_filter_threshold
+    ]
+    if person_frames and all(bool(score.get("adult_only")) for score in person_frames):
+        return PersonFilterDecision([], "adult-only")
+
+    for index, s in enumerate(scores):
+        s["_frame_index"] = int(s.get("idx", index))
+        child_score = float(s.get("child_score", 0.0))
+        if bool(s.get("adult_only")):
+            age_priority = 0.0
+        elif child_score >= 0.5:
+            age_priority = 2.0 + child_score
+        else:
+            age_priority = 1.0 + child_score
+        s["_combined"] = age_priority + float(s.get("person_score", 0.0))
 
     scores.sort(key=lambda s: s["_combined"], reverse=True)
     top_n = min(len(scores), settings.sample_frame_count)
-    selected_indices = {int(s["idx"]) for s in scores[:top_n]}
+    selected_indices = {int(s["_frame_index"]) for s in scores[:top_n]}
 
-    return [f for i, f in enumerate(frames) if i in selected_indices]
+    selected = [f for i, f in enumerate(frames) if i in selected_indices]
+    return PersonFilterDecision(selected)
 
 
 _PERSON_FILTER: PersonFilter | None = None
@@ -634,6 +674,8 @@ def _run_person_filter(
             backend=settings.person_filter_backend,
             model_url=settings.person_filter_model_url,
             model_dir=settings.person_filter_model_dir,
+            face_threshold=settings.person_filter_face_threshold,
+            adult_threshold=settings.person_filter_adult_threshold,
         )
     results: list[dict[str, object]] = []
     for idx, b64 in enumerate(images_b64):
@@ -695,4 +737,3 @@ async def _is_blank_frame(settings: Settings, path: Path) -> bool:
     except ValueError:
         return False
     return luma <= _BLANK_LUMA_THRESHOLD
-
