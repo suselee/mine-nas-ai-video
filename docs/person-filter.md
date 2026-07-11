@@ -80,6 +80,7 @@ PERSON_FILTER_MODEL_DIR=/var/db/nas-video/person_filter_models
 PERSON_FILTER_THRESHOLD=0.3
 PERSON_FILTER_FACE_THRESHOLD=0.7
 PERSON_FILTER_ADULT_THRESHOLD=0.9
+PERSON_FILTER_CHILD_THRESHOLD=0.6
 PERSON_FILTER_SAMPLE_COUNT=12
 ```
 
@@ -96,6 +97,9 @@ PERSON_FILTER_SAMPLE_COUNT=12
   hidden face, unmatched person, uncertain age, or possible child keeps the
   segment for LLM analysis. Child-likely and uncertain frames are selected
   ahead of confidently adult frames.
+- `PERSON_FILTER_CHILD_THRESHOLD` is the minimum local child probability
+  required before text-based keep repair or uncertain post-save verification
+  can preserve a clip.
 - The same pre-filter runs before both `frames` and `contact_sheet` analysis.
 - `/api/health` exposes the latest `workers.prefilter` status, elapsed seconds,
   and input/output frame counts for CPU tuning on the NAS.

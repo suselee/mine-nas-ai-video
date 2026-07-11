@@ -182,6 +182,8 @@ def test_person_filter_keeps_and_prioritizes_child_or_uncertain_frames(
 
     assert decision.skip_reason is None
     assert decision.frames == [frames[1], frames[2]]
+    assert decision.child_confirmed is True
+    assert decision.max_child_score == 0.85
 
 
 def test_person_filter_age_failure_is_fail_open(tmp_path, monkeypatch):

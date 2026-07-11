@@ -136,6 +136,7 @@ class Settings:
     person_filter_threshold: float
     person_filter_face_threshold: float
     person_filter_adult_threshold: float
+    person_filter_child_threshold: float
     person_filter_sample_count: int
 
     @property
@@ -251,6 +252,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         person_filter_threshold=_float("PERSON_FILTER_THRESHOLD", 0.3),
         person_filter_face_threshold=_float("PERSON_FILTER_FACE_THRESHOLD", 0.7),
         person_filter_adult_threshold=_float("PERSON_FILTER_ADULT_THRESHOLD", 0.9),
+        person_filter_child_threshold=_float("PERSON_FILTER_CHILD_THRESHOLD", 0.6),
         person_filter_sample_count=_int("PERSON_FILTER_SAMPLE_COUNT", 12),
     )
 

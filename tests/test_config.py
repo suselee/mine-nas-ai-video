@@ -54,6 +54,7 @@ def test_new_window_and_quota_defaults():
     assert settings.person_filter_model_dir == settings.data_dir / "person_filter_models"
     assert settings.person_filter_face_threshold == 0.7
     assert settings.person_filter_adult_threshold == 0.9
+    assert settings.person_filter_child_threshold == 0.6
 
 
 def test_env_overrides_window_and_quota():

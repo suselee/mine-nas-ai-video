@@ -69,6 +69,8 @@ class AnalysisResult:
     end_offset_seconds: int
     raw: dict[str, Any]
     raw_text: str = ""
+    local_child_confirmed: bool = False
+    local_child_score: float = 0.0
 
     def should_save(self, threshold: float) -> bool:
         # Normally both keep and confidence are required. Some small VLMs
@@ -80,7 +82,11 @@ class AnalysisResult:
 
     def keep_consistency_repaired(self, threshold: float) -> bool:
         """Repair a high-confidence false boolean that contradicts the text."""
-        if self.keep or self.confidence < max(threshold, _SEMANTIC_REPAIR_MIN_CONFIDENCE):
+        if (
+            self.keep
+            or not self.local_child_confirmed
+            or self.confidence < max(threshold, _SEMANTIC_REPAIR_MIN_CONFIDENCE)
+        ):
             return False
         evidence = " ".join([self.title, self.summary, *self.tags]).lower()
         if any(term in evidence for term in _EXCLUSION_EVIDENCE_TERMS):

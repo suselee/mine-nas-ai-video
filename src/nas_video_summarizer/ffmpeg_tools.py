@@ -35,6 +35,8 @@ class ContactSheet:
 class PersonFilterDecision:
     frames: list[SampledFrame]
     skip_reason: str | None = None
+    max_child_score: float = 0.0
+    child_confirmed: bool = False
 
 
 def _hwaccel_args(settings: Settings) -> list[str]:
@@ -640,6 +642,12 @@ def _select_person_filtered_frames(
     if person_frames and all(bool(score.get("adult_only")) for score in person_frames):
         return PersonFilterDecision([], "adult-only")
 
+    max_child_score = max(
+        (float(score.get("child_score", 0.0)) for score in person_frames),
+        default=0.0,
+    )
+    child_confirmed = max_child_score >= settings.person_filter_child_threshold
+
     for index, s in enumerate(scores):
         s["_frame_index"] = int(s.get("idx", index))
         child_score = float(s.get("child_score", 0.0))
@@ -656,7 +664,11 @@ def _select_person_filtered_frames(
     selected_indices = {int(s["_frame_index"]) for s in scores[:top_n]}
 
     selected = [f for i, f in enumerate(frames) if i in selected_indices]
-    return PersonFilterDecision(selected)
+    return PersonFilterDecision(
+        selected,
+        max_child_score=max_child_score,
+        child_confirmed=child_confirmed,
+    )
 
 
 _PERSON_FILTER: PersonFilter | None = None

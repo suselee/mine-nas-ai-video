@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 from .config import Settings
 from .database import Database, utc_now_iso
 from .ffmpeg_tools import (
+    SampledFrame,
     _extract_frame,
     build_contact_sheet_from_frames,
     build_recorder_command,
@@ -401,7 +403,8 @@ class Supervisor:
                 ):
                     self.database.add_event(
                         "keep-consistency-repair",
-                        f"corrected keep=false for high-confidence child activity: {result.title}",
+                        "corrected keep=false with local child evidence "
+                        f"({result.local_child_score:.2f}): {result.title}",
                     )
                 if should_save:
                     if self._moment_cooldown_active():
@@ -543,11 +546,16 @@ class Supervisor:
                 extracted_frame_count,
                 len(sampled_frames),
             )
-            return await analyzer.analyze(
+            result = await analyzer.analyze(
                 video_path=Path(segment["path"]),
                 image_paths=image_paths,
                 duration_seconds=duration_seconds,
                 frame_offsets_seconds=frame_offsets_seconds,
+            )
+            return replace(
+                result,
+                local_child_confirmed=decision.child_confirmed,
+                local_child_score=decision.max_child_score,
             )
 
     def _record_prefilter(
@@ -659,6 +667,8 @@ class Supervisor:
             "keep_consistency_repaired": result.keep_consistency_repaired(
                 self.settings.moment_keep_threshold
             ),
+            "local_child_confirmed": result.local_child_confirmed,
+            "local_child_score": result.local_child_score,
             "source_low_segment": segment["path"],
             "source_started_at": source_started.isoformat(timespec="seconds"),
             "source_ended_at": source_ended.isoformat(timespec="seconds"),
@@ -712,27 +722,49 @@ class Supervisor:
                         for fraction in (0.2, 0.5, 0.8)
                     }
                 )
-                frame_paths: list[Path] = []
+                verification_frames: list[SampledFrame] = []
                 for index, offset in enumerate(offsets, start=1):
                     frame_path = Path(temp_dir) / f"verify-{index}.jpg"
                     await _extract_frame(
                         self.settings, clip_path, frame_path, offset
                     )
                     if frame_path.exists():
-                        frame_paths.append(frame_path)
-                if not frame_paths:
+                        verification_frames.append(
+                            SampledFrame(path=frame_path, offset_seconds=offset)
+                        )
+                if not verification_frames:
                     return False
-                verification = await analyzer.verify_daughter_visible(frame_paths)
-                if verification.repaired:
+                local_decision = await filter_frames_by_person_detection(
+                    self.settings,
+                    verification_frames,
+                )
+                if not local_decision.frames:
+                    self.database.add_event(
+                        "verify-local-reject",
+                        local_decision.skip_reason or "no local child evidence",
+                    )
+                    return False
+                verification = await analyzer.verify_daughter_visible(
+                    [frame.path for frame in verification_frames]
+                )
+                verified = verification.visible and (
+                    not verification.repaired or local_decision.child_confirmed
+                )
+                if verification.repaired and local_decision.child_confirmed:
                     self.database.add_event(
                         "verify-consistency-repair",
-                        "corrected has_daughter=false from verification description",
+                        "corrected has_daughter=false with local child evidence",
                     )
-                if not verification.visible and verification.confidence < 0.75:
+                if (
+                    not verified
+                    and local_decision.child_confirmed
+                    and verification.confidence < 0.75
+                ):
                     self.database.add_event(
-                        "verify-uncertain-keep",
+                        "verify-local-child-keep",
                         json.dumps(
                             {
+                                "child_score": local_decision.max_child_score,
                                 "confidence": verification.confidence,
                                 "description": verification.description,
                             },
@@ -740,7 +772,7 @@ class Supervisor:
                         ),
                     )
                     return True
-                if not verification.visible:
+                if not verified:
                     self.database.add_event(
                         "verify-detail",
                         json.dumps(
@@ -752,7 +784,7 @@ class Supervisor:
                             ensure_ascii=False,
                         ),
                     )
-                return verification.visible
+                return verified
         except Exception as exc:
             self.database.add_event("verify-error", str(exc))
             # If verification itself fails, be conservative and keep the clip.
@@ -805,6 +837,7 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "sample_frame_count": settings.sample_frame_count,
             "person_filter_face_threshold": settings.person_filter_face_threshold,
             "person_filter_adult_threshold": settings.person_filter_adult_threshold,
+            "person_filter_child_threshold": settings.person_filter_child_threshold,
             "analysis_stream_role": settings.analysis_stream_role,
             "analysis_window_start": settings.analysis_window_start,
             "analysis_window_end": settings.analysis_window_end,

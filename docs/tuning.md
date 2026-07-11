@@ -50,13 +50,14 @@ blank staring, screen time, blurry/black). Override `ANALYSIS_PROMPT` in
 For small VLMs that return `keep=false` while their high-confidence title,
 summary, and tags explicitly describe a child playing or interacting, the
 service applies a conservative consistency repair. It requires confidence
->= 0.75 plus both child and activity evidence, rejects exclusion language,
-and still runs the normal post-save daughter-visibility verification.
+>= 0.75, both child and activity text evidence, and independent local age-model
+child probability >= `PERSON_FILTER_CHILD_THRESHOLD`. It rejects exclusion
+language and still runs the normal post-save daughter-visibility verification.
 
 Model-provided clip offsets are snapped to the nearest actual sampled-frame
 timestamps before extraction. Post-save verification uses three chronological
 frames from the resulting clip instead of only its midpoint, requests a factual
 description, and conservatively repairs the same false-boolean contradiction.
-A negative verification deletes a clip only at confidence >= 0.75; lower
-confidence is treated as uncertain and kept with a `verify-uncertain-keep`
-event.
+Final verification is fail-closed: low-confidence negatives are deleted unless
+the verification frames independently meet the local child threshold. Such
+dual-evidence keeps are recorded as `verify-local-child-keep`.
