@@ -81,6 +81,45 @@ def _in_record_window(now: datetime, start: str, end: str) -> bool:
     return _in_time_window(now, start, end)
 
 
+def _moment_period(
+    started_at: datetime, boundaries_value: str
+) -> tuple[str, datetime, datetime] | None:
+    parts = [part.strip() for part in boundaries_value.split(",")]
+    if len(parts) != 4:
+        return None
+    try:
+        minutes = []
+        for part in parts:
+            hour_text, minute_text = part.split(":", 1)
+            hour, minute = int(hour_text), int(minute_text)
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return None
+            minutes.append(hour * 60 + minute)
+    except (TypeError, ValueError):
+        return None
+    if minutes != sorted(set(minutes)):
+        return None
+
+    current = started_at.hour * 60 + started_at.minute
+    labels = ("morning", "afternoon", "evening")
+    for index, label in enumerate(labels):
+        if minutes[index] <= current < minutes[index + 1]:
+            start = started_at.replace(
+                hour=minutes[index] // 60,
+                minute=minutes[index] % 60,
+                second=0,
+                microsecond=0,
+            )
+            end = started_at.replace(
+                hour=minutes[index + 1] // 60,
+                minute=minutes[index + 1] % 60,
+                second=0,
+                microsecond=0,
+            )
+            return label, start, end
+    return None
+
+
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
@@ -333,14 +372,47 @@ class Supervisor:
             return weakest
         return False
 
-    def _evict_moment(self, moment: dict[str, Any]) -> None:
+    def _period_cap_eviction_target(
+        self, segment: dict[str, Any], result: AnalysisResult
+    ) -> tuple[str, dict[str, Any] | bool | None] | None:
+        cap = self.settings.max_moments_per_period
+        if cap <= 0:
+            return None
+        started_value = str(segment.get("started_at", ""))
+        if not started_value:
+            return None
+        period = _moment_period(
+            _parse_iso(started_value), self.settings.moment_period_boundaries
+        )
+        if period is None:
+            return None
+        label, start, end = period
+        start_iso = start.isoformat(timespec="seconds")
+        end_iso = end.isoformat(timespec="seconds")
+        if self.database.count_moments_between(start_iso, end_iso) < cap:
+            return label, None
+        weakest = self.database.weakest_moment_between(start_iso, end_iso)
+        if weakest is None:
+            return label, None
+        if result.confidence > float(weakest["confidence"]):
+            return label, weakest
+        return label, False
+
+    def _evict_moment(
+        self,
+        moment: dict[str, Any],
+        *,
+        event_type: str = "daily-cap-evict",
+        scope: str = "daily",
+    ) -> None:
         for key in ("clip_path", "metadata_path"):
             path = Path(str(moment[key]))
             path.unlink(missing_ok=True)
         self.database.delete_moment_by_clip(str(moment["clip_path"]))
         self.database.add_event(
-            "daily-cap-evict",
-            f"replaced weakest '{moment['title']}' (confidence {float(moment['confidence']):.2f})",
+            event_type,
+            f"replaced weakest {scope} moment '{moment['title']}' "
+            f"(confidence {float(moment['confidence']):.2f})",
         )
 
     async def _analyzer_loop(self) -> None:
@@ -413,19 +485,47 @@ class Supervisor:
                             f"skipped '{result.title}' due to cooldown",
                         )
                     else:
-                        evict = self._daily_cap_eviction_target(segment, result)
-                        if evict is False:
+                        period_decision = self._period_cap_eviction_target(
+                            segment, result
+                        )
+                        period_label = (
+                            period_decision[0] if period_decision else ""
+                        )
+                        period_evict = (
+                            period_decision[1] if period_decision else None
+                        )
+                        if period_evict is False:
                             self.database.add_event(
-                                "daily-cap",
-                                f"skipped '{result.title}' (daily limit {self.settings.max_moments_per_day} reached, "
+                                "period-cap",
+                                f"skipped '{result.title}' ({period_label} limit "
+                                f"{self.settings.max_moments_per_period} reached, "
                                 f"confidence {result.confidence:.2f} not above weakest)",
                             )
                         else:
-                            if evict is not None:
-                                self._evict_moment(evict)
-                            moment_id = await self._save_moment(segment, result, analyzer)
-                            if moment_id >= 0:
-                                self.database.add_event("moment", f"saved moment {moment_id}: {result.title}")
+                            if isinstance(period_evict, dict):
+                                self._evict_moment(
+                                    period_evict,
+                                    event_type="period-cap-evict",
+                                    scope=period_label,
+                                )
+                            evict = self._daily_cap_eviction_target(segment, result)
+                            if evict is False:
+                                self.database.add_event(
+                                    "daily-cap",
+                                    f"skipped '{result.title}' (daily limit {self.settings.max_moments_per_day} reached, "
+                                    f"confidence {result.confidence:.2f} not above weakest)",
+                                )
+                            else:
+                                if isinstance(evict, dict):
+                                    self._evict_moment(evict)
+                                moment_id = await self._save_moment(
+                                    segment, result, analyzer
+                                )
+                                if moment_id >= 0:
+                                    self.database.add_event(
+                                        "moment",
+                                        f"saved moment {moment_id}: {result.title}",
+                                    )
                 if not should_save:
                     self.database.add_event(
                         "analysis-skip",
@@ -835,6 +935,9 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "analysis_image_mode": settings.analysis_image_mode,
             "analysis_frame_width": settings.analysis_frame_width,
             "sample_frame_count": settings.sample_frame_count,
+            "max_moments_per_day": settings.max_moments_per_day,
+            "max_moments_per_period": settings.max_moments_per_period,
+            "moment_period_boundaries": settings.moment_period_boundaries,
             "person_filter_face_threshold": settings.person_filter_face_threshold,
             "person_filter_adult_threshold": settings.person_filter_adult_threshold,
             "person_filter_child_threshold": settings.person_filter_child_threshold,

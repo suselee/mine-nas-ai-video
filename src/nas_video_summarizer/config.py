@@ -116,6 +116,8 @@ class Settings:
     motion_threshold: float
     moment_keep_threshold: float
     max_moments_per_day: int
+    max_moments_per_period: int
+    moment_period_boundaries: str
     moment_cooldown_seconds: int
     context_before_seconds: int
     context_after_seconds: int
@@ -200,6 +202,10 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         motion_threshold=_float("MOTION_THRESHOLD", 0.02),
         moment_keep_threshold=_float("MOMENT_KEEP_THRESHOLD", 0.5),
         max_moments_per_day=_int("MAX_MOMENTS_PER_DAY", 0),
+        max_moments_per_period=_int("MAX_MOMENTS_PER_PERIOD", 0),
+        moment_period_boundaries=os.getenv(
+            "MOMENT_PERIOD_BOUNDARIES", "07:00,12:00,17:00,21:00"
+        ).strip(),
         moment_cooldown_seconds=_int("MOMENT_COOLDOWN_SECONDS", 0),
         context_before_seconds=_int("CONTEXT_BEFORE_SECONDS", 5),
         context_after_seconds=_int("CONTEXT_AFTER_SECONDS", 10),

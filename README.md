@@ -35,6 +35,8 @@ Important values:
 - `LLAMA_MODEL`: the multimodal model name served by llama.cpp.
 - `RETENTION_HOURS`: how long raw rolling-buffer segments remain on disk.
 - `MAX_MOMENT_SECONDS`: maximum saved clip length after adding before/after context.
+- `MAX_MOMENTS_PER_PERIOD`: optional keep-best-N limit applied separately to
+  configurable morning, afternoon, and evening ranges.
 - `ANALYSIS_IMAGE_MODE`: `contact_sheet` by default; use `frames` only when the model is fast enough.
 - `ANALYSIS_FRAME_WIDTH`: width of each sampled frame before it is sent or placed into the contact sheet.
 - `PERSON_FILTER_ENABLED`: locally skips frames with no person and segments

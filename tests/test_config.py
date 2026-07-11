@@ -49,6 +49,8 @@ def test_new_window_and_quota_defaults():
     settings = load_settings("/nonexistent.env")
     assert settings.moment_keep_threshold == 0.5
     assert settings.max_moments_per_day == 0
+    assert settings.max_moments_per_period == 0
+    assert settings.moment_period_boundaries == "07:00,12:00,17:00,21:00"
     assert settings.record_window_start == ""
     assert settings.record_window_end == ""
     assert settings.person_filter_model_dir == settings.data_dir / "person_filter_models"

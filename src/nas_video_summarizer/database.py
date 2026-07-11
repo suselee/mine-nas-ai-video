@@ -289,6 +289,37 @@ class Database:
             keys = ("id", "title", "confidence", "clip_path", "metadata_path")
             return dict(zip(keys, row))
 
+    def count_moments_between(self, start_iso: str, end_iso: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM moments
+                WHERE source_started_at >= ? AND source_started_at < ?
+                """,
+                (start_iso, end_iso),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def weakest_moment_between(
+        self, start_iso: str, end_iso: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, title, confidence, clip_path, metadata_path
+                FROM moments
+                WHERE source_started_at >= ? AND source_started_at < ?
+                ORDER BY confidence ASC
+                LIMIT 1
+                """,
+                (start_iso, end_iso),
+            ).fetchone()
+            if not row:
+                return None
+            keys = ("id", "title", "confidence", "clip_path", "metadata_path")
+            return dict(zip(keys, row))
+
     def delete_moment_by_clip(self, clip_path: str) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -395,4 +426,3 @@ class Database:
                 (limit,),
             ).fetchall()
             return [row_to_dict(row) for row in rows]
-

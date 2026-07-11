@@ -16,6 +16,7 @@ from nas_video_summarizer.workers import (
     _in_analysis_window,
     _in_time_window,
     _in_record_window,
+    _moment_period,
 )
 
 
@@ -96,8 +97,9 @@ def test_time_window_helpers_and_record_alias():
 
 
 class _FakeCapDB:
-    def __init__(self, count, weakest):
+    def __init__(self, count, weakest, period_count=None):
         self._count = count
+        self._period_count = count if period_count is None else period_count
         self._weakest = weakest
         self.evicted = None
 
@@ -110,6 +112,12 @@ class _FakeCapDB:
     def weakest_moment_on_day(self, day):
         return self._weakest
 
+    def count_moments_between(self, start_iso, end_iso):
+        return self._period_count
+
+    def weakest_moment_between(self, start_iso, end_iso):
+        return self._weakest
+
     def delete_moment_by_clip(self, clip):
         self.evicted = clip
 
@@ -117,10 +125,11 @@ class _FakeCapDB:
         pass
 
 
-def _supervisor_with(db, max_per_day=20):
+def _supervisor_with(db, max_per_day=20, max_per_period=0):
     settings = replace(
         load_settings("/nonexistent.env"),
         max_moments_per_day=max_per_day,
+        max_moments_per_period=max_per_period,
         moment_keep_threshold=0.5,
     )
     return Supervisor(settings, db)
@@ -169,6 +178,61 @@ def test_daily_cap_at_limit_worse_skips():
     )
     sup = _supervisor_with(db, max_per_day=20)
     assert sup._daily_cap_eviction_target(_segment(), _result(0.5)) is False
+
+
+def test_moment_period_boundaries():
+    boundaries = "07:00,12:00,17:00,21:00"
+
+    assert _moment_period(_dt(11, 59), boundaries)[0] == "morning"
+    assert _moment_period(_dt(12, 0), boundaries)[0] == "afternoon"
+    assert _moment_period(_dt(16, 59), boundaries)[0] == "afternoon"
+    assert _moment_period(_dt(17, 0), boundaries)[0] == "evening"
+    assert _moment_period(_dt(21, 0), boundaries) is None
+    assert _moment_period(_dt(10, 0), "invalid") is None
+
+
+def test_period_cap_under_limit_saves():
+    db = _FakeCapDB(count=20, period_count=7, weakest=None)
+    sup = _supervisor_with(db, max_per_day=24, max_per_period=8)
+
+    assert sup._period_cap_eviction_target(
+        {"started_at": "2026-07-10T10:00:00+08:00"}, _result(0.8)
+    ) == ("morning", None)
+
+
+def test_period_cap_replaces_weaker_moment_in_same_period():
+    weakest = {
+        "confidence": 0.7,
+        "clip_path": "/x.mp4",
+        "metadata_path": "/x.json",
+        "title": "weak",
+        "id": 1,
+    }
+    db = _FakeCapDB(count=20, period_count=8, weakest=weakest)
+    sup = _supervisor_with(db, max_per_day=24, max_per_period=8)
+
+    label, target = sup._period_cap_eviction_target(
+        {"started_at": "2026-07-10T18:00:00+08:00"}, _result(0.85)
+    )
+
+    assert label == "evening"
+    assert target == weakest
+
+
+def test_period_cap_skips_equal_or_weaker_moment():
+    weakest = {
+        "confidence": 0.85,
+        "clip_path": "/x.mp4",
+        "metadata_path": "/x.json",
+        "title": "strong",
+        "id": 1,
+    }
+    db = _FakeCapDB(count=20, period_count=8, weakest=weakest)
+    sup = _supervisor_with(db, max_per_day=24, max_per_period=8)
+
+    assert sup._period_cap_eviction_target(
+        {"started_at": "2026-07-10T13:00:00+08:00"}, _result(0.85)
+    ) == ("afternoon", False)
 
 
 def test_evict_moment_removes_files(tmp_path):

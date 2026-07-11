@@ -32,6 +32,13 @@ that masks mid-day or a brief power-off. No extra Python dependencies.
   Once the day hits the cap, a new clip is saved only if its confidence
   beats the weakest clip already saved that day (the weakest is then
   deleted). Set `~20` to bound disk while keeping the best moments.
+- `MAX_MOMENTS_PER_PERIOD` (default `0` = disabled) applies the same
+  keep-best-N behavior independently to morning, afternoon, and evening.
+  `MOMENT_PERIOD_BOUNDARIES=07:00,12:00,17:00,21:00` defines the three
+  local-time ranges. Set the period limit to `8` and daily limit to `24` for
+  at most eight moments in each range.
+- `MOMENT_COOLDOWN_SECONDS=300` prevents consecutive two-minute segments from
+  filling a period with near-duplicate activity.
 - Person pre-filter (`PERSON_FILTER_ENABLED=true`, default `yolov11n`) drops
   empty-room / no-person segments before they reach the LLM. It also uses a
   local face/age model to drop a segment when every visible person is
