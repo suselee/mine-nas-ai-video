@@ -661,7 +661,30 @@ def _select_person_filtered_frames(
 
     scores.sort(key=lambda s: s["_combined"], reverse=True)
     top_n = min(len(scores), settings.sample_frame_count)
-    selected_indices = {int(s["_frame_index"]) for s in scores[:top_n]}
+
+    # Preserve temporal coverage instead of allowing all high-scoring images
+    # to come from one short burst. Pick the best frame from each equal time
+    # bucket first, then fill remaining slots by detection score.
+    selected_indices: set[int] = set()
+    if top_n:
+        max_offset = max((frame.offset_seconds for frame in frames), default=0.0)
+        bucket_span = max(max_offset + 0.001, 1.0) / top_n
+        for bucket in range(top_n):
+            candidates = [
+                score
+                for score in scores
+                if min(
+                    top_n - 1,
+                    int(frames[int(score["_frame_index"])].offset_seconds / bucket_span),
+                )
+                == bucket
+            ]
+            if candidates:
+                selected_indices.add(int(candidates[0]["_frame_index"]))
+        for score in scores:
+            if len(selected_indices) >= top_n:
+                break
+            selected_indices.add(int(score["_frame_index"]))
 
     selected = [f for i, f in enumerate(frames) if i in selected_indices]
     return PersonFilterDecision(

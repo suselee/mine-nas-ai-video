@@ -130,6 +130,10 @@ class Settings:
     llama_api_key: str
     llama_model: str
     llama_timeout_seconds: int
+    llama_timeout_fallback: bool
+    llama_circuit_breaker_failures: int
+    llama_circuit_breaker_seconds: int
+    verification_frame_width: int
     analysis_prompt: str
     person_filter_enabled: bool
     person_filter_backend: str
@@ -192,11 +196,11 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         analysis_window_end=os.getenv("ANALYSIS_WINDOW_END", "").strip(),
         record_window_start=os.getenv("RECORD_WINDOW_START", "").strip(),
         record_window_end=os.getenv("RECORD_WINDOW_END", "").strip(),
-        analysis_image_mode=os.getenv("ANALYSIS_IMAGE_MODE", "contact_sheet").strip().lower(),
-        analysis_frame_width=_int("ANALYSIS_FRAME_WIDTH", 320),
+        analysis_image_mode=os.getenv("ANALYSIS_IMAGE_MODE", "frames").strip().lower(),
+        analysis_frame_width=_int("ANALYSIS_FRAME_WIDTH", 384),
         contact_sheet_columns=_int("CONTACT_SHEET_COLUMNS", 2),
         contact_sheet_padding=_int("CONTACT_SHEET_PADDING", 8),
-        sample_frame_count=_int("SAMPLE_FRAME_COUNT", 6),
+        sample_frame_count=_int("SAMPLE_FRAME_COUNT", 4),
         sample_every_seconds=_int("SAMPLE_EVERY_SECONDS", 30),
         sample_mode=os.getenv("SAMPLE_MODE", "even").strip().lower(),
         motion_threshold=_float("MOTION_THRESHOLD", 0.02),
@@ -217,7 +221,11 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         llama_base_url=os.getenv("LLAMA_BASE_URL", "http://127.0.0.1:8080/v1"),
         llama_api_key=os.getenv("LLAMA_API_KEY", ""),
         llama_model=os.getenv("LLAMA_MODEL", "Qwen3-VL-2B-Instruct"),
-        llama_timeout_seconds=_int("LLAMA_TIMEOUT_SECONDS", 120),
+        llama_timeout_seconds=_int("LLAMA_TIMEOUT_SECONDS", 180),
+        llama_timeout_fallback=_bool("LLAMA_TIMEOUT_FALLBACK", True),
+        llama_circuit_breaker_failures=_int("LLAMA_CIRCUIT_BREAKER_FAILURES", 3),
+        llama_circuit_breaker_seconds=_int("LLAMA_CIRCUIT_BREAKER_SECONDS", 300),
+        verification_frame_width=_int("VERIFICATION_FRAME_WIDTH", 512),
         analysis_prompt=os.getenv(
             "ANALYSIS_PROMPT",
             (

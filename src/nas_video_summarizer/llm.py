@@ -251,15 +251,17 @@ class LlamaAnalyzer:
         image_paths: list[Path],
         duration_seconds: int,
         frame_offsets_seconds: list[float] | None = None,
+        image_mode: str | None = None,
     ) -> AnalysisResult:
         if not image_paths:
             raise ValueError("no sampled images available for analysis")
 
         endpoint = self.settings.llama_base_url.rstrip("/") + "/chat/completions"
+        effective_image_mode = image_mode or self.settings.analysis_image_mode
         image_note = (
             "The image is a contact sheet. Read cells chronologically from left to right, "
             "then top to bottom."
-            if self.settings.analysis_image_mode == "contact_sheet"
+            if effective_image_mode == "contact_sheet"
             else "The images are sampled video frames in chronological order."
         )
         annotation_offsets = (
@@ -267,7 +269,7 @@ class LlamaAnalyzer:
             if frame_offsets_seconds
             else _estimated_offsets(duration_seconds, len(image_paths))
         )
-        annotation_label = "cell" if self.settings.analysis_image_mode == "contact_sheet" else "frame"
+        annotation_label = "cell" if effective_image_mode == "contact_sheet" else "frame"
         frame_offsets = ", ".join(
             f"{annotation_label} #{index}: ~{_format_seconds(offset)}s"
             for index, offset in enumerate(annotation_offsets, start=1)

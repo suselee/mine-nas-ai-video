@@ -33,6 +33,10 @@ from .llm import AnalysisResult, LlamaAnalyzer
 class PersonFilterSkip(Exception):
     """Raised when person filter detects no person in any sampled frame."""
 
+
+def _is_timeout_error(exc: Exception) -> bool:
+    return "timed out" in str(exc).lower() or isinstance(exc, asyncio.TimeoutError)
+
 def _now() -> datetime:
     return datetime.now().astimezone()
 
@@ -177,6 +181,8 @@ class Supervisor:
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
         self._last_moment_saved_at: datetime | None = None
+        self._llama_timeout_count = 0
+        self._llama_circuit_open_until: datetime | None = None
         self.state: dict[str, Any] = {
             "started_at": utc_now_iso(),
             "recorders": {
@@ -240,7 +246,6 @@ class Supervisor:
                 }
                 await asyncio.sleep(30)
                 continue
-
             if not _in_record_window(
                 _now(),
                 self.settings.record_window_start,
@@ -464,6 +469,18 @@ class Supervisor:
                 }
                 await asyncio.sleep(self.settings.analysis_interval_seconds)
                 continue
+            if (
+                self._llama_circuit_open_until is not None
+                and _now() < self._llama_circuit_open_until
+            ):
+                self.state["analyzer"] = {
+                    "status": "circuit-open",
+                    "resume_at": self._llama_circuit_open_until.isoformat(timespec="seconds"),
+                    "consecutive_timeouts": self._llama_timeout_count,
+                    "updated_at": utc_now_iso(),
+                }
+                await asyncio.sleep(min(30, self.settings.analysis_interval_seconds))
+                continue
 
             ready_before = (_now() - timedelta(seconds=self.settings.analysis_delay_seconds)).isoformat(
                 timespec="seconds"
@@ -490,6 +507,8 @@ class Supervisor:
             }
             try:
                 result = await self._analyze_segment(analyzer, segment)
+                self._llama_timeout_count = 0
+                self._llama_circuit_open_until = None
                 should_save = result.should_save(self.settings.moment_keep_threshold)
                 if result.keep_consistency_repaired(
                     self.settings.moment_keep_threshold
@@ -581,6 +600,23 @@ class Supervisor:
                     await asyncio.sleep(self.settings.analysis_cooldown_seconds)
                 continue
             except Exception as exc:
+                if _is_timeout_error(exc):
+                    self._llama_timeout_count += 1
+                    if (
+                        self.settings.llama_circuit_breaker_failures > 0
+                        and self._llama_timeout_count
+                        >= self.settings.llama_circuit_breaker_failures
+                    ):
+                        self._llama_circuit_open_until = _now() + timedelta(
+                            seconds=self.settings.llama_circuit_breaker_seconds
+                        )
+                        self.database.add_event(
+                            "llama-circuit-open",
+                            f"paused analysis for {self.settings.llama_circuit_breaker_seconds}s "
+                            f"after {self._llama_timeout_count} consecutive timeouts",
+                        )
+                else:
+                    self._llama_timeout_count = 0
                 attempt = int(segment["analysis_attempts"]) + 1
                 final = attempt >= self.settings.analysis_max_attempts
                 self.database.record_analysis_error(int(segment["id"]), str(exc), final=final)
@@ -667,12 +703,38 @@ class Supervisor:
                 extracted_frame_count,
                 len(sampled_frames),
             )
-            result = await analyzer.analyze(
-                video_path=Path(segment["path"]),
-                image_paths=image_paths,
-                duration_seconds=duration_seconds,
-                frame_offsets_seconds=frame_offsets_seconds,
-            )
+            try:
+                result = await analyzer.analyze(
+                    video_path=Path(segment["path"]),
+                    image_paths=image_paths,
+                    duration_seconds=duration_seconds,
+                    frame_offsets_seconds=frame_offsets_seconds,
+                )
+            except Exception as exc:
+                if (
+                    not _is_timeout_error(exc)
+                    or not self.settings.llama_timeout_fallback
+                    or len(sampled_frames) <= 1
+                ):
+                    raise
+                fallback_dir = Path(temp_dir) / "fallback"
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                fallback_sheet = await build_contact_sheet_from_frames(
+                    self.settings,
+                    sampled_frames,
+                    fallback_dir,
+                )
+                self.database.add_event(
+                    "analysis-timeout-fallback",
+                    f"retrying {len(sampled_frames)} frames as one contact sheet",
+                )
+                result = await analyzer.analyze(
+                    video_path=Path(segment["path"]),
+                    image_paths=[fallback_sheet.path],
+                    duration_seconds=duration_seconds,
+                    frame_offsets_seconds=fallback_sheet.frame_offsets_seconds,
+                    image_mode="contact_sheet",
+                )
             return replace(
                 result,
                 local_child_confirmed=decision.child_confirmed,
@@ -760,6 +822,21 @@ class Supervisor:
         clip_path = _unique_path(day_dir / f"{source_started.strftime('%H%M%S')}_{title_slug}.mp4")
         metadata_path = clip_path.with_suffix(".json")
 
+        # Confirm the candidate on the analysis stream before doing expensive 4K
+        # extraction. Three higher-resolution frames refine the positive decision.
+        verified = await self._verify_candidate(
+            analyzer,
+            Path(segment["path"]),
+            result.start_offset_seconds,
+            result.end_offset_seconds,
+        )
+        if not verified:
+            self.database.add_event(
+                "moment-verify-failed",
+                f"rejected false positive before clip extraction: {result.title}",
+            )
+            return -1
+
         await extract_clip(
             self.settings,
             source_paths,
@@ -767,17 +844,6 @@ class Supervisor:
             start_offset_seconds=start_offset_seconds,
             duration_seconds=duration_seconds,
         )
-
-        # Post-save verification: confirm the clip actually contains the daughter.
-        # This catches LLM hallucinations where keep=true but the clip is empty.
-        verified = await self._verify_saved_clip(analyzer, clip_path, duration_seconds)
-        if not verified:
-            clip_path.unlink(missing_ok=True)
-            self.database.add_event(
-                "moment-verify-failed",
-                f"deleted false positive clip: {result.title}",
-            )
-            return -1
 
         metadata = {
             "camera_name": segment["camera_name"],
@@ -911,6 +977,82 @@ class Supervisor:
             # If verification itself fails, be conservative and keep the clip.
             return True
 
+    async def _verify_candidate(
+        self,
+        analyzer: LlamaAnalyzer,
+        video_path: Path,
+        start_offset_seconds: float,
+        end_offset_seconds: float,
+    ) -> bool:
+        center = (start_offset_seconds + end_offset_seconds) / 2
+        offsets = sorted(
+            {
+                max(0.0, start_offset_seconds),
+                max(0.0, center),
+                max(0.0, end_offset_seconds),
+            }
+        )
+        verification_settings = replace(
+            self.settings,
+            analysis_frame_width=self.settings.verification_frame_width,
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="nas-video-candidate-") as temp_dir:
+                frames: list[SampledFrame] = []
+                for index, offset in enumerate(offsets, start=1):
+                    frame_path = Path(temp_dir) / f"candidate-{index}.jpg"
+                    await _extract_frame(
+                        verification_settings, video_path, frame_path, offset
+                    )
+                    if frame_path.exists():
+                        frames.append(SampledFrame(frame_path, offset))
+                if not frames:
+                    return False
+                local_decision = await filter_frames_by_person_detection(
+                    self.settings, frames
+                )
+                if not local_decision.frames:
+                    self.database.add_event(
+                        "verify-local-reject",
+                        local_decision.skip_reason or "no local child evidence",
+                    )
+                    return False
+                verification = await analyzer.verify_daughter_visible(
+                    [frame.path for frame in frames]
+                )
+                if verification.visible:
+                    return True
+                if local_decision.child_confirmed and verification.confidence < 0.75:
+                    self.database.add_event(
+                        "verify-local-child-keep",
+                        json.dumps(
+                            {
+                                "child_score": local_decision.max_child_score,
+                                "confidence": verification.confidence,
+                                "description": verification.description,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    return True
+                self.database.add_event(
+                    "verify-detail",
+                    json.dumps(
+                        {
+                            "confidence": verification.confidence,
+                            "description": verification.description,
+                            "raw_text": verification.raw_text[:1000],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                return False
+        except Exception as exc:
+            self.database.add_event("verify-error", str(exc))
+            if _is_timeout_error(exc):
+                raise
+            return False
+
     async def _cleanup_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -956,6 +1098,10 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "analysis_image_mode": settings.analysis_image_mode,
             "analysis_frame_width": settings.analysis_frame_width,
             "sample_frame_count": settings.sample_frame_count,
+            "verification_frame_width": settings.verification_frame_width,
+            "llama_timeout_fallback": settings.llama_timeout_fallback,
+            "llama_circuit_breaker_failures": settings.llama_circuit_breaker_failures,
+            "llama_circuit_breaker_seconds": settings.llama_circuit_breaker_seconds,
             "max_moments_per_day": settings.max_moments_per_day,
             "max_moments_per_period": settings.max_moments_per_period,
             "moment_period_boundaries": settings.moment_period_boundaries,

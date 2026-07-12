@@ -70,6 +70,22 @@ def test_motion_aware_offsets_all_static_falls_back_to_even():
     assert offsets[-1] < 120
 
 
+def test_person_filter_selection_preserves_temporal_coverage(tmp_path):
+    settings = replace(load_settings("/nonexistent.env"), sample_frame_count=4)
+    frames = [
+        SampledFrame(tmp_path / f"frame-{index}.jpg", offset)
+        for index, offset in enumerate((5.0, 10.0, 35.0, 65.0, 95.0))
+    ]
+    scores = [
+        {"idx": index, "person_score": score, "child_score": 0.0, "adult_only": False}
+        for index, score in enumerate((0.99, 0.98, 0.6, 0.6, 0.6))
+    ]
+
+    decision = _select_person_filtered_frames(settings, frames, scores)
+
+    assert [frame.offset_seconds for frame in decision.frames] == [5.0, 35.0, 65.0, 95.0]
+
+
 def _settings_with_hwaccel(hwaccel: str) -> Settings:
     import os
     os.environ["FFMPEG_HWACCEL"] = hwaccel

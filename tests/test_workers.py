@@ -567,3 +567,32 @@ def test_local_child_evidence_can_keep_uncertain_verification(tmp_path, monkeypa
 
     assert verified is True
     assert database.recent_events(limit=1)[0]["event_type"] == "verify-local-child-keep"
+
+
+def test_candidate_verification_uses_high_resolution_frames(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"), verification_frame_width=512
+    )
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    captured = []
+
+    async def fake_extract(frame_settings, video_path, frame_path, offset):
+        captured.append((frame_settings.analysis_frame_width, offset))
+        frame_path.write_bytes(b"jpeg")
+
+    class FakeAnalyzer:
+        async def verify_daughter_visible(self, frame_paths):
+            return DaughterVerification(True, 0.9, "daughter visible", False, "{}")
+
+    monkeypatch.setattr("nas_video_summarizer.workers._extract_frame", fake_extract)
+
+    verified = asyncio.run(
+        supervisor._verify_candidate(
+            FakeAnalyzer(), tmp_path / "segment.mp4", 20, 40
+        )
+    )
+
+    assert verified is True
+    assert captured == [(512, 20), (512, 30.0), (512, 40)]
