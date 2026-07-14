@@ -236,6 +236,13 @@ class Supervisor:
     def snapshot(self) -> dict[str, Any]:
         return self.state
 
+    def _safe_add_event(self, event_type: str, message: str) -> None:
+        try:
+            self.database.add_event(event_type, message)
+        except Exception:
+            # Worker error reporting must never terminate the worker itself.
+            pass
+
     async def _recorder_loop(self, role: str, rtsp_url: str) -> None:
         while not self.stop_event.is_set():
             if not ffmpeg_available(self.settings):
@@ -325,12 +332,12 @@ class Supervisor:
                     "message": str(exc),
                     "updated_at": utc_now_iso(),
                 }
-                self.database.add_event("scanner-error", str(exc))
+                self._safe_add_event("scanner-error", str(exc))
             await asyncio.sleep(10)
 
     def _scan_once(self) -> int:
         now = _now()
-        seen = 0
+        segments: list[dict[str, Any]] = []
         for directory, role in (
             (self.settings.low_buffer_dir, "low"),
             (self.settings.high_buffer_dir, "high"),
@@ -355,17 +362,19 @@ class Supervisor:
                         continue
 
                 started, ended = segment_time_window(started_at, self.settings.segment_seconds)
-                self.database.upsert_segment(
-                    camera_name=camera_name,
-                    stream_role=role,
-                    path=path,
-                    started_at=started.isoformat(timespec="seconds"),
-                    ended_at=ended.isoformat(timespec="seconds"),
-                    duration_seconds=self.settings.segment_seconds,
-                    size_bytes=stat.st_size,
+                segments.append(
+                    {
+                        "camera_name": camera_name,
+                        "stream_role": role,
+                        "path": path,
+                        "started_at": started.isoformat(timespec="seconds"),
+                        "ended_at": ended.isoformat(timespec="seconds"),
+                        "duration_seconds": self.settings.segment_seconds,
+                        "size_bytes": stat.st_size,
+                    }
                 )
-                seen += 1
-        return seen
+        self.database.upsert_segments(segments)
+        return len(segments)
 
     def _moment_cooldown_active(self) -> bool:
         if self.settings.moment_cooldown_seconds <= 0:
@@ -619,14 +628,19 @@ class Supervisor:
                     self._llama_timeout_count = 0
                 attempt = int(segment["analysis_attempts"]) + 1
                 final = attempt >= self.settings.analysis_max_attempts
-                self.database.record_analysis_error(int(segment["id"]), str(exc), final=final)
+                try:
+                    self.database.record_analysis_error(
+                        int(segment["id"]), str(exc), final=final
+                    )
+                except Exception:
+                    pass
                 self.state["analyzer"] = {
                     "status": "error",
                     "message": str(exc),
                     "final": final,
                     "updated_at": utc_now_iso(),
                 }
-                self.database.add_event("analysis-error", str(exc))
+                self._safe_add_event("analysis-error", str(exc))
                 await asyncio.sleep(self.settings.analysis_interval_seconds)
             finally:
                 if self.settings.analysis_cooldown_seconds > 0:
@@ -1071,7 +1085,7 @@ class Supervisor:
                     "message": str(exc),
                     "updated_at": utc_now_iso(),
                 }
-                self.database.add_event("cleanup-error", str(exc))
+                self._safe_add_event("cleanup-error", str(exc))
             await asyncio.sleep(300)
 
     def _cleanup_once(self, cutoff_iso: str) -> int:

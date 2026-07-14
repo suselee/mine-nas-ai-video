@@ -16,18 +16,26 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 class Database:
+    _BUSY_TIMEOUT_MS = 30_000
+
     def __init__(self, path: Path):
         self.path = path
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(
+            self.path,
+            timeout=self._BUSY_TIMEOUT_MS / 1000,
+        )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def migrate(self) -> None:
         with self.connect() as conn:
+            # WAL is persistent for the database file. Setting it once during
+            # startup avoids lock-taking journal mode checks on every connection.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS segments (
@@ -124,6 +132,41 @@ class Database:
             )
             row = conn.execute("SELECT id FROM segments WHERE path = ?", (str(path),)).fetchone()
             return int(row["id"])
+
+    def upsert_segments(self, segments: list[dict[str, Any]]) -> None:
+        """Insert/update one scanner pass in a single short transaction."""
+        if not segments:
+            return
+        values = [
+            (
+                segment["camera_name"],
+                segment["stream_role"],
+                str(segment["path"]),
+                segment["started_at"],
+                segment["ended_at"],
+                segment["duration_seconds"],
+                segment["size_bytes"],
+            )
+            for segment in segments
+        ]
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO segments(
+                    camera_name, stream_role, path, started_at, ended_at,
+                    duration_seconds, size_bytes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    ended_at=excluded.ended_at,
+                    duration_seconds=excluded.duration_seconds,
+                    size_bytes=excluded.size_bytes
+                WHERE segments.ended_at != excluded.ended_at
+                   OR segments.duration_seconds != excluded.duration_seconds
+                   OR segments.size_bytes != excluded.size_bytes
+                """,
+                values,
+            )
 
     def get_pending_segments(
         self,
