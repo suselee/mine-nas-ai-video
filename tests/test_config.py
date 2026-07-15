@@ -43,6 +43,9 @@ def test_load_settings_from_env_file(tmp_path):
     assert settings.record_window_end == ""
     assert settings.ffmpeg_hwaccel == ""
     assert settings.analysis_cooldown_seconds == 5
+    assert settings.segment_at_clocktime is True
+    assert settings.stream_alignment_tolerance_seconds == 2.0
+    assert settings.stream_alignment_sample_count == 5
 
 
 def test_new_window_and_quota_defaults():

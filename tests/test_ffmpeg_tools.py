@@ -8,6 +8,7 @@ from nas_video_summarizer.ffmpeg_tools import (
     _select_person_filtered_frames,
     _hwaccel_args,
     _motion_aware_offsets,
+    build_recorder_command,
     contact_sheet_layout,
     filter_frames_by_person_detection,
     filter_out_blank_frames,
@@ -31,6 +32,26 @@ def test_sample_offsets_respect_minimum_spacing_limit():
 def test_contact_sheet_layout_caps_columns_to_frame_count():
     assert contact_sheet_layout(frame_count=4, preferred_columns=2) == (2, 2)
     assert contact_sheet_layout(frame_count=1, preferred_columns=2) == (1, 1)
+
+
+def test_recorder_segments_at_wall_clock_by_default():
+    settings = load_settings("/nonexistent.env")
+
+    command = build_recorder_command(settings, "low", "rtsp://camera/low")
+
+    index = command.index("-segment_atclocktime")
+    assert command[index + 1] == "1"
+    assert command[command.index("-reset_timestamps") + 1] == "1"
+
+
+def test_recorder_wall_clock_alignment_can_be_disabled():
+    settings = replace(
+        load_settings("/nonexistent.env"), segment_at_clocktime=False
+    )
+
+    command = build_recorder_command(settings, "low", "rtsp://camera/low")
+
+    assert "-segment_atclocktime" not in command
 
 
 def test_motion_aware_offsets_keeps_static_baseline():

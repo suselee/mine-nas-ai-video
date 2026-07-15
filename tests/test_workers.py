@@ -18,6 +18,7 @@ from nas_video_summarizer.workers import (
     _in_time_window,
     _in_record_window,
     _moment_period,
+    _stream_alignment_snapshot,
 )
 
 
@@ -49,6 +50,59 @@ def test_append_daily_summary(tmp_path):
     assert "## 10:00:00 - Painting together" in text
     assert "[100000_painting.mp4](100000_painting.mp4)" in text
     assert "art, family" in text
+
+
+def _alignment_segment(role: str, second: int) -> dict:
+    return {
+        "path": f"/{role}-{second}.mp4",
+        "started_at": f"2026-07-15T08:{second // 60:02d}:{second % 60:02d}+08:00",
+    }
+
+
+def test_stream_alignment_is_stable_with_small_offset():
+    low = [_alignment_segment("low", value) for value in (8, 6, 4, 2, 0)]
+    high = [_alignment_segment("high", value) for value in (9, 7, 5, 3, 1)]
+
+    result = _stream_alignment_snapshot(
+        low,
+        high,
+        tolerance_seconds=2,
+        required_samples=5,
+        segment_seconds=120,
+    )
+
+    assert result["status"] == "stable"
+    assert result["offset_seconds"] == 1.0
+    assert result["paired_segments"] == 5
+
+
+def test_stream_alignment_reports_drift():
+    low = [_alignment_segment("low", value) for value in (480, 360, 240, 120, 0)]
+    high = [_alignment_segment("high", value) for value in (484, 364, 244, 124, 4)]
+
+    result = _stream_alignment_snapshot(
+        low,
+        high,
+        tolerance_seconds=2,
+        required_samples=5,
+        segment_seconds=120,
+    )
+
+    assert result["status"] == "drifted"
+    assert result["offset_seconds"] == 4.0
+
+
+def test_stream_alignment_requires_enough_pairs():
+    result = _stream_alignment_snapshot(
+        [_alignment_segment("low", 0)],
+        [_alignment_segment("high", 1)],
+        tolerance_seconds=2,
+        required_samples=5,
+        segment_seconds=120,
+    )
+
+    assert result["status"] == "insufficient"
+    assert result["paired_segments"] == 1
 
 
 def _dt(hour: int, minute: int) -> datetime:

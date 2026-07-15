@@ -102,6 +102,12 @@ def build_recorder_command(settings: Settings, role: str, rtsp_url: str) -> list
             "segment",
             "-segment_time",
             str(settings.segment_seconds),
+        ]
+    )
+    if settings.segment_at_clocktime:
+        command.extend(["-segment_atclocktime", "1"])
+    command.extend(
+        [
             "-reset_timestamps",
             "1",
             "-strftime",

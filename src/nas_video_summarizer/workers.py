@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from .config import Settings
@@ -130,6 +131,64 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _stream_alignment_snapshot(
+    low_segments: list[dict[str, Any]],
+    high_segments: list[dict[str, Any]],
+    *,
+    tolerance_seconds: float,
+    required_samples: int,
+    segment_seconds: int,
+) -> dict[str, Any]:
+    required = max(1, required_samples)
+    result: dict[str, Any] = {
+        "status": "insufficient",
+        "offset_seconds": None,
+        "tolerance_seconds": tolerance_seconds,
+        "paired_segments": 0,
+        "required_samples": required,
+        "updated_at": utc_now_iso(),
+    }
+    if low_segments:
+        result["latest_low"] = low_segments[0]["path"]
+        result["latest_low_started_at"] = low_segments[0]["started_at"]
+    if high_segments:
+        result["latest_high"] = high_segments[0]["path"]
+        result["latest_high_started_at"] = high_segments[0]["started_at"]
+    if not low_segments or not high_segments:
+        return result
+
+    available_high = list(high_segments)
+    offsets: list[float] = []
+    max_pair_distance = max(float(segment_seconds) / 2, tolerance_seconds * 4, 5.0)
+    for low in low_segments:
+        if not available_high or len(offsets) >= required:
+            break
+        low_started = _parse_iso(low["started_at"])
+        nearest = min(
+            available_high,
+            key=lambda row: abs(
+                (_parse_iso(row["started_at"]) - low_started).total_seconds()
+            ),
+        )
+        offset = (_parse_iso(nearest["started_at"]) - low_started).total_seconds()
+        if abs(offset) <= max_pair_distance:
+            offsets.append(offset)
+            available_high.remove(nearest)
+
+    result["paired_segments"] = len(offsets)
+    if offsets:
+        result["offset_seconds"] = round(float(median(offsets)), 3)
+        result["max_abs_offset_seconds"] = round(max(abs(v) for v in offsets), 3)
+    if len(offsets) < required:
+        return result
+    result["status"] = (
+        "stable"
+        if abs(float(result["offset_seconds"])) <= tolerance_seconds
+        else "drifted"
+    )
+    return result
+
+
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
     return slug[:64] or "family-moment"
@@ -223,6 +282,7 @@ class Supervisor:
             },
             "scanner": {"status": "not-started"},
             "prefilter": {"status": "not-started"},
+            "stream_alignment": {"status": "unknown"},
             "analyzer": {"status": "not-started"},
             "cleanup": {"status": "not-started"},
         }
@@ -358,6 +418,7 @@ class Supervisor:
                     "last_scan_at": utc_now_iso(),
                     "segments_seen": count,
                 }
+                self._update_stream_alignment()
             except Exception as exc:
                 self.state["scanner"] = {
                     "status": "error",
@@ -366,6 +427,25 @@ class Supervisor:
                 }
                 self._safe_add_event("scanner-error", str(exc))
             await asyncio.sleep(10)
+
+    def _update_stream_alignment(self) -> None:
+        sample_count = max(1, self.settings.stream_alignment_sample_count)
+        fetch_limit = max(sample_count * 2, sample_count)
+        alignment = _stream_alignment_snapshot(
+            self.database.recent_segments("low", limit=fetch_limit),
+            self.database.recent_segments("high", limit=fetch_limit),
+            tolerance_seconds=self.settings.stream_alignment_tolerance_seconds,
+            required_samples=sample_count,
+            segment_seconds=self.settings.segment_seconds,
+        )
+        previous = self.state.get("stream_alignment", {}).get("status")
+        self.state["stream_alignment"] = alignment
+        status = alignment["status"]
+        if status != previous and status in {"stable", "drifted", "insufficient"}:
+            self._safe_add_event(
+                f"stream-alignment-{status}",
+                json.dumps(alignment, ensure_ascii=False),
+            )
 
     def _scan_once(self) -> int:
         now = _now()
@@ -1215,6 +1295,9 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "high_rtsp": bool(settings.rtsp_high_url),
             "rtsp_credentials": bool(settings.rtsp_username or settings.rtsp_password),
             "camera_time_offset_seconds": settings.camera_time_offset_seconds,
+            "segment_at_clocktime": settings.segment_at_clocktime,
+            "stream_alignment_tolerance_seconds": settings.stream_alignment_tolerance_seconds,
+            "stream_alignment_sample_count": settings.stream_alignment_sample_count,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
             "analysis_image_mode": settings.analysis_image_mode,
@@ -1251,6 +1334,11 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "latest_low": database.latest_segment("low"),
             "latest_high": database.latest_segment("high"),
         },
+        "stream_alignment": (
+            supervisor.snapshot().get("stream_alignment", {"status": "unknown"})
+            if supervisor
+            else {"status": "not-started"}
+        ),
         "workers": supervisor.snapshot() if supervisor else {"status": "not-started"},
         "events": database.recent_events(limit=10),
     }

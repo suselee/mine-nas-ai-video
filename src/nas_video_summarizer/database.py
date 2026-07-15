@@ -433,6 +433,22 @@ class Database:
             ).fetchone()
         return row_to_dict(row) if row else None
 
+    def recent_segments(
+        self, stream_role: str, *, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM segments
+                WHERE stream_role = ? AND deleted_at IS NULL
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (stream_role, max(1, limit)),
+            ).fetchall()
+            return [row_to_dict(row) for row in rows]
+
     def expired_segments(self, cutoff_iso: str, *, limit: int = 500) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(

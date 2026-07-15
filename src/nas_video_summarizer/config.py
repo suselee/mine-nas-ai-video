@@ -125,7 +125,10 @@ class Settings:
     ffprobe_bin: str
     ffmpeg_hwaccel: str
     segment_seconds: int
+    segment_at_clocktime: bool
     segment_stable_seconds: int
+    stream_alignment_tolerance_seconds: float
+    stream_alignment_sample_count: int
     retention_hours: int
     analysis_enabled: bool
     analysis_delay_seconds: int
@@ -216,7 +219,12 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ffprobe_bin=os.getenv("FFPROBE_BIN", "ffprobe"),
         ffmpeg_hwaccel=os.getenv("FFMPEG_HWACCEL", "").strip().lower(),
         segment_seconds=_int("SEGMENT_SECONDS", 120),
+        segment_at_clocktime=_bool("SEGMENT_AT_CLOCKTIME", True),
         segment_stable_seconds=_int("SEGMENT_STABLE_SECONDS", 8),
+        stream_alignment_tolerance_seconds=_float(
+            "STREAM_ALIGNMENT_TOLERANCE_SECONDS", 2.0
+        ),
+        stream_alignment_sample_count=_int("STREAM_ALIGNMENT_SAMPLE_COUNT", 5),
         retention_hours=_int("RETENTION_HOURS", 168),
         analysis_enabled=_bool("ANALYSIS_ENABLED", True),
         analysis_delay_seconds=_int("ANALYSIS_DELAY_SECONDS", 300),

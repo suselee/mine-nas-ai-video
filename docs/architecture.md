@@ -17,9 +17,9 @@ flowchart LR
             RUNTIME[WorkerRuntime\n独立 asyncio event loop]
 
             subgraph SUP[Supervisor 并发任务]
-                RLOW[low recorder\nffmpeg RTSP -> segment mp4]
-                RHIGH[high recorder\nffmpeg RTSP -> segment mp4]
-                SCAN[scanner\n每10秒发现稳定文件\n批量 upsert]
+                RLOW[low recorder\nffmpeg RTSP -> wall-clock segments]
+                RHIGH[high recorder\nffmpeg RTSP -> wall-clock segments]
+                SCAN[scanner\n每10秒发现稳定文件\n批量 upsert + 对齐监控]
                 ANALYZE[analyzer\n按时间顺序处理 low segment]
                 CLEAN[cleanup\n按 RETENTION_HOURS 清理原始 buffer]
             end
@@ -48,6 +48,8 @@ flowchart LR
     DB -->|pending low, older than delay| ANALYZE
     BUFFER -->|low segment| ANALYZE
     ANALYZE --> MODELS
+    SCAN -. recent low/high offsets .-> ALIGN[stream_alignment\nstable / drifted / insufficient]
+    ALIGN -. /api/health .-> HTTP
 
     subgraph PIPE[单个片段的分析与保存流水线]
         SAMPLE[ffmpeg 抽样\n默认本地最多12帧]
@@ -86,13 +88,14 @@ flowchart LR
 
 ## 如何阅读
 
-1. **录像层**：摄像头同时输出 low 和 high 两路 RTSP。两个 ffmpeg recorder 各自把视频切成约120秒文件。`RECORD_WINDOW_START/END` 外会停止拉流。
+1. **录像层**：摄像头同时输出 low 和 high 两路 RTSP。两个 ffmpeg recorder 各自按 FreeBSD 墙上时钟切成约120秒文件。`RECORD_WINDOW_START/END` 外会停止拉流。
 2. **索引层**：scanner 只把稳定的 mp4 登记到 SQLite；analyzer 只处理 `analysis_stream_role=low` 的待处理片段，并故意等待 `ANALYSIS_DELAY_SECONDS`。
 3. **本地预过滤层**：OpenCV DNN 运行 YOLO、脸部检测和年龄分类。黑帧、无人物、确定只有成人的片段不会调用 VLM。
 4. **主判断层**：Qwen3-VL 查看低流抽样帧，返回 `keep`、置信度、标题、摘要和片段偏移。
 5. **候选确认层**：主判断为正面后，重新抽取候选附近的高分辨率帧，进行第二次 VLM 确认。
 6. **最终视频层**：根据 low 的时间偏移找到所有重叠 high 文件，生成隐藏暂存视频，再从暂存视频抽取前、中、后三帧进行第三次确认。只有这里通过后才发布到 Nextcloud 目录。
 7. **持久化层**：发布后写视频、JSON 元数据、每日 `summary.md`，再写 SQLite `moments` 记录。配额淘汰也延迟到新视频成功登记后执行。
+8. **时间监控层**：scanner 用最近 low/high 片段的开始时间计算中位数 offset。它监控 recorder 边界是否同步，不把摄像头 OSD 水印误认为 RTSP 元数据。
 
 ## 当前一次正面片段的 VLM 成本
 

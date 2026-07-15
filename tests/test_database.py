@@ -89,3 +89,25 @@ def test_connections_configure_busy_timeout(tmp_path):
 
     assert busy_timeout == 30_000
     assert journal_mode == "wal"
+
+
+def test_recent_segments_returns_newest_first(tmp_path):
+    db = Database(tmp_path / "test.sqlite3")
+    db.migrate()
+    _insert_segment(
+        db,
+        stream_role="low",
+        path="/buffer/low/older.mp4",
+        started_at="2026-07-08T10:00:00+00:00",
+    )
+    _insert_segment(
+        db,
+        stream_role="low",
+        path="/buffer/low/newer.mp4",
+        started_at="2026-07-08T10:02:00+00:00",
+    )
+
+    rows = db.recent_segments("low", limit=1)
+
+    assert len(rows) == 1
+    assert rows[0]["path"] == "/buffer/low/newer.mp4"

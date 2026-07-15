@@ -8,6 +8,30 @@ service uses Python's standard library and `ffmpeg`; the enabled-by-default
 person filter additionally uses the OpenCV and NumPy packages supplied by
 FreeBSD.
 
+## Host clock and camera clock
+
+The jail reads the FreeBSD host clock but should not try to change it. Enable
+NTP on the FreeBSD host (not inside the jail):
+
+```sh
+sysrc ntpd_enable=YES
+sysrc ntpd_sync_on_start=YES
+service ntpd start
+ntpq -p
+date
+```
+
+The recorder uses the host wall clock for segment boundaries when
+`SEGMENT_AT_CLOCKTIME=true`. The camera's on-screen timestamp is a separate
+clock. If it is 23 seconds behind the host, set this in the jail's `.env`:
+
+```text
+CAMERA_TIME_OFFSET_SECONDS=-23
+```
+
+This changes displayed metadata and directory names only; it does not rewrite
+the media PTS or alter relative clip extraction.
+
 ## 1. Packages
 
 Install Python, SQLite support, `uv`, `ffmpeg`, and the person-filter runtime
@@ -74,6 +98,10 @@ RTSP_LOW_URL=rtsp://camera-ip/low-stream
 RTSP_HIGH_URL=rtsp://camera-ip/4k-stream
 LLAMA_BASE_URL=http://llama-jail-ip:8080/v1
 LLAMA_MODEL=Qwen3-VL-2B-Instruct
+SEGMENT_AT_CLOCKTIME=true
+STREAM_ALIGNMENT_TOLERANCE_SECONDS=2
+STREAM_ALIGNMENT_SAMPLE_COUNT=5
+CAMERA_TIME_OFFSET_SECONDS=-23
 ```
 
 If the RTSP password contains special characters, quote it in `.env`, for example `RTSP_PASSWORD="your#complex&password"`.
@@ -97,6 +125,18 @@ uv run nas-video
 ```
 
 Open `http://jail-ip:8000`.
+
+After both streams have produced at least five stable segments, inspect the
+alignment state:
+
+```sh
+fetch -qo - http://127.0.0.1:8000/api/health | \
+  python3.11 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["stream_alignment"], indent=2))'
+```
+
+`stable` means recent low/high segment starts are within the configured
+tolerance. `drifted` means recorder or camera timing needs investigation;
+final high-stream verification remains enabled in either case.
 
 ## 4. rc.d Service
 
