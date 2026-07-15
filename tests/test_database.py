@@ -42,12 +42,18 @@ def test_get_pending_segments_filters_by_role(tmp_path):
 def test_get_pending_low_segments_still_works(tmp_path):
     db = Database(tmp_path / "test.sqlite3")
     db.migrate()
-
     ready_before = "2026-07-08T12:00:00+00:00"
-    _insert_segment(db, stream_role="low", path="/buffer/low/seg1.mp4", started_at="2026-07-08T10:00:00+00:00")
+    _insert_segment(
+        db,
+        stream_role="low",
+        path="/buffer/low/seg1.mp4",
+        started_at="2026-07-08T10:00:00+00:00",
+    )
 
-    # Backward compatibility wrapper
-    rows = db.get_pending_low_segments(ready_before=ready_before, max_attempts=3, limit=10)
+    rows = db.get_pending_low_segments(
+        ready_before=ready_before, max_attempts=3, limit=10
+    )
+
     assert len(rows) == 1
     assert rows[0]["stream_role"] == "low"
 

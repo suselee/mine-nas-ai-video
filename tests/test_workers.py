@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -152,9 +153,6 @@ class _FakeCapDB:
     def count_moments_on_day(self, day):
         return self._count
 
-    def min_confidence_on_day(self, day):
-        return float(self._weakest["confidence"]) if self._weakest else 1.0
-
     def weakest_moment_on_day(self, day):
         return self._weakest
 
@@ -204,7 +202,7 @@ def test_daily_cap_under_limit_saves():
         weakest={"confidence": 0.3, "clip_path": "/x", "metadata_path": "/y", "title": "t", "id": 1},
     )
     sup = _supervisor_with(db, max_per_day=20)
-    assert sup._daily_cap_eviction_target(_segment(), _result(0.6)) is None
+    assert sup._daily_cap_decision(_segment(), _result(0.6)).outcome == "ok"
 
 
 def test_daily_cap_at_limit_better_evicts():
@@ -213,8 +211,8 @@ def test_daily_cap_at_limit_better_evicts():
         weakest={"confidence": 0.3, "clip_path": "/x.mp4", "metadata_path": "/x.json", "title": "weak", "id": 1},
     )
     sup = _supervisor_with(db, max_per_day=20)
-    target = sup._daily_cap_eviction_target(_segment(), _result(0.8))
-    assert isinstance(target, dict) and target["title"] == "weak"
+    decision = sup._daily_cap_decision(_segment(), _result(0.8))
+    assert decision.outcome == "evict" and decision.weakest["title"] == "weak"
 
 
 def test_daily_cap_at_limit_worse_skips():
@@ -223,7 +221,7 @@ def test_daily_cap_at_limit_worse_skips():
         weakest={"confidence": 0.7, "clip_path": "/x.mp4", "metadata_path": "/x.json", "title": "strong", "id": 1},
     )
     sup = _supervisor_with(db, max_per_day=20)
-    assert sup._daily_cap_eviction_target(_segment(), _result(0.5)) is False
+    assert sup._daily_cap_decision(_segment(), _result(0.5)).outcome == "blocked"
 
 
 def test_moment_period_boundaries():
@@ -241,9 +239,10 @@ def test_period_cap_under_limit_saves():
     db = _FakeCapDB(count=20, period_count=7, weakest=None)
     sup = _supervisor_with(db, max_per_day=24, max_per_period=8)
 
-    assert sup._period_cap_eviction_target(
+    decision = sup._period_cap_decision(
         {"started_at": "2026-07-10T10:00:00+08:00"}, _result(0.8)
-    ) == ("morning", None)
+    )
+    assert decision.outcome == "ok" and decision.scope == "morning"
 
 
 def test_period_cap_replaces_weaker_moment_in_same_period():
@@ -257,12 +256,13 @@ def test_period_cap_replaces_weaker_moment_in_same_period():
     db = _FakeCapDB(count=20, period_count=8, weakest=weakest)
     sup = _supervisor_with(db, max_per_day=24, max_per_period=8)
 
-    label, target = sup._period_cap_eviction_target(
+    decision = sup._period_cap_decision(
         {"started_at": "2026-07-10T18:00:00+08:00"}, _result(0.85)
     )
 
-    assert label == "evening"
-    assert target == weakest
+    assert decision.outcome == "evict"
+    assert decision.scope == "evening"
+    assert decision.weakest == weakest
 
 
 def test_period_cap_skips_equal_or_weaker_moment():
@@ -276,9 +276,10 @@ def test_period_cap_skips_equal_or_weaker_moment():
     db = _FakeCapDB(count=20, period_count=8, weakest=weakest)
     sup = _supervisor_with(db, max_per_day=24, max_per_period=8)
 
-    assert sup._period_cap_eviction_target(
+    decision = sup._period_cap_decision(
         {"started_at": "2026-07-10T13:00:00+08:00"}, _result(0.85)
-    ) == ("afternoon", False)
+    )
+    assert decision.outcome == "blocked" and decision.scope == "afternoon"
 
 
 def test_evict_moment_removes_files(tmp_path):
@@ -292,6 +293,57 @@ def test_evict_moment_removes_files(tmp_path):
         {"clip_path": str(clip), "metadata_path": str(meta), "title": "t", "confidence": 0.3}
     )
     assert not clip.exists() and not meta.exists()
+
+
+def test_apply_moment_caps_period_eviction_lowers_daily_count(tmp_path):
+    # The period-weakest is also the day-weakest, and both caps are at limit.
+    # Evicting it for the period must lower the day count so the daily check
+    # sees the post-eviction state and does NOT evict a second moment.
+    weakest = {
+        "confidence": 0.3,
+        "clip_path": str(tmp_path / "w.mp4"),
+        "metadata_path": str(tmp_path / "w.json"),
+        "title": "weak",
+        "id": 1,
+    }
+
+    class _SharedWeakestDB:
+        def __init__(self):
+            self.day_count = 20
+            self.period_count = 8
+            self.evictions = 0
+
+        def count_moments_on_day(self, day):
+            return self.day_count
+
+        def weakest_moment_on_day(self, day):
+            return weakest
+
+        def count_moments_between(self, start_iso, end_iso):
+            return self.period_count
+
+        def weakest_moment_between(self, start_iso, end_iso):
+            return weakest
+
+        def delete_moment_by_clip(self, clip):
+            # The evicted moment leaves both the day and its period.
+            self.day_count -= 1
+            self.period_count -= 1
+            self.evictions += 1
+
+        def add_event(self, *args, **kwargs):
+            pass
+
+    db = _SharedWeakestDB()
+    sup = _supervisor_with(db, max_per_day=20, max_per_period=8)
+
+    plan = sup._apply_moment_caps(
+        {"started_at": "2026-07-10T18:00:00+08:00"}, _result(0.85)
+    )
+
+    assert plan.skip is None  # proceed to save
+    assert len(plan.evictions) == 1  # schedule once, do not delete yet
+    assert db.evictions == 0
 
 
 def test_analyze_segment_passes_actual_frame_offsets(tmp_path, monkeypatch):
@@ -596,3 +648,110 @@ def test_candidate_verification_uses_high_resolution_frames(tmp_path, monkeypatc
 
     assert verified is True
     assert captured == [(512, 20), (512, 30.0), (512, 40)]
+
+
+def test_final_source_verification_fails_closed(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        analysis_stream_role="high",
+        output_dir=tmp_path / "output",
+    )
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    segment_path = tmp_path / "segment.mp4"
+    segment_path.write_bytes(b"source")
+    segment = {
+        "id": 1,
+        "camera_name": "home-camera",
+        "path": str(segment_path),
+        "started_at": "2026-07-15T08:34:15+08:00",
+        "ended_at": "2026-07-15T08:36:15+08:00",
+    }
+    database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="high",
+        path=segment_path,
+        started_at=segment["started_at"],
+        ended_at=segment["ended_at"],
+        duration_seconds=120,
+        size_bytes=6,
+    )
+
+    async def fake_candidate(*args, **kwargs):
+        return True
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        output_path.write_bytes(b"staged")
+
+    async def fake_verify(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(supervisor, "_verify_candidate", fake_candidate)
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    monkeypatch.setattr(supervisor, "_verify_saved_clip", fake_verify)
+
+    result = asyncio.run(
+        supervisor._save_moment(
+            segment,
+            _result(0.95),
+            object(),
+        )
+    )
+
+    assert result == -1
+    assert not list((tmp_path / "output").rglob("*.mp4"))
+
+
+def test_published_clip_uses_camera_offset_and_final_source(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        analysis_stream_role="high",
+        output_dir=tmp_path / "output",
+        camera_time_offset_seconds=-23,
+    )
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    segment_path = tmp_path / "segment.mp4"
+    segment_path.write_bytes(b"source")
+    segment_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="high",
+        path=segment_path,
+        started_at="2026-07-15T08:34:14+08:00",
+        ended_at="2026-07-15T08:36:14+08:00",
+        duration_seconds=120,
+        size_bytes=6,
+    )
+    segment = {
+        "id": segment_id,
+        "camera_name": "home-camera",
+        "path": str(segment_path),
+        "started_at": "2026-07-15T08:34:14+08:00",
+        "ended_at": "2026-07-15T08:36:14+08:00",
+    }
+
+    async def fake_candidate(*args, **kwargs):
+        return True
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        output_path.write_bytes(b"verified-source")
+
+    async def fake_verify(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(supervisor, "_verify_candidate", fake_candidate)
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    monkeypatch.setattr(supervisor, "_verify_saved_clip", fake_verify)
+
+    moment_id = asyncio.run(
+        supervisor._save_moment(segment, _result(0.95), object())
+    )
+
+    assert moment_id > 0
+    clip = next((tmp_path / "output" / "2026-07-15").glob("*.mp4"))
+    assert clip.name.startswith("083351_")
+    metadata = json.loads(clip.with_suffix(".json").read_text())
+    assert metadata["clip_start"] == "2026-07-15T08:33:51+08:00"
+    assert clip.read_bytes() == b"verified-source"

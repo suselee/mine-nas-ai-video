@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import tempfile
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 from .config import Settings
 from .database import Database, utc_now_iso
 from .ffmpeg_tools import (
+    PersonFilterDecision,
     SampledFrame,
     _extract_frame,
     build_contact_sheet_from_frames,
@@ -27,7 +29,7 @@ from .ffmpeg_tools import (
     sample_frames_with_offsets,
     segment_time_window,
 )
-from .llm import AnalysisResult, LlamaAnalyzer
+from .llm import AnalysisResult, DaughterVerification, LlamaAnalyzer
 
 
 class PersonFilterSkip(Exception):
@@ -172,6 +174,36 @@ def _append_daily_summary(
     with summary_path.open("a", encoding="utf-8") as handle:
         handle.write(entry)
     return summary_path
+
+
+@dataclass(frozen=True)
+class CapDecision:
+    """Outcome of a per-day or per-period moment-cap check.
+
+    ``outcome`` is one of:
+      * ``"ok"``      — under the cap; save normally, no eviction.
+      * ``"evict"``   — at the cap but the new clip is stronger; ``weakest``
+                        should be evicted before saving.
+      * ``"blocked"`` — at the cap and the new clip is not stronger; skip it.
+    """
+
+    outcome: str
+    scope: str
+    weakest: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class MomentSkip:
+    """A decision to not save the current candidate, with the event to log."""
+
+    event_type: str
+    message: str
+
+
+@dataclass(frozen=True)
+class CapPlan:
+    skip: MomentSkip | None = None
+    evictions: tuple[tuple[dict[str, Any], str, str], ...] = ()
 
 
 class Supervisor:
@@ -383,55 +415,63 @@ class Supervisor:
             return False
         return (_now() - self._last_moment_saved_at).total_seconds() < self.settings.moment_cooldown_seconds
 
-    def _daily_cap_eviction_target(self, segment: dict[str, Any], result: AnalysisResult):
-        """Return the weakest moment to evict for the daily cap, or a decision.
+    def _display_started_at(self, segment: dict[str, Any]) -> datetime | None:
+        value = str(segment.get("started_at", ""))
+        if not value:
+            return None
+        return _parse_iso(value) + timedelta(
+            seconds=self.settings.camera_time_offset_seconds
+        )
 
-        Returns:
-          * ``None``      — under the cap, save normally (no eviction).
-          * a dict       — at the cap and this new clip is better; evict this
-                           weakest moment, then save the new one.
-          * ``False``    — at the cap and the new clip is not better; skip it.
-        """
+    def _daily_cap_decision(
+        self, segment: dict[str, Any], result: AnalysisResult
+    ) -> CapDecision:
+        """Decide the daily keep-best-N cap for this candidate (see CapDecision)."""
         cap = self.settings.max_moments_per_day
         if cap <= 0:
-            return None
-        day = str(segment.get("started_at", ""))[:10]
-        if not day:
-            return None
+            return CapDecision("ok", "daily")
+        started_at = self._display_started_at(segment)
+        if started_at is None:
+            return CapDecision("ok", "daily")
+        day = started_at.strftime("%Y-%m-%d")
         if self.database.count_moments_on_day(day) < cap:
-            return None
+            return CapDecision("ok", "daily")
         weakest = self.database.weakest_moment_on_day(day)
         if weakest is None:
-            return None
+            return CapDecision("ok", "daily")
         if result.confidence > float(weakest["confidence"]):
-            return weakest
-        return False
+            return CapDecision("evict", "daily", weakest)
+        return CapDecision("blocked", "daily")
 
-    def _period_cap_eviction_target(
+    def _period_cap_decision(
         self, segment: dict[str, Any], result: AnalysisResult
-    ) -> tuple[str, dict[str, Any] | bool | None] | None:
+    ) -> CapDecision:
+        """Decide the per-period keep-best-N cap for this candidate.
+
+        ``scope`` carries the period label ("morning"/"afternoon"/"evening"),
+        or "" when the period cap does not apply (disabled, no timestamp, or
+        the timestamp falls outside every configured period).
+        """
         cap = self.settings.max_moments_per_period
         if cap <= 0:
-            return None
-        started_value = str(segment.get("started_at", ""))
-        if not started_value:
-            return None
-        period = _moment_period(
-            _parse_iso(started_value), self.settings.moment_period_boundaries
-        )
+            return CapDecision("ok", "")
+        started_at = self._display_started_at(segment)
+        if started_at is None:
+            return CapDecision("ok", "")
+        period = _moment_period(started_at, self.settings.moment_period_boundaries)
         if period is None:
-            return None
+            return CapDecision("ok", "")
         label, start, end = period
         start_iso = start.isoformat(timespec="seconds")
         end_iso = end.isoformat(timespec="seconds")
         if self.database.count_moments_between(start_iso, end_iso) < cap:
-            return label, None
+            return CapDecision("ok", label)
         weakest = self.database.weakest_moment_between(start_iso, end_iso)
         if weakest is None:
-            return label, None
+            return CapDecision("ok", label)
         if result.confidence > float(weakest["confidence"]):
-            return label, weakest
-        return label, False
+            return CapDecision("evict", label, weakest)
+        return CapDecision("blocked", label)
 
     def _evict_moment(
         self,
@@ -449,6 +489,82 @@ class Supervisor:
             f"replaced weakest {scope} moment '{moment['title']}' "
             f"(confidence {float(moment['confidence']):.2f})",
         )
+
+    def _apply_moment_caps(
+        self, segment: dict[str, Any], result: AnalysisResult
+    ) -> CapPlan:
+        """Apply cooldown + period + daily caps for a keep-worthy candidate.
+
+        Return a plan without deleting anything. Evictions are applied only
+        after the new clip has passed final verification and been registered.
+        This prevents a false positive or ffmpeg failure from deleting an old
+        good moment.
+        """
+        if self._moment_cooldown_active():
+            return CapPlan(
+                skip=MomentSkip(
+                    "moment-cooldown", f"skipped '{result.title}' due to cooldown"
+                )
+            )
+
+        evictions: list[tuple[dict[str, Any], str, str]] = []
+        period = self._period_cap_decision(segment, result)
+        if period.outcome == "blocked":
+            return CapPlan(
+                skip=MomentSkip(
+                    "period-cap",
+                    f"skipped '{result.title}' ({period.scope} limit "
+                    f"{self.settings.max_moments_per_period} reached, "
+                    f"confidence {result.confidence:.2f} not above weakest)",
+                )
+            )
+        if period.outcome == "evict":
+            assert period.weakest is not None
+            evictions.append((period.weakest, "period-cap-evict", period.scope))
+
+        display_started = self._display_started_at(segment)
+        day = display_started.strftime("%Y-%m-%d") if display_started else ""
+        daily_count = self.database.count_moments_on_day(day) if day else 0
+        # A period eviction belongs to this same source day, so account for it
+        # before applying the daily cap without mutating the database yet.
+        daily_count -= len(evictions)
+        daily = self._daily_cap_decision_after_count(
+            segment, result, daily_count
+        )
+        if daily.outcome == "blocked":
+            return CapPlan(
+                skip=MomentSkip(
+                    "daily-cap",
+                    f"skipped '{result.title}' (daily limit "
+                    f"{self.settings.max_moments_per_day} reached, "
+                    f"confidence {result.confidence:.2f} not above weakest)",
+                )
+            )
+        if daily.outcome == "evict":
+            assert daily.weakest is not None
+            if not any(item[0]["id"] == daily.weakest["id"] for item in evictions):
+                evictions.append((daily.weakest, "daily-cap-evict", "daily"))
+        return CapPlan(evictions=tuple(evictions))
+
+    def _daily_cap_decision_after_count(
+        self,
+        segment: dict[str, Any],
+        result: AnalysisResult,
+        count: int,
+    ) -> CapDecision:
+        cap = self.settings.max_moments_per_day
+        if cap <= 0 or count < cap:
+            return CapDecision("ok", "daily")
+        started_at = self._display_started_at(segment)
+        if started_at is None:
+            return CapDecision("ok", "daily")
+        day = started_at.strftime("%Y-%m-%d")
+        weakest = self.database.weakest_moment_on_day(day)
+        if weakest is None:
+            return CapDecision("ok", "daily")
+        if result.confidence > float(weakest["confidence"]):
+            return CapDecision("evict", "daily", weakest)
+        return CapDecision("blocked", "daily")
 
     async def _analyzer_loop(self) -> None:
         analyzer = LlamaAnalyzer(self.settings)
@@ -528,53 +644,24 @@ class Supervisor:
                         f"({result.local_child_score:.2f}): {result.title}",
                     )
                 if should_save:
-                    if self._moment_cooldown_active():
+                    cap_plan = self._apply_moment_caps(segment, result)
+                    if cap_plan.skip is not None:
                         self.database.add_event(
-                            "moment-cooldown",
-                            f"skipped '{result.title}' due to cooldown",
+                            cap_plan.skip.event_type, cap_plan.skip.message
                         )
                     else:
-                        period_decision = self._period_cap_eviction_target(
-                            segment, result
+                        moment_id = await self._save_moment(
+                            segment, result, analyzer
                         )
-                        period_label = (
-                            period_decision[0] if period_decision else ""
-                        )
-                        period_evict = (
-                            period_decision[1] if period_decision else None
-                        )
-                        if period_evict is False:
-                            self.database.add_event(
-                                "period-cap",
-                                f"skipped '{result.title}' ({period_label} limit "
-                                f"{self.settings.max_moments_per_period} reached, "
-                                f"confidence {result.confidence:.2f} not above weakest)",
-                            )
-                        else:
-                            if isinstance(period_evict, dict):
+                        if moment_id >= 0:
+                            for moment, event_type, scope in cap_plan.evictions:
                                 self._evict_moment(
-                                    period_evict,
-                                    event_type="period-cap-evict",
-                                    scope=period_label,
+                                    moment, event_type=event_type, scope=scope
                                 )
-                            evict = self._daily_cap_eviction_target(segment, result)
-                            if evict is False:
-                                self.database.add_event(
-                                    "daily-cap",
-                                    f"skipped '{result.title}' (daily limit {self.settings.max_moments_per_day} reached, "
-                                    f"confidence {result.confidence:.2f} not above weakest)",
-                                )
-                            else:
-                                if isinstance(evict, dict):
-                                    self._evict_moment(evict)
-                                moment_id = await self._save_moment(
-                                    segment, result, analyzer
-                                )
-                                if moment_id >= 0:
-                                    self.database.add_event(
-                                        "moment",
-                                        f"saved moment {moment_id}: {result.title}",
-                                    )
+                            self.database.add_event(
+                                "moment",
+                                f"saved moment {moment_id}: {result.title}",
+                            )
                 if not should_save:
                     self.database.add_event(
                         "analysis-skip",
@@ -778,6 +865,9 @@ class Supervisor:
     ) -> int:
         source_started = _parse_iso(segment["started_at"])
         source_ended = _parse_iso(segment["ended_at"])
+        display_offset = timedelta(seconds=self.settings.camera_time_offset_seconds)
+        display_source_started = source_started + display_offset
+        display_source_ended = source_ended + display_offset
 
         wanted_start = source_started + timedelta(
             seconds=result.start_offset_seconds - self.settings.context_before_seconds
@@ -800,20 +890,14 @@ class Supervisor:
                 started_before=wanted_end.isoformat(timespec="seconds"),
                 ended_after=wanted_start.isoformat(timespec="seconds"),
             )
-            source_rows = [row for row in high_segments if Path(row["path"]).exists()]
+            source_rows = sorted(
+                (row for row in high_segments if Path(row["path"]).exists()),
+                key=lambda row: _parse_iso(row["started_at"]),
+            )
             if source_rows:
-
-                def _overlap_seconds(row: dict[str, Any]) -> float:
-                    row_start = _parse_iso(row["started_at"])
-                    row_end = _parse_iso(row["ended_at"])
-                    overlap_start = max(row_start, wanted_start)
-                    overlap_end = min(row_end, wanted_end)
-                    return max(0.0, (overlap_end - overlap_start).total_seconds())
-
-                best_row = max(source_rows, key=_overlap_seconds)
-                source_paths = [Path(best_row["path"])]
-                first_started = _parse_iso(best_row["started_at"])
-                last_ended = _parse_iso(best_row["ended_at"])
+                source_paths = [Path(row["path"]) for row in source_rows]
+                first_started = _parse_iso(source_rows[0]["started_at"])
+                last_ended = _parse_iso(source_rows[-1]["ended_at"])
             else:
                 source_paths = [Path(segment["path"])]
                 first_started = source_started
@@ -831,9 +915,11 @@ class Supervisor:
             clip_end = clip_start + timedelta(seconds=self.settings.max_moment_seconds)
             duration_seconds = float(self.settings.max_moment_seconds)
 
-        day_dir = self.settings.output_dir / source_started.strftime("%Y-%m-%d")
+        display_clip_start = clip_start + display_offset
+        display_clip_end = clip_end + display_offset
+        day_dir = self.settings.output_dir / display_clip_start.strftime("%Y-%m-%d")
         title_slug = _slugify(result.title)
-        clip_path = _unique_path(day_dir / f"{source_started.strftime('%H%M%S')}_{title_slug}.mp4")
+        clip_path = _unique_path(day_dir / f"{display_clip_start.strftime('%H%M%S')}_{title_slug}.mp4")
         metadata_path = clip_path.with_suffix(".json")
 
         # Confirm the candidate on the analysis stream before doing expensive 4K
@@ -851,13 +937,29 @@ class Supervisor:
             )
             return -1
 
-        await extract_clip(
-            self.settings,
-            source_paths,
-            clip_path,
-            start_offset_seconds=start_offset_seconds,
-            duration_seconds=duration_seconds,
-        )
+        day_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".nas-video-staged-", dir=day_dir
+        ) as staging_dir:
+            staged_clip_path = Path(staging_dir) / clip_path.name
+            await extract_clip(
+                self.settings,
+                source_paths,
+                staged_clip_path,
+                start_offset_seconds=start_offset_seconds,
+                duration_seconds=duration_seconds,
+            )
+            verified_final = await self._verify_saved_clip(
+                analyzer, staged_clip_path, duration_seconds
+            )
+            if not verified_final:
+                self.database.add_event(
+                    "moment-verify-failed",
+                    f"rejected final source clip before publishing: {result.title}",
+                )
+                return -1
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_clip_path, clip_path)
 
         metadata = {
             "camera_name": segment["camera_name"],
@@ -871,12 +973,12 @@ class Supervisor:
             "local_child_confirmed": result.local_child_confirmed,
             "local_child_score": result.local_child_score,
             "source_low_segment": segment["path"],
-            "source_started_at": source_started.isoformat(timespec="seconds"),
-            "source_ended_at": source_ended.isoformat(timespec="seconds"),
-            "wanted_start": wanted_start.isoformat(timespec="seconds"),
-            "wanted_end": wanted_end.isoformat(timespec="seconds"),
-            "clip_start": clip_start.isoformat(timespec="seconds"),
-            "clip_end": clip_end.isoformat(timespec="seconds"),
+            "source_started_at": display_source_started.isoformat(timespec="seconds"),
+            "source_ended_at": display_source_ended.isoformat(timespec="seconds"),
+            "wanted_start": (wanted_start + display_offset).isoformat(timespec="seconds"),
+            "wanted_end": (wanted_end + display_offset).isoformat(timespec="seconds"),
+            "clip_start": display_clip_start.isoformat(timespec="seconds"),
+            "clip_end": display_clip_end.isoformat(timespec="seconds"),
             "clip_duration_seconds": duration_seconds,
             "source_paths": [str(path) for path in source_paths],
             "model_raw": result.raw,
@@ -886,8 +988,8 @@ class Supervisor:
             day_dir=day_dir,
             clip_path=clip_path,
             result=result,
-            clip_start=clip_start,
-            clip_end=clip_end,
+            clip_start=display_clip_start,
+            clip_end=display_clip_end,
         )
         metadata["daily_summary_path"] = str(daily_summary_path)
         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
@@ -901,11 +1003,70 @@ class Supervisor:
             tags=result.tags,
             confidence=result.confidence,
             source_low_segment_id=int(segment["id"]),
-            source_started_at=source_started.isoformat(timespec="seconds"),
-            source_ended_at=source_ended.isoformat(timespec="seconds"),
+            source_started_at=display_source_started.isoformat(timespec="seconds"),
+            source_ended_at=display_source_ended.isoformat(timespec="seconds"),
             clip_path=clip_path,
             metadata_path=metadata_path,
         )
+
+    async def _extract_verification_frames(
+        self,
+        settings: Settings,
+        video_path: Path,
+        offsets: list[float],
+        temp_dir: str,
+        *,
+        prefix: str,
+    ) -> list[SampledFrame]:
+        """Extract one frame per offset; return only the frames that were written."""
+        frames: list[SampledFrame] = []
+        for index, offset in enumerate(offsets, start=1):
+            frame_path = Path(temp_dir) / f"{prefix}-{index}.jpg"
+            await _extract_frame(settings, video_path, frame_path, offset)
+            if frame_path.exists():
+                frames.append(SampledFrame(path=frame_path, offset_seconds=offset))
+        return frames
+
+    @staticmethod
+    def _dual_evidence_keep(
+        local_decision: PersonFilterDecision,
+        verification: DaughterVerification,
+    ) -> bool:
+        """Keep an otherwise-unverified clip when local child evidence is strong
+        and the VLM is only weakly negative."""
+        return local_decision.child_confirmed and verification.confidence < 0.75
+
+    def _log_verification_outcome(
+        self,
+        kept: bool,
+        local_decision: PersonFilterDecision,
+        verification: DaughterVerification,
+    ) -> None:
+        """Record the shared dual-evidence keep / verify-detail reject event."""
+        if kept:
+            self.database.add_event(
+                "verify-local-child-keep",
+                json.dumps(
+                    {
+                        "child_score": local_decision.max_child_score,
+                        "confidence": verification.confidence,
+                        "description": verification.description,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        else:
+            self.database.add_event(
+                "verify-detail",
+                json.dumps(
+                    {
+                        "confidence": verification.confidence,
+                        "description": verification.description,
+                        "raw_text": verification.raw_text[:1000],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
 
     async def _verify_saved_clip(
         self,
@@ -923,21 +1084,13 @@ class Supervisor:
                         for fraction in (0.2, 0.5, 0.8)
                     }
                 )
-                verification_frames: list[SampledFrame] = []
-                for index, offset in enumerate(offsets, start=1):
-                    frame_path = Path(temp_dir) / f"verify-{index}.jpg"
-                    await _extract_frame(
-                        self.settings, clip_path, frame_path, offset
-                    )
-                    if frame_path.exists():
-                        verification_frames.append(
-                            SampledFrame(path=frame_path, offset_seconds=offset)
-                        )
-                if not verification_frames:
+                frames = await self._extract_verification_frames(
+                    self.settings, clip_path, offsets, temp_dir, prefix="verify"
+                )
+                if not frames:
                     return False
                 local_decision = await filter_frames_by_person_detection(
-                    self.settings,
-                    verification_frames,
+                    self.settings, frames
                 )
                 if not local_decision.frames:
                     self.database.add_event(
@@ -946,7 +1099,7 @@ class Supervisor:
                     )
                     return False
                 verification = await analyzer.verify_daughter_visible(
-                    [frame.path for frame in verification_frames]
+                    [frame.path for frame in frames]
                 )
                 verified = verification.visible and (
                     not verification.repaired or local_decision.child_confirmed
@@ -956,40 +1109,19 @@ class Supervisor:
                         "verify-consistency-repair",
                         "corrected has_daughter=false with local child evidence",
                     )
-                if (
-                    not verified
-                    and local_decision.child_confirmed
-                    and verification.confidence < 0.75
-                ):
-                    self.database.add_event(
-                        "verify-local-child-keep",
-                        json.dumps(
-                            {
-                                "child_score": local_decision.max_child_score,
-                                "confidence": verification.confidence,
-                                "description": verification.description,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
+                if not verified and self._dual_evidence_keep(local_decision, verification):
+                    self._log_verification_outcome(True, local_decision, verification)
                     return True
                 if not verified:
-                    self.database.add_event(
-                        "verify-detail",
-                        json.dumps(
-                            {
-                                "confidence": verification.confidence,
-                                "description": verification.description,
-                                "raw_text": verification.raw_text[:1000],
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
+                    self._log_verification_outcome(False, local_decision, verification)
                 return verified
         except Exception as exc:
             self.database.add_event("verify-error", str(exc))
-            # If verification itself fails, be conservative and keep the clip.
-            return True
+            if _is_timeout_error(exc):
+                raise
+            # Final-source verification is fail-closed: an unreadable or
+            # malformed clip must never become a published moment.
+            return False
 
     async def _verify_candidate(
         self,
@@ -1012,14 +1144,9 @@ class Supervisor:
         )
         try:
             with tempfile.TemporaryDirectory(prefix="nas-video-candidate-") as temp_dir:
-                frames: list[SampledFrame] = []
-                for index, offset in enumerate(offsets, start=1):
-                    frame_path = Path(temp_dir) / f"candidate-{index}.jpg"
-                    await _extract_frame(
-                        verification_settings, video_path, frame_path, offset
-                    )
-                    if frame_path.exists():
-                        frames.append(SampledFrame(frame_path, offset))
+                frames = await self._extract_verification_frames(
+                    verification_settings, video_path, offsets, temp_dir, prefix="candidate"
+                )
                 if not frames:
                     return False
                 local_decision = await filter_frames_by_person_detection(
@@ -1036,30 +1163,10 @@ class Supervisor:
                 )
                 if verification.visible:
                     return True
-                if local_decision.child_confirmed and verification.confidence < 0.75:
-                    self.database.add_event(
-                        "verify-local-child-keep",
-                        json.dumps(
-                            {
-                                "child_score": local_decision.max_child_score,
-                                "confidence": verification.confidence,
-                                "description": verification.description,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
+                if self._dual_evidence_keep(local_decision, verification):
+                    self._log_verification_outcome(True, local_decision, verification)
                     return True
-                self.database.add_event(
-                    "verify-detail",
-                    json.dumps(
-                        {
-                            "confidence": verification.confidence,
-                            "description": verification.description,
-                            "raw_text": verification.raw_text[:1000],
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
+                self._log_verification_outcome(False, local_decision, verification)
                 return False
         except Exception as exc:
             self.database.add_event("verify-error", str(exc))
@@ -1107,6 +1214,7 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "low_rtsp": bool(settings.rtsp_low_url),
             "high_rtsp": bool(settings.rtsp_high_url),
             "rtsp_credentials": bool(settings.rtsp_username or settings.rtsp_password),
+            "camera_time_offset_seconds": settings.camera_time_offset_seconds,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
             "analysis_image_mode": settings.analysis_image_mode,

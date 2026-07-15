@@ -6,6 +6,36 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
 
+DEFAULT_ANALYSIS_PROMPT = (
+    "Find short, precious everyday moments of my ~1.5-year-old daughter at home. "
+    "There are three family members: my daughter (a toddler girl), her mom "
+    "(a young adult woman, NOT the grandma), and her grandma (an older woman) - "
+    "distinct people, do not confuse mom with grandma. "
+    "KEEP a clip when my daughter is clearly visible AND something real is happening: "
+    "she is interacting with family (playing, talking, cuddling, reading, eating "
+    "together, being washed/dressed with engagement, reacting to someone) or doing "
+    "something on her own (playing with a toy, cruising/walking, babbling, exploring, "
+    "laughing, dancing, looking at a book). Warm family interaction IS a highlight - "
+    "high energy is NOT required. A calm but genuine moment with her is worth saving. "
+    "EXCLUDE only these truly low-value scenes: "
+    "an empty or static room with NO child visible (do not invent a child off-screen); "
+    "child sleeping or drowsy/being rocked to sleep (passive, no engagement); "
+    "child being fed with zero interaction (bottle propped, no eye contact/play); "
+    "child sitting totally blank, idle, staring at nothing; "
+    "child watching a screen (TV/iPad/phone) as passive consumption; "
+    "blurry or black/empty frames; "
+    "an adult doing chores while the child is merely present in the background and "
+    "NOT engaging with them. "
+    "If you cannot see my daughter clearly in a frame, that frame is keep=false. "
+    "Skip outdoor views and pets-only scenes. "
+    "When describing the scene, name people correctly: daughter, mom, or grandma. "
+    "Keep clips concise. Aim to capture a balanced, joyful record of her day - "
+    "around 10-20 good clips per day is the goal, so keep genuine interactions and "
+    "her own activities, and only drop the empty/low-value ones. "
+    "Return JSON only with keep, title, summary, tags, confidence, start_offset_seconds, and end_offset_seconds."
+)
+
+
 def _bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -85,6 +115,7 @@ class Settings:
     output_dir: Path
     database_path: Path
     camera_name: str
+    camera_time_offset_seconds: int
     rtsp_username: str
     rtsp_password: str
     rtsp_low_url: str
@@ -175,6 +206,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         output_dir=_path("NEXTCLOUD_OUTPUT_DIR", "./var/nextcloud_moments"),
         database_path=_path("DATABASE_PATH", "./var/app.sqlite3"),
         camera_name=os.getenv("CAMERA_NAME", "home-camera"),
+        camera_time_offset_seconds=_int("CAMERA_TIME_OFFSET_SECONDS", 0),
         rtsp_username=os.getenv("RTSP_USERNAME", ""),
         rtsp_password=os.getenv("RTSP_PASSWORD", ""),
         rtsp_low_url=os.getenv("RTSP_LOW_URL", ""),
@@ -226,37 +258,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         llama_circuit_breaker_failures=_int("LLAMA_CIRCUIT_BREAKER_FAILURES", 3),
         llama_circuit_breaker_seconds=_int("LLAMA_CIRCUIT_BREAKER_SECONDS", 300),
         verification_frame_width=_int("VERIFICATION_FRAME_WIDTH", 512),
-        analysis_prompt=os.getenv(
-            "ANALYSIS_PROMPT",
-            (
-                "Find short, precious everyday moments of my ~1.5-year-old daughter at home. "
-                "There are three family members: my daughter (a toddler girl), her mom "
-                "(a young adult woman, NOT the grandma), and her grandma (an older woman) - "
-                "distinct people, do not confuse mom with grandma. "
-                "KEEP a clip when my daughter is clearly visible AND something real is happening: "
-                "she is interacting with family (playing, talking, cuddling, reading, eating "
-                "together, being washed/dressed with engagement, reacting to someone) or doing "
-                "something on her own (playing with a toy, cruising/walking, babbling, exploring, "
-                "laughing, dancing, looking at a book). Warm family interaction IS a highlight - "
-                "high energy is NOT required. A calm but genuine moment with her is worth saving. "
-                "EXCLUDE only these truly low-value scenes: "
-                "an empty or static room with NO child visible (do not invent a child off-screen); "
-                "child sleeping or drowsy/being rocked to sleep (passive, no engagement); "
-                "child being fed with zero interaction (bottle propped, no eye contact/play); "
-                "child sitting totally blank, idle, staring at nothing; "
-                "child watching a screen (TV/iPad/phone) as passive consumption; "
-                "blurry or black/empty frames; "
-                "an adult doing chores while the child is merely present in the background and "
-                "NOT engaging with them. "
-                "If you cannot see my daughter clearly in a frame, that frame is keep=false. "
-                "Skip outdoor views and pets-only scenes. "
-                "When describing the scene, name people correctly: daughter, mom, or grandma. "
-                "Keep clips concise. Aim to capture a balanced, joyful record of her day - "
-                "around 10-20 good clips per day is the goal, so keep genuine interactions and "
-                "her own activities, and only drop the empty/low-value ones. "
-                "Return JSON only with keep, title, summary, tags, confidence, start_offset_seconds, and end_offset_seconds."
-            ),
-        ),
+        analysis_prompt=os.getenv("ANALYSIS_PROMPT", DEFAULT_ANALYSIS_PROMPT),
         person_filter_enabled=_bool("PERSON_FILTER_ENABLED", False),
         person_filter_backend=os.getenv("PERSON_FILTER_BACKEND", "yolov11n").strip().lower(),
         person_filter_model_url=os.getenv("PERSON_FILTER_MODEL_URL", "").strip(),

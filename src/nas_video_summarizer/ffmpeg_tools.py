@@ -368,30 +368,11 @@ async def sample_frames(
     *,
     duration_seconds: int,
 ) -> list[Path]:
+    """Backward-compatible path-only frame sampling helper."""
     frames = await sample_frames_with_offsets(
-        settings,
-        video_path,
-        output_dir,
-        duration_seconds=duration_seconds,
+        settings, video_path, output_dir, duration_seconds=duration_seconds
     )
     return [frame.path for frame in frames]
-
-
-async def build_contact_sheet_with_offsets(
-    settings: Settings,
-    video_path: Path,
-    output_dir: Path,
-    *,
-    duration_seconds: int,
-) -> ContactSheet:
-    frames_dir = output_dir / "frames"
-    sampled_frames = await sample_frames_with_offsets(
-        settings,
-        video_path,
-        frames_dir,
-        duration_seconds=duration_seconds,
-    )
-    return await build_contact_sheet_from_frames(settings, sampled_frames, output_dir)
 
 
 async def build_contact_sheet_from_frames(
@@ -439,6 +420,21 @@ async def build_contact_sheet_from_frames(
     return ContactSheet(path=sheet_path, frame_offsets_seconds=offsets)
 
 
+async def build_contact_sheet_with_offsets(
+    settings: Settings,
+    video_path: Path,
+    output_dir: Path,
+    *,
+    duration_seconds: int,
+) -> ContactSheet:
+    """Backward-compatible helper that samples then builds a contact sheet."""
+    frames_dir = output_dir / "frames"
+    sampled_frames = await sample_frames_with_offsets(
+        settings, video_path, frames_dir, duration_seconds=duration_seconds
+    )
+    return await build_contact_sheet_from_frames(settings, sampled_frames, output_dir)
+
+
 async def build_contact_sheet(
     settings: Settings,
     video_path: Path,
@@ -446,11 +442,9 @@ async def build_contact_sheet(
     *,
     duration_seconds: int,
 ) -> Path:
+    """Backward-compatible path-only contact sheet helper."""
     sheet = await build_contact_sheet_with_offsets(
-        settings,
-        video_path,
-        output_dir,
-        duration_seconds=duration_seconds,
+        settings, video_path, output_dir, duration_seconds=duration_seconds
     )
     return sheet.path
 

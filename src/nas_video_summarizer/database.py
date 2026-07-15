@@ -200,6 +200,7 @@ class Database:
         max_attempts: int,
         limit: int,
     ) -> list[dict[str, Any]]:
+        """Backward-compatible wrapper for callers that only analyze low stream."""
         return self.get_pending_segments(
             stream_role="low",
             ready_before=ready_before,
@@ -303,10 +304,7 @@ class Database:
             return int(row[0]) if row else 0
 
     def min_confidence_on_day(self, day: str) -> float:
-        """Lowest saved confidence among moments starting on ``day``.
-
-        Returns 1.0 when no moments exist yet, so a new clip always beats it.
-        """
+        """Return the weakest confidence, or 1.0 when the day is empty."""
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT MIN(confidence) FROM moments WHERE source_started_at LIKE ?",
