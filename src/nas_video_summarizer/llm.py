@@ -328,9 +328,10 @@ class LlamaAnalyzer:
                 },
                 {"role": "user", "content": user_content},
             ],
-            "temperature": 0.2,
             "response_format": {"type": "json_object"},
         }
+        if self.settings.llama_analysis_temperature is not None:
+            payload["temperature"] = self.settings.llama_analysis_temperature
 
         body = await asyncio.to_thread(
             _post_json,
@@ -400,9 +401,10 @@ class LlamaAnalyzer:
                 },
                 {"role": "user", "content": user_content},
             ],
-            "temperature": 0.1,
             "response_format": {"type": "json_object"},
         }
+        if self.settings.llama_verification_temperature is not None:
+            payload["temperature"] = self.settings.llama_verification_temperature
         body = await asyncio.to_thread(
             _post_json,
             endpoint,

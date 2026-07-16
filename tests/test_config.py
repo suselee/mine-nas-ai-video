@@ -1,7 +1,9 @@
 from nas_video_summarizer.config import load_env_file, load_settings, with_rtsp_credentials
 
 
-def test_load_settings_from_env_file(tmp_path):
+def test_load_settings_from_env_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLAMA_ANALYSIS_TEMPERATURE", raising=False)
+    monkeypatch.delenv("LLAMA_VERIFICATION_TEMPERATURE", raising=False)
     env_file = tmp_path / ".env"
     env_file.write_text(
         "\n".join(
@@ -17,6 +19,8 @@ def test_load_settings_from_env_file(tmp_path):
                 "ANALYSIS_FRAME_WIDTH=320",
                 "CONTACT_SHEET_COLUMNS=2",
                 "MAX_MOMENT_SECONDS=180",
+                "LLAMA_ANALYSIS_TEMPERATURE=0.7",
+                "LLAMA_VERIFICATION_TEMPERATURE=0.2",
             ]
         ),
         encoding="utf-8",
@@ -36,6 +40,8 @@ def test_load_settings_from_env_file(tmp_path):
     assert settings.analysis_frame_width == 320
     assert settings.contact_sheet_columns == 2
     assert settings.max_moment_seconds == 180
+    assert settings.llama_analysis_temperature == 0.7
+    assert settings.llama_verification_temperature == 0.2
     assert settings.analysis_stream_role == "low"
     assert settings.analysis_window_start == ""
     assert settings.analysis_window_end == ""
@@ -48,7 +54,9 @@ def test_load_settings_from_env_file(tmp_path):
     assert settings.stream_alignment_sample_count == 5
 
 
-def test_new_window_and_quota_defaults():
+def test_new_window_and_quota_defaults(monkeypatch):
+    monkeypatch.delenv("LLAMA_ANALYSIS_TEMPERATURE", raising=False)
+    monkeypatch.delenv("LLAMA_VERIFICATION_TEMPERATURE", raising=False)
     settings = load_settings("/nonexistent.env")
     assert settings.moment_keep_threshold == 0.5
     assert settings.max_moments_per_day == 0
@@ -60,6 +68,8 @@ def test_new_window_and_quota_defaults():
     assert settings.person_filter_face_threshold == 0.7
     assert settings.person_filter_adult_threshold == 0.9
     assert settings.person_filter_child_threshold == 0.6
+    assert settings.llama_analysis_temperature is None
+    assert settings.llama_verification_temperature is None
 
 
 def test_env_overrides_window_and_quota():

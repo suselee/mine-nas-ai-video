@@ -57,6 +57,13 @@ def _float(name: str, default: float) -> float:
     return float(value)
 
 
+def _optional_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
+
+
 def _path(name: str, default: str) -> Path:
     return Path(os.getenv(name, default)).expanduser()
 
@@ -164,6 +171,8 @@ class Settings:
     llama_api_key: str
     llama_model: str
     llama_timeout_seconds: int
+    llama_analysis_temperature: float | None
+    llama_verification_temperature: float | None
     llama_timeout_fallback: bool
     llama_circuit_breaker_failures: int
     llama_circuit_breaker_seconds: int
@@ -262,6 +271,12 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         llama_api_key=os.getenv("LLAMA_API_KEY", ""),
         llama_model=os.getenv("LLAMA_MODEL", "Qwen3-VL-2B-Instruct"),
         llama_timeout_seconds=_int("LLAMA_TIMEOUT_SECONDS", 180),
+        llama_analysis_temperature=_optional_float(
+            "LLAMA_ANALYSIS_TEMPERATURE"
+        ),
+        llama_verification_temperature=_optional_float(
+            "LLAMA_VERIFICATION_TEMPERATURE"
+        ),
         llama_timeout_fallback=_bool("LLAMA_TIMEOUT_FALLBACK", True),
         llama_circuit_breaker_failures=_int("LLAMA_CIRCUIT_BREAKER_FAILURES", 3),
         llama_circuit_breaker_seconds=_int("LLAMA_CIRCUIT_BREAKER_SECONDS", 300),

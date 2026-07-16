@@ -1300,6 +1300,8 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "stream_alignment_sample_count": settings.stream_alignment_sample_count,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
+            "llama_analysis_temperature": settings.llama_analysis_temperature,
+            "llama_verification_temperature": settings.llama_verification_temperature,
             "analysis_image_mode": settings.analysis_image_mode,
             "analysis_frame_width": settings.analysis_frame_width,
             "sample_frame_count": settings.sample_frame_count,
