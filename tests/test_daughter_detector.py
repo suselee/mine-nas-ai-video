@@ -65,6 +65,15 @@ def test_short_or_isolated_detection_is_rejected():
     assert detector.candidates([_observation(2)]) == []
 
 
+def test_detector_reset_clears_cached_heuristic_state():
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    detector._cached_child_score = 0.9
+    detector._cached_child_until = 10
+    detector.reset_segment()
+    assert detector._cached_child_score == 0.0
+    assert detector._cached_child_until == -1.0
+
+
 def test_archive_contract_contains_manifest_and_ready(tmp_path):
     settings = replace(load_settings("/nonexistent.env"), output_dir=tmp_path / "out")
     database = Database(tmp_path / "app.sqlite3")

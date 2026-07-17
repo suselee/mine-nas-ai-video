@@ -1012,6 +1012,7 @@ class Supervisor:
     ) -> list[ClipCandidate]:
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="nas-video-daughter-") as temp_dir:
+            detector.reset_segment()
             duration = int(segment["duration_seconds"])
             frames = await sample_frames_at_fps(
                 self.settings,
@@ -1535,6 +1536,7 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "daughter_detector_model_path": str(settings.daughter_detector_model_path or ""),
             "daughter_detector_input_size": settings.daughter_detector_input_size,
             "daughter_detector_threshold": settings.daughter_detector_threshold,
+            "daughter_age_check_every": settings.daughter_age_check_every,
             "daughter_scan_fps": settings.daughter_scan_fps,
             "daughter_event_min_hits": settings.daughter_event_min_hits,
             "daughter_event_max_gap_seconds": settings.daughter_event_max_gap_seconds,

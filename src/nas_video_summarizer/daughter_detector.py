@@ -37,6 +37,16 @@ class DaughterDetector:
         self._cv2 = None
         self._np = None
         self._person_filter: PersonFilter | None = None
+        self._heuristic_frame_index = 0
+        self._next_age_check = 0
+        self._cached_child_score = 0.0
+        self._cached_child_until = -1.0
+
+    def reset_segment(self) -> None:
+        self._heuristic_frame_index = 0
+        self._next_age_check = 0
+        self._cached_child_score = 0.0
+        self._cached_child_until = -1.0
 
     def prepare(self) -> str:
         if self.mode == "heuristic":
@@ -83,8 +93,27 @@ class DaughterDetector:
     def detect_path(self, frame: SampledFrame) -> DaughterObservation:
         encoded = self._encoded(frame.path)
         if self.mode == "heuristic":
-            info = self._get_person_filter().detect(encoded)
-            child_score = float(info.get("child_score", 0.0))
+            self._heuristic_frame_index += 1
+            check_age = self._heuristic_frame_index >= self._next_age_check
+            if check_age:
+                self._next_age_check = (
+                    self._heuristic_frame_index
+                    + max(1, self.settings.daughter_age_check_every)
+                )
+            info = self._get_person_filter().detect(encoded, classify_age=check_age)
+            detected_child_score = float(info.get("child_score", 0.0))
+            if detected_child_score >= self.settings.person_filter_child_threshold:
+                self._cached_child_score = detected_child_score
+                self._cached_child_until = (
+                    frame.offset_seconds + self.settings.daughter_event_max_gap_seconds
+                )
+            child_score = (
+                detected_child_score
+                if check_age
+                else self._cached_child_score
+                if frame.offset_seconds <= self._cached_child_until
+                else 0.0
+            )
             boxes = list(info.get("person_boxes", []))
             if child_score < self.settings.person_filter_child_threshold or not boxes:
                 return DaughterObservation(frame.offset_seconds, 0.0, [], len(boxes))
@@ -99,7 +128,7 @@ class DaughterDetector:
         if score < self.settings.daughter_detector_threshold:
             return DaughterObservation(frame.offset_seconds, 0.0, [], 0)
         # Only daughter-positive frames pay the secondary generic-person cost.
-        context = self._get_person_filter().detect(encoded)
+        context = self._get_person_filter().detect(encoded, classify_age=False)
         return DaughterObservation(
             frame.offset_seconds,
             score,

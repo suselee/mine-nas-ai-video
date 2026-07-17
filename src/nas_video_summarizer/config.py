@@ -197,6 +197,7 @@ class Settings:
     daughter_detector_model_path: Path | None
     daughter_detector_input_size: int
     daughter_detector_threshold: float
+    daughter_age_check_every: int
     daughter_scan_fps: float
     daughter_event_min_hits: int
     daughter_event_max_gap_seconds: float
@@ -316,6 +317,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         daughter_detector_model_path=_optional_path("DAUGHTER_DETECTOR_MODEL_PATH"),
         daughter_detector_input_size=_int("DAUGHTER_DETECTOR_INPUT_SIZE", 416),
         daughter_detector_threshold=_float("DAUGHTER_DETECTOR_THRESHOLD", 0.45),
+        daughter_age_check_every=_int("DAUGHTER_AGE_CHECK_EVERY", 3),
         daughter_scan_fps=_float("DAUGHTER_SCAN_FPS", 0.5),
         daughter_event_min_hits=_int("DAUGHTER_EVENT_MIN_HITS", 2),
         daughter_event_max_gap_seconds=_float(

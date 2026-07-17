@@ -210,7 +210,9 @@ class PersonFilter:
             net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
             net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
-    def detect(self, image_b64: str) -> dict[str, object]:
+    def detect(
+        self, image_b64: str, *, classify_age: bool = True
+    ) -> dict[str, object]:
         self._init_net()
 
         img_bytes = base64.b64decode(image_b64)
@@ -233,7 +235,10 @@ class PersonFilter:
             result = self._detect_yolo(img)
         else:
             result = self._detect_mobilenet(img)
-        result.update(self._classify_ages(img, result["person_boxes"]))
+        if classify_age:
+            result.update(self._classify_ages(img, result["person_boxes"]))
+        else:
+            result.update(self._age_result())
         return result
 
     def _detect_mobilenet(self, img) -> dict[str, object]:
