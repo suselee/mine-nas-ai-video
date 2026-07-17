@@ -13,8 +13,11 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from .analysis import ClipCandidate
+from .archive import rebuild_day_archive
 from .config import Settings
 from .database import Database, utc_now_iso
+from .daughter_detector import DaughterDetector
 from .ffmpeg_tools import (
     PersonFilterDecision,
     SampledFrame,
@@ -28,6 +31,7 @@ from .ffmpeg_tools import (
     filter_out_blank_frames,
     parse_segment_filename,
     sample_frames_with_offsets,
+    sample_frames_at_fps,
     segment_time_window,
 )
 from .llm import AnalysisResult, DaughterVerification, LlamaAnalyzer
@@ -125,6 +129,19 @@ def _moment_period(
             )
             return label, start, end
     return None
+
+
+def _parse_category_targets(value: str) -> dict[str, int]:
+    targets: dict[str, int] = {}
+    for item in value.split(","):
+        if ":" not in item:
+            continue
+        name, count = item.split(":", 1)
+        try:
+            targets[name.strip()] = max(0, int(count.strip()))
+        except ValueError:
+            continue
+    return targets
 
 
 def _parse_iso(value: str) -> datetime:
@@ -271,7 +288,6 @@ class Supervisor:
         self.database = database
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
-        self._last_moment_saved_at: datetime | None = None
         self._llama_timeout_count = 0
         self._llama_circuit_open_until: datetime | None = None
         self.state: dict[str, Any] = {
@@ -285,6 +301,7 @@ class Supervisor:
             "stream_alignment": {"status": "unknown"},
             "analyzer": {"status": "not-started"},
             "cleanup": {"status": "not-started"},
+            "day_archive": {"status": "not-started"},
         }
 
     async def start(self) -> None:
@@ -295,6 +312,7 @@ class Supervisor:
         self.tasks.append(asyncio.create_task(self._scan_loop(), name="segment-scanner"))
         self.tasks.append(asyncio.create_task(self._cleanup_loop(), name="buffer-cleanup"))
         self.tasks.append(asyncio.create_task(self._analyzer_loop(), name="segment-analyzer"))
+        self.tasks.append(asyncio.create_task(self._day_archive_loop(), name="day-archive"))
 
         low_rtsp_url = self.settings.rtsp_low_url_for_ffmpeg
         high_rtsp_url = self.settings.rtsp_high_url_for_ffmpeg
@@ -488,12 +506,21 @@ class Supervisor:
         self.database.upsert_segments(segments)
         return len(segments)
 
-    def _moment_cooldown_active(self) -> bool:
+    def _moment_cooldown_active(
+        self, segment: dict[str, Any] | None = None, result: ClipCandidate | None = None
+    ) -> bool:
         if self.settings.moment_cooldown_seconds <= 0:
             return False
-        if self._last_moment_saved_at is None:
+        if segment is None or result is None or not hasattr(self.database, "nearest_moment_before"):
             return False
-        return (_now() - self._last_moment_saved_at).total_seconds() < self.settings.moment_cooldown_seconds
+        candidate = _parse_iso(segment["started_at"]) + timedelta(
+            seconds=result.start_offset_seconds + self.settings.camera_time_offset_seconds
+        )
+        previous = self.database.nearest_moment_before(candidate.isoformat(timespec="seconds"))
+        if not previous or not previous.get("clip_started_at"):
+            return False
+        gap = (candidate - _parse_iso(str(previous["clip_started_at"]))).total_seconds()
+        return 0 <= gap < self.settings.moment_cooldown_seconds
 
     def _display_started_at(self, segment: dict[str, Any]) -> datetime | None:
         value = str(segment.get("started_at", ""))
@@ -519,7 +546,7 @@ class Supervisor:
         weakest = self.database.weakest_moment_on_day(day)
         if weakest is None:
             return CapDecision("ok", "daily")
-        if result.confidence > float(weakest["confidence"]):
+        if result.effective_selection_score > float(weakest.get("selection_score", weakest["confidence"])):
             return CapDecision("evict", "daily", weakest)
         return CapDecision("blocked", "daily")
 
@@ -549,7 +576,28 @@ class Supervisor:
         weakest = self.database.weakest_moment_between(start_iso, end_iso)
         if weakest is None:
             return CapDecision("ok", label)
-        if result.confidence > float(weakest["confidence"]):
+        if result.analysis_backend == "daughter_detector" and hasattr(
+            self.database, "moments_between"
+        ):
+            target_map = _parse_category_targets(self.settings.moment_category_targets)
+            target = target_map.get(result.category, 0)
+            existing = self.database.moments_between(start_iso, end_iso)
+            category_counts = {
+                category: sum(item.get("category") == category for item in existing)
+                for category in target_map
+            }
+            if target > 0 and category_counts.get(result.category, 0) < target:
+                overrepresented = [
+                    item for item in existing
+                    if category_counts.get(str(item.get("category")), 0)
+                    > target_map.get(str(item.get("category")), 0)
+                ]
+                if overrepresented:
+                    return CapDecision(
+                        "evict", label,
+                        min(overrepresented, key=lambda item: float(item.get("selection_score", item["confidence"])))
+                    )
+        if result.effective_selection_score > float(weakest.get("selection_score", weakest["confidence"])):
             return CapDecision("evict", label, weakest)
         return CapDecision("blocked", label)
 
@@ -564,10 +612,13 @@ class Supervisor:
             path = Path(str(moment[key]))
             path.unlink(missing_ok=True)
         self.database.delete_moment_by_clip(str(moment["clip_path"]))
+        day = Path(str(moment["clip_path"])).parent.name
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            rebuild_day_archive(self.settings, self.database, day)
         self.database.add_event(
             event_type,
             f"replaced weakest {scope} moment '{moment['title']}' "
-            f"(confidence {float(moment['confidence']):.2f})",
+            f"(score {float(moment.get('selection_score', moment['confidence'])):.2f})",
         )
 
     def _apply_moment_caps(
@@ -580,7 +631,7 @@ class Supervisor:
         This prevents a false positive or ffmpeg failure from deleting an old
         good moment.
         """
-        if self._moment_cooldown_active():
+        if self._moment_cooldown_active(segment, result):
             return CapPlan(
                 skip=MomentSkip(
                     "moment-cooldown", f"skipped '{result.title}' due to cooldown"
@@ -642,18 +693,20 @@ class Supervisor:
         weakest = self.database.weakest_moment_on_day(day)
         if weakest is None:
             return CapDecision("ok", "daily")
-        if result.confidence > float(weakest["confidence"]):
+        if result.effective_selection_score > float(weakest.get("selection_score", weakest["confidence"])):
             return CapDecision("evict", "daily", weakest)
         return CapDecision("blocked", "daily")
 
     async def _analyzer_loop(self) -> None:
-        analyzer = LlamaAnalyzer(self.settings)
+        backend = self.settings.analysis_backend
+        analyzer = LlamaAnalyzer(self.settings) if backend == "vlm" else None
+        detector = DaughterDetector(self.settings) if backend == "daughter_detector" else None
         while not self.stop_event.is_set():
             if not self.settings.analysis_enabled:
                 self.state["analyzer"] = {"status": "disabled", "reason": "ANALYSIS_ENABLED=false"}
                 await asyncio.sleep(self.settings.analysis_interval_seconds)
                 continue
-            if not _in_analysis_window(
+            if backend != "daughter_detector" and not _in_analysis_window(
                 _now(),
                 self.settings.analysis_window_start,
                 self.settings.analysis_window_end,
@@ -674,7 +727,7 @@ class Supervisor:
                 }
                 await asyncio.sleep(self.settings.analysis_interval_seconds)
                 continue
-            if (
+            if backend == "vlm" and (
                 self._llama_circuit_open_until is not None
                 and _now() < self._llama_circuit_open_until
             ):
@@ -705,64 +758,96 @@ class Supervisor:
                 continue
 
             segment = segments[0]
+            if backend == "daughter_detector" and not _in_analysis_window(
+                _parse_iso(segment["started_at"]),
+                self.settings.analysis_window_start,
+                self.settings.analysis_window_end,
+            ):
+                self.database.add_event(
+                    "analysis-window-skip",
+                    f"detector skipped segment outside source-time window: {segment['path']}",
+                )
+                self.database.mark_segment_processed(int(segment["id"]))
+                continue
             self.state["analyzer"] = {
                 "status": "analyzing",
                 "segment": segment["path"],
                 "updated_at": utc_now_iso(),
             }
             try:
-                result = await self._analyze_segment(analyzer, segment)
+                if backend == "vlm":
+                    assert analyzer is not None
+                    results = [await self._analyze_segment(analyzer, segment)]
+                elif backend == "daughter_detector":
+                    assert detector is not None
+                    results = await self._analyze_daughter_segment(detector, segment)
+                else:
+                    raise ValueError(f"unsupported ANALYSIS_BACKEND: {backend}")
                 self._llama_timeout_count = 0
                 self._llama_circuit_open_until = None
-                should_save = result.should_save(self.settings.moment_keep_threshold)
-                if result.keep_consistency_repaired(
-                    self.settings.moment_keep_threshold
-                ):
-                    self.database.add_event(
-                        "keep-consistency-repair",
-                        "corrected keep=false with local child evidence "
-                        f"({result.local_child_score:.2f}): {result.title}",
+                saved_any = False
+                for result in results:
+                    keep_threshold = (
+                        self.settings.daughter_detector_threshold
+                        if result.analysis_backend == "daughter_detector"
+                        else self.settings.moment_keep_threshold
                     )
-                if should_save:
-                    cap_plan = self._apply_moment_caps(segment, result)
-                    if cap_plan.skip is not None:
+                    should_save = result.should_save(keep_threshold)
+                    if result.keep_consistency_repaired(
+                        self.settings.moment_keep_threshold
+                    ):
                         self.database.add_event(
-                            cap_plan.skip.event_type, cap_plan.skip.message
+                            "keep-consistency-repair",
+                            "corrected keep=false with local child evidence "
+                            f"({result.local_child_score:.2f}): {result.title}",
                         )
-                    else:
-                        moment_id = await self._save_moment(
-                            segment, result, analyzer
-                        )
-                        if moment_id >= 0:
-                            for moment, event_type, scope in cap_plan.evictions:
-                                self._evict_moment(
-                                    moment, event_type=event_type, scope=scope
-                                )
+                    if should_save:
+                        cap_plan = self._apply_moment_caps(segment, result)
+                        if cap_plan.skip is not None:
                             self.database.add_event(
-                                "moment",
-                                f"saved moment {moment_id}: {result.title}",
+                                cap_plan.skip.event_type, cap_plan.skip.message
                             )
-                if not should_save:
+                        else:
+                            moment_id = await self._save_moment(
+                                segment, result, analyzer=analyzer, detector=detector
+                            )
+                            if moment_id >= 0:
+                                saved_any = True
+                                for moment, event_type, scope in cap_plan.evictions:
+                                    self._evict_moment(
+                                        moment, event_type=event_type, scope=scope
+                                    )
+                                self.database.add_event(
+                                    "moment",
+                                    f"saved moment {moment_id}: {result.title}",
+                                )
+                    if not should_save:
+                        self.database.add_event(
+                            "analysis-skip",
+                            json.dumps(
+                                {
+                                    "backend": result.analysis_backend,
+                                    "keep": result.keep,
+                                    "confidence": result.confidence,
+                                    "title": result.title,
+                                    "tags": result.tags,
+                                    "start_offset": result.start_offset_seconds,
+                                    "end_offset": result.end_offset_seconds,
+                                    "raw_text": result.raw_text[:1000],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                if not results and backend == "daughter_detector":
                     self.database.add_event(
-                        "analysis-skip",
-                        json.dumps(
-                            {
-                                "keep": result.keep,
-                                "confidence": result.confidence,
-                                "title": result.title,
-                                "tags": result.tags,
-                                "start_offset": result.start_offset_seconds,
-                                "end_offset": result.end_offset_seconds,
-                                "raw_text": result.raw_text[:1000],
-                            },
-                            ensure_ascii=False,
-                        ),
+                        "daughter-detector-skip", "no qualifying daughter event"
                     )
                 self.database.mark_segment_processed(int(segment["id"]))
                 self.state["analyzer"] = {
                     "status": "ok",
                     "last_segment": segment["path"],
-                    "last_keep": should_save,
+                    "last_keep": saved_any,
+                    "backend": backend,
                     "updated_at": utc_now_iso(),
                 }
             except PersonFilterSkip:
@@ -776,7 +861,7 @@ class Supervisor:
                     await asyncio.sleep(self.settings.analysis_cooldown_seconds)
                 continue
             except Exception as exc:
-                if _is_timeout_error(exc):
+                if backend == "vlm" and _is_timeout_error(exc):
                     self._llama_timeout_count += 1
                     if (
                         self.settings.llama_circuit_breaker_failures > 0
@@ -791,7 +876,7 @@ class Supervisor:
                             f"paused analysis for {self.settings.llama_circuit_breaker_seconds}s "
                             f"after {self._llama_timeout_count} consecutive timeouts",
                         )
-                else:
+                elif backend == "vlm":
                     self._llama_timeout_count = 0
                 attempt = int(segment["analysis_attempts"]) + 1
                 final = attempt >= self.settings.analysis_max_attempts
@@ -922,6 +1007,36 @@ class Supervisor:
                 local_child_score=decision.max_child_score,
             )
 
+    async def _analyze_daughter_segment(
+        self, detector: DaughterDetector, segment: dict[str, Any]
+    ) -> list[ClipCandidate]:
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="nas-video-daughter-") as temp_dir:
+            duration = int(segment["duration_seconds"])
+            frames = await sample_frames_at_fps(
+                self.settings,
+                Path(segment["path"]),
+                Path(temp_dir) / "frames",
+                duration_seconds=duration,
+                fps=self.settings.daughter_scan_fps,
+                width=self.settings.daughter_detector_input_size,
+            )
+            observations = []
+            for frame in frames:
+                observations.append(await asyncio.to_thread(detector.detect_path, frame))
+            candidates = detector.candidates(observations)
+        elapsed = time.monotonic() - started
+        self.state["prefilter"] = {
+            "status": "daughter-detector",
+            "mode": detector.mode,
+            "elapsed_seconds": round(elapsed, 3),
+            "realtime_ratio": round(elapsed / max(1, duration), 3),
+            "input_frame_count": len(frames),
+            "candidate_count": len(candidates),
+            "updated_at": utc_now_iso(),
+        }
+        return candidates
+
     def _record_prefilter(
         self,
         started_at: float,
@@ -940,8 +1055,9 @@ class Supervisor:
     async def _save_moment(
         self,
         segment: dict[str, Any],
-        result: AnalysisResult,
-        analyzer: LlamaAnalyzer,
+        result: ClipCandidate,
+        analyzer: LlamaAnalyzer | None,
+        detector: DaughterDetector | None = None,
     ) -> int:
         source_started = _parse_iso(segment["started_at"])
         source_ended = _parse_iso(segment["ended_at"])
@@ -1004,12 +1120,15 @@ class Supervisor:
 
         # Confirm the candidate on the analysis stream before doing expensive 4K
         # extraction. Three higher-resolution frames refine the positive decision.
-        verified = await self._verify_candidate(
-            analyzer,
-            Path(segment["path"]),
-            result.start_offset_seconds,
-            result.end_offset_seconds,
-        )
+        verified = True
+        if result.analysis_backend == "vlm":
+            assert analyzer is not None
+            verified = await self._verify_candidate(
+                analyzer,
+                Path(segment["path"]),
+                result.start_offset_seconds,
+                result.end_offset_seconds,
+            )
         if not verified:
             self.database.add_event(
                 "moment-verify-failed",
@@ -1029,9 +1148,16 @@ class Supervisor:
                 start_offset_seconds=start_offset_seconds,
                 duration_seconds=duration_seconds,
             )
-            verified_final = await self._verify_saved_clip(
-                analyzer, staged_clip_path, duration_seconds
-            )
+            if result.analysis_backend == "daughter_detector":
+                assert detector is not None
+                verified_final = await self._verify_detector_saved_clip(
+                    detector, staged_clip_path, duration_seconds
+                )
+            else:
+                assert analyzer is not None
+                verified_final = await self._verify_saved_clip(
+                    analyzer, staged_clip_path, duration_seconds
+                )
             if not verified_final:
                 self.database.add_event(
                     "moment-verify-failed",
@@ -1042,11 +1168,16 @@ class Supervisor:
             os.replace(staged_clip_path, clip_path)
 
         metadata = {
+            "schema_version": 2,
+            "owner": "nas",
             "camera_name": segment["camera_name"],
+            "analysis_backend": result.analysis_backend,
+            "category": result.category,
             "title": result.title,
             "summary": result.summary,
             "tags": result.tags,
             "confidence": result.confidence,
+            "selection_score": result.effective_selection_score,
             "keep_consistency_repaired": result.keep_consistency_repaired(
                 self.settings.moment_keep_threshold
             ),
@@ -1063,20 +1194,9 @@ class Supervisor:
             "source_paths": [str(path) for path in source_paths],
             "model_raw": result.raw,
         }
-        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
-        daily_summary_path = _append_daily_summary(
-            day_dir=day_dir,
-            clip_path=clip_path,
-            result=result,
-            clip_start=display_clip_start,
-            clip_end=display_clip_end,
-        )
-        metadata["daily_summary_path"] = str(daily_summary_path)
-        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        self._last_moment_saved_at = _now()
-
-        return self.database.create_moment(
+        moment_id = self.database.create_moment(
             camera_name=segment["camera_name"],
             title=result.title,
             summary=result.summary,
@@ -1087,7 +1207,44 @@ class Supervisor:
             source_ended_at=display_source_ended.isoformat(timespec="seconds"),
             clip_path=clip_path,
             metadata_path=metadata_path,
+            analysis_backend=result.analysis_backend,
+            category=result.category,
+            selection_score=result.effective_selection_score,
+            clip_started_at=display_clip_start.isoformat(timespec="seconds"),
+            clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
         )
+        metadata["event_id"] = moment_id
+        metadata["daily_summary_path"] = str(day_dir / "summary.md")
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        rebuild_day_archive(
+            self.settings, self.database, display_clip_start.strftime("%Y-%m-%d")
+        )
+        return moment_id
+
+    async def _verify_detector_saved_clip(
+        self, detector: DaughterDetector, clip_path: Path, duration_seconds: float
+    ) -> bool:
+        offsets = [
+            max(0.0, min(duration_seconds - 0.1, duration_seconds * fraction))
+            for fraction in (0.1, 0.3, 0.5, 0.7, 0.9)
+        ]
+        try:
+            with tempfile.TemporaryDirectory(prefix="nas-video-detector-verify-") as temp_dir:
+                frames = await self._extract_verification_frames(
+                    replace(self.settings, analysis_frame_width=self.settings.daughter_detector_input_size),
+                    clip_path,
+                    offsets,
+                    temp_dir,
+                    prefix="daughter",
+                )
+                return await asyncio.to_thread(
+                    detector.verify_paths, [frame.path for frame in frames]
+                )
+        except Exception as exc:
+            self.database.add_event("detector-verify-error", str(exc))
+            return False
 
     async def _extract_verification_frames(
         self,
@@ -1275,6 +1432,81 @@ class Supervisor:
                 self._safe_add_event("cleanup-error", str(exc))
             await asyncio.sleep(300)
 
+    async def _day_archive_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                finalized = self._finalize_ready_days()
+                self.state["day_archive"] = {
+                    "status": "ok",
+                    "finalized": finalized,
+                    "updated_at": utc_now_iso(),
+                }
+            except Exception as exc:
+                self.state["day_archive"] = {
+                    "status": "error",
+                    "message": str(exc),
+                    "updated_at": utc_now_iso(),
+                }
+                self._safe_add_event("day-archive-error", str(exc))
+            await asyncio.sleep(60)
+
+    def _finalize_ready_days(self) -> list[str]:
+        now = _now()
+        candidates = {
+            path.name for path in self.settings.output_dir.glob("????-??-??")
+            if path.is_dir()
+        }
+        candidates.add(now.strftime("%Y-%m-%d"))
+        finalized: list[str] = []
+        for day in sorted(candidates):
+            try:
+                start = datetime.fromisoformat(f"{day}T00:00:00").astimezone()
+            except ValueError:
+                continue
+            end = start + timedelta(days=1)
+            if start.date() > now.date():
+                continue
+            if start.date() == now.date() and not self._current_day_ready(now):
+                continue
+            pending, errors, total = self.database.segment_status_between(
+                stream_role=self.settings.analysis_stream_role,
+                start_iso=start.isoformat(timespec="seconds"),
+                end_iso=end.isoformat(timespec="seconds"),
+            )
+            if total == 0 or pending > 0:
+                continue
+            day_dir = self.settings.output_dir / day
+            ready_path = day_dir / "_READY.json"
+            manifest_path = day_dir / "manifest.json"
+            if ready_path.exists() and manifest_path.exists():
+                try:
+                    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if ready.get("manifest_revision") == manifest.get("revision"):
+                        continue
+                except (OSError, json.JSONDecodeError):
+                    pass
+            rebuild_day_archive(
+                self.settings, self.database, day, ready=True, error_count=errors
+            )
+            finalized.append(day)
+        return finalized
+
+    def _current_day_ready(self, now: datetime) -> bool:
+        if not self.settings.record_window_end:
+            return False
+        try:
+            hour, minute = (int(value) for value in self.settings.record_window_end.split(":", 1))
+        except (TypeError, ValueError):
+            return False
+        cutoff = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        cutoff += timedelta(
+            seconds=self.settings.analysis_delay_seconds
+            + self.settings.segment_stable_seconds
+            + self.settings.day_ready_grace_seconds
+        )
+        return now >= cutoff
+
     def _cleanup_once(self, cutoff_iso: str) -> int:
         deleted = 0
         for segment in self.database.expired_segments(cutoff_iso):
@@ -1298,6 +1530,16 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "segment_at_clocktime": settings.segment_at_clocktime,
             "stream_alignment_tolerance_seconds": settings.stream_alignment_tolerance_seconds,
             "stream_alignment_sample_count": settings.stream_alignment_sample_count,
+            "analysis_backend": settings.analysis_backend,
+            "daughter_detector_mode": settings.daughter_detector_mode,
+            "daughter_detector_model_path": str(settings.daughter_detector_model_path or ""),
+            "daughter_detector_input_size": settings.daughter_detector_input_size,
+            "daughter_detector_threshold": settings.daughter_detector_threshold,
+            "daughter_scan_fps": settings.daughter_scan_fps,
+            "daughter_event_min_hits": settings.daughter_event_min_hits,
+            "daughter_event_max_gap_seconds": settings.daughter_event_max_gap_seconds,
+            "daughter_event_min_seconds": settings.daughter_event_min_seconds,
+            "moment_category_targets": settings.moment_category_targets,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
             "llama_analysis_temperature": settings.llama_analysis_temperature,

@@ -1,5 +1,13 @@
 # Mine NAS AI Video Architecture
 
+> The diagram below documents the legacy `ANALYSIS_BACKEND=vlm` path. With
+> `ANALYSIS_BACKEND=daughter_detector`, the main/candidate/final VLM stages are
+> replaced by dense local OpenCV detection, temporal event grouping, and local
+> final verification. Both backends share high-stream extraction, SQLite
+> moments, quotas, and the Nextcloud archive. See
+> [daughter-detector.md](daughter-detector.md) for the detector and desktop
+> handoff contract.
+
 下面这张图对应当前 `main` 分支的实现。箭头表示数据流，虚线表示控制、状态或查询。
 
 ```mermaid

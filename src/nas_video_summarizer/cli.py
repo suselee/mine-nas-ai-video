@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .config import Settings, ensure_directories, load_settings
 from .database import Database
+from .daughter_detector import DaughterDetector
 from .person_filter import PersonFilter
 
 
@@ -86,9 +87,28 @@ def _person_filter_check(settings: Settings) -> Check:
         )
 
 
+def _daughter_detector_check(settings: Settings) -> Check:
+    if settings.analysis_backend != "daughter_detector":
+        return Check("daughter detector", True, "inactive", required=False)
+    try:
+        detail = DaughterDetector(settings).prepare()
+        return Check(
+            "daughter detector",
+            True,
+            f"{settings.daughter_detector_mode}: {detail}",
+        )
+    except Exception as exc:
+        return Check("daughter detector", False, str(exc))
+
+
 def build_checks(settings: Settings) -> list[Check]:
     credentials_ok, credentials_detail = _rtsp_credentials_check(settings)
     return [
+        Check(
+            "analysis backend",
+            settings.analysis_backend in {"vlm", "daughter_detector"},
+            settings.analysis_backend,
+        ),
         Check(
             "ffmpeg",
             shutil.which(settings.ffmpeg_bin) is not None,
@@ -123,8 +143,9 @@ def build_checks(settings: Settings) -> list[Check]:
         ),
         Check(
             "llama.cpp endpoint",
-            bool(settings.llama_base_url),
-            settings.llama_base_url or "LLAMA_BASE_URL is empty",
+            settings.analysis_backend != "vlm" or bool(settings.llama_base_url),
+            "inactive" if settings.analysis_backend != "vlm" else settings.llama_base_url or "LLAMA_BASE_URL is empty",
+            required=settings.analysis_backend == "vlm",
         ),
         Check(
             "output directory",
@@ -142,6 +163,7 @@ def build_checks(settings: Settings) -> list[Check]:
             str(settings.database_path.parent),
         ),
         _person_filter_check(settings),
+        _daughter_detector_check(settings),
     ]
 
 
@@ -153,7 +175,12 @@ def check_main() -> None:
     checks = build_checks(settings)
     print("NAS Video preflight")
     print(f"camera: {settings.camera_name}")
-    print(f"model: {settings.llama_model}")
+    print(f"analysis backend: {settings.analysis_backend}")
+    print(
+        f"model: {settings.llama_model}"
+        if settings.analysis_backend == "vlm"
+        else f"detector: {settings.daughter_detector_mode}"
+    )
     print(
         "analysis: "
         f"{settings.analysis_image_mode}, "

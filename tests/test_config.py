@@ -70,6 +70,11 @@ def test_new_window_and_quota_defaults(monkeypatch):
     assert settings.person_filter_child_threshold == 0.6
     assert settings.llama_analysis_temperature is None
     assert settings.llama_verification_temperature is None
+    assert settings.analysis_backend == "vlm"
+    assert settings.daughter_detector_mode == "heuristic"
+    assert settings.daughter_scan_fps == 0.5
+    assert settings.daughter_event_min_hits == 2
+    assert settings.moment_category_targets == "active:3,multi_person:3,quiet:2"
 
 
 def test_env_overrides_window_and_quota():

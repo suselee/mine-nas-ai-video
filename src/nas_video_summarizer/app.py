@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .archive import rebuild_day_archive
 from .config import Settings, ensure_directories, load_settings
 from .database import Database
 from .workers import Supervisor, health_snapshot
@@ -218,6 +219,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         for key in ("clip_path", "metadata_path"):
             Path(moment[key]).unlink(missing_ok=True)
         self.state.database.delete_moment_record(moment_id)
+        day = Path(moment["clip_path"]).parent.name
+        rebuild_day_archive(self.state.settings, self.state.database, day)
         self._send_json({"deleted": True})
 
     def _send_json(

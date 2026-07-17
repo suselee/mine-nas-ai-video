@@ -68,6 +68,11 @@ def _path(name: str, default: str) -> Path:
     return Path(os.getenv(name, default)).expanduser()
 
 
+def _optional_path(name: str) -> Path | None:
+    value = os.getenv(name, "").strip()
+    return Path(value).expanduser() if value else None
+
+
 def _parse_env_value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -138,6 +143,7 @@ class Settings:
     stream_alignment_sample_count: int
     retention_hours: int
     analysis_enabled: bool
+    analysis_backend: str
     analysis_delay_seconds: int
     analysis_interval_seconds: int
     analysis_max_attempts: int
@@ -187,6 +193,16 @@ class Settings:
     person_filter_adult_threshold: float
     person_filter_child_threshold: float
     person_filter_sample_count: int
+    daughter_detector_mode: str
+    daughter_detector_model_path: Path | None
+    daughter_detector_input_size: int
+    daughter_detector_threshold: float
+    daughter_scan_fps: float
+    daughter_event_min_hits: int
+    daughter_event_max_gap_seconds: float
+    daughter_event_min_seconds: float
+    moment_category_targets: str
+    day_ready_grace_seconds: int
 
     @property
     def low_buffer_dir(self) -> Path:
@@ -236,6 +252,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         stream_alignment_sample_count=_int("STREAM_ALIGNMENT_SAMPLE_COUNT", 5),
         retention_hours=_int("RETENTION_HOURS", 168),
         analysis_enabled=_bool("ANALYSIS_ENABLED", True),
+        analysis_backend=os.getenv("ANALYSIS_BACKEND", "vlm").strip().lower(),
         analysis_delay_seconds=_int("ANALYSIS_DELAY_SECONDS", 300),
         analysis_interval_seconds=_int("ANALYSIS_INTERVAL_SECONDS", 15),
         analysis_max_attempts=_int("ANALYSIS_MAX_ATTEMPTS", 3),
@@ -293,6 +310,22 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         person_filter_adult_threshold=_float("PERSON_FILTER_ADULT_THRESHOLD", 0.9),
         person_filter_child_threshold=_float("PERSON_FILTER_CHILD_THRESHOLD", 0.6),
         person_filter_sample_count=_int("PERSON_FILTER_SAMPLE_COUNT", 12),
+        daughter_detector_mode=os.getenv(
+            "DAUGHTER_DETECTOR_MODE", "heuristic"
+        ).strip().lower(),
+        daughter_detector_model_path=_optional_path("DAUGHTER_DETECTOR_MODEL_PATH"),
+        daughter_detector_input_size=_int("DAUGHTER_DETECTOR_INPUT_SIZE", 416),
+        daughter_detector_threshold=_float("DAUGHTER_DETECTOR_THRESHOLD", 0.45),
+        daughter_scan_fps=_float("DAUGHTER_SCAN_FPS", 0.5),
+        daughter_event_min_hits=_int("DAUGHTER_EVENT_MIN_HITS", 2),
+        daughter_event_max_gap_seconds=_float(
+            "DAUGHTER_EVENT_MAX_GAP_SECONDS", 6.0
+        ),
+        daughter_event_min_seconds=_float("DAUGHTER_EVENT_MIN_SECONDS", 4.0),
+        moment_category_targets=os.getenv(
+            "MOMENT_CATEGORY_TARGETS", "active:3,multi_person:3,quiet:2"
+        ).strip(),
+        day_ready_grace_seconds=_int("DAY_READY_GRACE_SECONDS", 120),
     )
 
 

@@ -117,7 +117,7 @@ function renderMoments(moments) {
     momentsContainer.innerHTML = `
       <div class="empty-state">
         <h3>No saved moments yet</h3>
-        <p>After RTSP and llama.cpp are configured, selected clips will appear here automatically.</p>
+        <p>After RTSP and an analysis backend are configured, selected clips will appear here automatically.</p>
       </div>
     `;
     return;
@@ -141,6 +141,7 @@ function renderMoments(moments) {
             <div class="moment-meta">
               <span>${escapeHtml(formatDate(moment.source_started_at))}</span>
               <span>${escapeHtml(moment.camera_name)}</span>
+              <span>${escapeHtml(moment.category || moment.analysis_backend || "vlm")}</span>
             </div>
             <div class="actions">
               <button class="button secondary" data-action="favorite">${

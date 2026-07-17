@@ -2,7 +2,10 @@
 
 Local FreeBSD-jail service for saving meaningful moments from a home RTSP camera.
 
-The service records a low-resolution RTSP stream for analysis, records a 4K RTSP stream as the quality source, asks a local llama.cpp OpenAI-compatible endpoint whether a segment is worth saving, then writes selected clips and metadata into a Nextcloud-visible folder.
+The service records a low-resolution RTSP stream for analysis and a 4K RTSP
+stream as the quality source. It can either ask a local llama.cpp vision model
+or use a CPU-only daughter detector, then writes selected clips and metadata
+into a Nextcloud-visible folder.
 
 For slow local vision models such as Qwen3-VL-2B in llama.cpp, the default analyzer sends one low-resolution contact sheet per segment instead of many separate images. This keeps model calls bounded while still showing several moments in chronological order.
 
@@ -31,6 +34,8 @@ Important values:
 - `RTSP_HIGH_URL`: the camera's 4K stream, for saved clips.
 - `RTSP_USERNAME` / `RTSP_PASSWORD`: optional shared credentials for both RTSP streams.
 - `NEXTCLOUD_OUTPUT_DIR`: a folder mounted into this jail and exposed to Nextcloud.
+- `ANALYSIS_BACKEND`: `vlm` or `daughter_detector`; detector mode makes no LLM requests.
+- `DAUGHTER_DETECTOR_MODE`: `heuristic` initially, or `onnx` for a trained one-class daughter model.
 - `LLAMA_BASE_URL`: your llama.cpp jail's OpenAI-compatible base URL, usually ending in `/v1`.
 - `LLAMA_MODEL`: the multimodal model name served by llama.cpp.
 - `RETENTION_HOURS`: how long raw rolling-buffer segments remain on disk.
@@ -82,9 +87,15 @@ If analysis still falls behind badly, try the camera low stream at `352x288` and
 - Python runs orchestration, state, UI, and HTTP model calls.
 - Python 3.11 or newer is supported; Python 3.12 is not required.
 - Runtime Python dependencies are intentionally zero; the web server and llama.cpp HTTP client use the Python standard library to avoid Pydantic/Rust builds on FreeBSD.
+- Detector mode uses the existing FreeBSD OpenCV/NumPy system packages and
+  extracts its chronological frame series in one ffmpeg process.
 - `ffmpeg` does all RTSP recording, segmentation, frame extraction, and clip concatenation.
 - The rolling buffer is stored on disk, not in memory.
 - Analysis is deliberately high-recall: low-confidence but promising moments are saved instead of discarded.
+- Each day directory has NAS-owned MP4/JSON files, a factual `summary.md`, an
+  atomic `manifest.json`, and a `_READY.json` marker once the day is complete.
+  A future desktop worker can safely write `analysis/`, `diary.json`, and
+  `diary.md`; the NAS does not overwrite those files.
 
 ## FreeBSD Service Sketch
 

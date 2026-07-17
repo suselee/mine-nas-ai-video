@@ -349,6 +349,44 @@ def test_evict_moment_removes_files(tmp_path):
     assert not clip.exists() and not meta.exists()
 
 
+def test_detector_cooldown_uses_clip_source_time(tmp_path):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "out",
+        moment_cooldown_seconds=480,
+    )
+    database = Database(tmp_path / "test.sqlite3")
+    database.migrate()
+    clip = tmp_path / "out" / "2026-07-10" / "100000_x.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"x")
+    metadata = clip.with_suffix(".json")
+    metadata.write_text("{}")
+    database.create_moment(
+        camera_name="home-camera",
+        title="x",
+        summary="",
+        tags=[],
+        confidence=0.9,
+        source_low_segment_id=None,
+        source_started_at="2026-07-10T10:00:00+08:00",
+        source_ended_at="2026-07-10T10:02:00+08:00",
+        clip_path=clip,
+        metadata_path=metadata,
+        clip_started_at="2026-07-10T10:00:00+08:00",
+        clip_ended_at="2026-07-10T10:00:30+08:00",
+    )
+    supervisor = Supervisor(settings, database)
+    result = replace(_result(0.9), analysis_backend="daughter_detector")
+
+    assert supervisor._moment_cooldown_active(
+        {"started_at": "2026-07-10T10:05:00+08:00"}, result
+    )
+    assert not supervisor._moment_cooldown_active(
+        {"started_at": "2026-07-10T10:09:00+08:00"}, result
+    )
+
+
 def test_apply_moment_caps_period_eviction_lowers_daily_count(tmp_path):
     # The period-weakest is also the day-weakest, and both caps are at limit.
     # Evicting it for the period must lower the day count so the daily check

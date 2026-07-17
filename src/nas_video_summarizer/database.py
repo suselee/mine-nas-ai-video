@@ -72,6 +72,11 @@ class Database:
                     source_ended_at TEXT NOT NULL,
                     clip_path TEXT NOT NULL UNIQUE,
                     metadata_path TEXT NOT NULL,
+                    analysis_backend TEXT NOT NULL DEFAULT 'vlm',
+                    category TEXT NOT NULL DEFAULT 'semantic',
+                    selection_score REAL NOT NULL DEFAULT 0,
+                    clip_started_at TEXT,
+                    clip_ended_at TEXT,
                     favorited INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(source_low_segment_id) REFERENCES segments(id)
@@ -87,6 +92,31 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 """
+            )
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(moments)").fetchall()
+            }
+            additions = (
+                ("analysis_backend", "TEXT NOT NULL DEFAULT 'vlm'"),
+                ("category", "TEXT NOT NULL DEFAULT 'semantic'"),
+                ("selection_score", "REAL NOT NULL DEFAULT 0"),
+                ("clip_started_at", "TEXT"),
+                ("clip_ended_at", "TEXT"),
+            )
+            for name, declaration in additions:
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE moments ADD COLUMN {name} {declaration}")
+            conn.execute(
+                "UPDATE moments SET selection_score=confidence "
+                "WHERE selection_score=0 AND confidence!=0"
+            )
+            conn.execute(
+                "UPDATE moments SET clip_started_at=source_started_at "
+                "WHERE clip_started_at IS NULL"
+            )
+            conn.execute(
+                "UPDATE moments SET clip_ended_at=source_ended_at "
+                "WHERE clip_ended_at IS NULL"
             )
 
     def add_event(self, event_type: str, message: str) -> None:
@@ -268,6 +298,11 @@ class Database:
         source_ended_at: str,
         clip_path: Path,
         metadata_path: Path,
+        analysis_backend: str = "vlm",
+        category: str = "semantic",
+        selection_score: float | None = None,
+        clip_started_at: str | None = None,
+        clip_ended_at: str | None = None,
     ) -> int:
         with self.connect() as conn:
             cursor = conn.execute(
@@ -275,9 +310,10 @@ class Database:
                 INSERT INTO moments(
                     camera_name, title, summary, tags_json, confidence,
                     source_low_segment_id, source_started_at, source_ended_at,
-                    clip_path, metadata_path
+                    clip_path, metadata_path, analysis_backend, category,
+                    selection_score, clip_started_at, clip_ended_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     camera_name,
@@ -290,6 +326,11 @@ class Database:
                     source_ended_at,
                     str(clip_path),
                     str(metadata_path),
+                    analysis_backend,
+                    category,
+                    confidence if selection_score is None else selection_score,
+                    clip_started_at or source_started_at,
+                    clip_ended_at or source_ended_at,
                 ),
             )
             return int(cursor.lastrowid)
@@ -298,7 +339,7 @@ class Database:
         """Number of moments whose source started on ``day`` (``YYYY-MM-DD``)."""
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) FROM moments WHERE source_started_at LIKE ?",
+                "SELECT COUNT(*) FROM moments WHERE clip_started_at LIKE ?",
                 (f"{day}%",),
             ).fetchone()
             return int(row[0]) if row else 0
@@ -307,7 +348,7 @@ class Database:
         """Return the weakest confidence, or 1.0 when the day is empty."""
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT MIN(confidence) FROM moments WHERE source_started_at LIKE ?",
+                "SELECT MIN(selection_score) FROM moments WHERE clip_started_at LIKE ?",
                 (f"{day}%",),
             ).fetchone()
             return float(row[0]) if row and row[0] is not None else 1.0
@@ -317,18 +358,18 @@ class Database:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, title, confidence, clip_path, metadata_path
+                SELECT id, title, confidence, selection_score, category,
+                       clip_path, metadata_path
                 FROM moments
-                WHERE source_started_at LIKE ?
-                ORDER BY confidence ASC
+                WHERE clip_started_at LIKE ?
+                ORDER BY selection_score ASC
                 LIMIT 1
                 """,
                 (f"{day}%",),
             ).fetchone()
             if not row:
                 return None
-            keys = ("id", "title", "confidence", "clip_path", "metadata_path")
-            return dict(zip(keys, row))
+            return row_to_dict(row)
 
     def count_moments_between(self, start_iso: str, end_iso: str) -> int:
         with self.connect() as conn:
@@ -336,11 +377,25 @@ class Database:
                 """
                 SELECT COUNT(*)
                 FROM moments
-                WHERE source_started_at >= ? AND source_started_at < ?
+                WHERE clip_started_at >= ? AND clip_started_at < ?
                 """,
                 (start_iso, end_iso),
             ).fetchone()
             return int(row[0]) if row else 0
+
+    def moments_between(self, start_iso: str, end_iso: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, confidence, selection_score, category,
+                       clip_path, metadata_path
+                FROM moments
+                WHERE clip_started_at >= ? AND clip_started_at < ?
+                ORDER BY selection_score ASC
+                """,
+                (start_iso, end_iso),
+            ).fetchall()
+        return [row_to_dict(row) for row in rows]
 
     def weakest_moment_between(
         self, start_iso: str, end_iso: str
@@ -348,18 +403,43 @@ class Database:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, title, confidence, clip_path, metadata_path
+                SELECT id, title, confidence, selection_score, category,
+                       clip_path, metadata_path
                 FROM moments
-                WHERE source_started_at >= ? AND source_started_at < ?
-                ORDER BY confidence ASC
+                WHERE clip_started_at >= ? AND clip_started_at < ?
+                ORDER BY selection_score ASC
                 LIMIT 1
                 """,
                 (start_iso, end_iso),
             ).fetchone()
             if not row:
                 return None
-            keys = ("id", "title", "confidence", "clip_path", "metadata_path")
-            return dict(zip(keys, row))
+            return row_to_dict(row)
+
+    def moments_on_day(self, day: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM moments
+                WHERE clip_started_at LIKE ?
+                ORDER BY clip_started_at ASC, id ASC
+                """,
+                (f"{day}%",),
+            ).fetchall()
+        return [row_to_dict(row) for row in rows]
+
+    def nearest_moment_before(self, clip_started_at: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM moments
+                WHERE clip_started_at <= ?
+                ORDER BY clip_started_at DESC
+                LIMIT 1
+                """,
+                (clip_started_at,),
+            ).fetchone()
+        return row_to_dict(row) if row else None
 
     def delete_moment_by_clip(self, clip_path: str) -> None:
         with self.connect() as conn:
@@ -418,6 +498,28 @@ class Database:
                 (stream_role,),
             ).fetchone()
             return int(row["count"])
+
+    def segment_status_between(
+        self, *, stream_role: str, start_iso: str, end_iso: str
+    ) -> tuple[int, int, int]:
+        """Return pending, final-error, and total counts for a time window."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    SUM(processed_at IS NULL) AS pending,
+                    SUM(processed_at IS NOT NULL AND last_error IS NOT NULL) AS errors,
+                    COUNT(*) AS total
+                FROM segments
+                WHERE stream_role = ? AND started_at >= ? AND started_at < ?
+                """,
+                (stream_role, start_iso, end_iso),
+            ).fetchone()
+        return (
+            int(row["pending"] or 0),
+            int(row["errors"] or 0),
+            int(row["total"] or 0),
+        )
 
     def latest_segment(self, stream_role: str) -> dict[str, Any] | None:
         with self.connect() as conn:

@@ -111,3 +111,36 @@ def test_recent_segments_returns_newest_first(tmp_path):
 
     assert len(rows) == 1
     assert rows[0]["path"] == "/buffer/low/newer.mp4"
+
+
+def test_migrate_adds_detector_columns_to_existing_moments_table(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE moments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                camera_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                source_low_segment_id INTEGER,
+                source_started_at TEXT NOT NULL,
+                source_ended_at TEXT NOT NULL,
+                clip_path TEXT NOT NULL UNIQUE,
+                metadata_path TEXT NOT NULL,
+                favorited INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+    database = Database(path)
+    database.migrate()
+
+    with database.connect() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(moments)")}
+
+    assert {"analysis_backend", "category", "selection_score", "clip_started_at"} <= columns

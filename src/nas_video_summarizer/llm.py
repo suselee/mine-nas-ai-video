@@ -10,6 +10,9 @@ from typing import Any
 from urllib import error, request
 
 from .config import Settings
+from .analysis import ClipCandidate
+
+AnalysisResult = ClipCandidate
 
 
 _SEMANTIC_REPAIR_MIN_CONFIDENCE = 0.75
@@ -56,44 +59,6 @@ _EXCLUSION_EVIDENCE_TERMS = (
     "sitting idle",
     "passive",
 )
-
-
-@dataclass(frozen=True)
-class AnalysisResult:
-    keep: bool
-    title: str
-    summary: str
-    tags: list[str]
-    confidence: float
-    start_offset_seconds: int
-    end_offset_seconds: int
-    raw: dict[str, Any]
-    raw_text: str = ""
-    local_child_confirmed: bool = False
-    local_child_score: float = 0.0
-
-    def should_save(self, threshold: float) -> bool:
-        # Normally both keep and confidence are required. Some small VLMs
-        # emit keep=false while their title/summary confidently describe a
-        # child playing; repair only that narrow contradiction.
-        return self.confidence >= threshold and (
-            self.keep or self.keep_consistency_repaired(threshold)
-        )
-
-    def keep_consistency_repaired(self, threshold: float) -> bool:
-        """Repair a high-confidence false boolean that contradicts the text."""
-        if (
-            self.keep
-            or not self.local_child_confirmed
-            or self.confidence < max(threshold, _SEMANTIC_REPAIR_MIN_CONFIDENCE)
-        ):
-            return False
-        evidence = " ".join([self.title, self.summary, *self.tags]).lower()
-        if any(term in evidence for term in _EXCLUSION_EVIDENCE_TERMS):
-            return False
-        has_child = any(term in evidence for term in _CHILD_EVIDENCE_TERMS)
-        has_activity = any(term in evidence for term in _ACTIVITY_EVIDENCE_TERMS)
-        return has_child and has_activity
 
 
 @dataclass(frozen=True)

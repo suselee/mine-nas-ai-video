@@ -367,6 +367,50 @@ async def sample_frames_with_offsets(
     return frames
 
 
+async def sample_frames_at_fps(
+    settings: Settings,
+    video_path: Path,
+    output_dir: Path,
+    *,
+    duration_seconds: int,
+    fps: float,
+    width: int,
+) -> list[SampledFrame]:
+    """Decode a chronological frame series in one ffmpeg process.
+
+    Dense detector sampling must not start one decoder per frame. Offsets are
+    deterministic at the configured cadence and intentionally approximate;
+    event context absorbs the sub-frame difference.
+    """
+    if fps <= 0 or duration_seconds <= 0:
+        return []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pattern = output_dir / "frame_%06d.jpg"
+    command = [
+        settings.ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        *_hwaccel_args(settings),
+        "-i",
+        str(video_path),
+        "-an",
+        "-vf",
+        f"fps={fps:g},scale={max(32, width)}:-2",
+        "-q:v",
+        "5",
+        str(pattern),
+    ]
+    await _run_command(command, "ffmpeg detector frame extraction failed")
+    interval = 1.0 / fps
+    frames: list[SampledFrame] = []
+    for index, path in enumerate(sorted(output_dir.glob("frame_*.jpg"))):
+        offset = min(float(duration_seconds), index * interval)
+        frames.append(SampledFrame(path=path, offset_seconds=offset))
+    return frames
+
+
 async def sample_frames(
     settings: Settings,
     video_path: Path,
