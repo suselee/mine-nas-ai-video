@@ -74,6 +74,20 @@ def test_detector_reset_clears_cached_heuristic_state():
     assert detector._cached_child_until == -1.0
 
 
+def test_relative_body_size_fallback_selects_smaller_person():
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    adult = [0.1, 0.1, 0.30, 0.70]
+    child = [0.6, 0.4, 0.14, 0.35]
+    assert detector._relative_child_box([adult, child]) == child
+
+
+def test_relative_body_size_fallback_rejects_similar_adults():
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    first = [0.1, 0.1, 0.25, 0.60]
+    second = [0.5, 0.1, 0.23, 0.56]
+    assert detector._relative_child_box([first, second]) is None
+
+
 def test_archive_contract_contains_manifest_and_ready(tmp_path):
     settings = replace(load_settings("/nonexistent.env"), output_dir=tmp_path / "out")
     database = Database(tmp_path / "app.sqlite3")

@@ -17,9 +17,12 @@ DAUGHTER_EVENT_MIN_SECONDS=4
 ```
 
 Heuristic mode only accepts explicit child evidence from the existing face/age
-models. It intentionally misses hidden or turned-away faces rather than saving
-an uncertain adult. Use it to validate CPU throughput and the detector-only
-archive before training the final model.
+models as its strongest signal. In multi-person scenes it can also use a
+conservative relative-body-size fallback: a person must be substantially
+shorter and smaller than the largest person across the sampled event. This
+helps when the toddler is turned away or partially occluded, while similar-size
+adults do not pass. Use heuristic mode to validate the detector-only archive
+before training the final model.
 
 ## Custom ONNX model
 

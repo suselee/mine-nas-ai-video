@@ -17,6 +17,7 @@ class DaughterObservation:
     confidence: float
     boxes: list[list[float]]
     person_count: int
+    evidence: str = ""
 
     @property
     def positive(self) -> bool:
@@ -116,12 +117,27 @@ class DaughterDetector:
             )
             boxes = list(info.get("person_boxes", []))
             if child_score < self.settings.person_filter_child_threshold or not boxes:
-                return DaughterObservation(frame.offset_seconds, 0.0, [], len(boxes))
+                body_box = self._relative_child_box(boxes)
+                if body_box is None:
+                    return DaughterObservation(
+                        frame.offset_seconds, 0.0, [], len(boxes)
+                    )
+                return DaughterObservation(
+                    frame.offset_seconds,
+                    max(0.55, self.settings.daughter_detector_threshold),
+                    [body_box],
+                    len(boxes),
+                    "relative_body_size",
+                )
             # The age model currently exposes aggregate evidence. A toddler is
             # normally the smallest visible person in this fixed indoor view.
             daughter_box = min(boxes, key=lambda box: float(box[2]) * float(box[3]))
             return DaughterObservation(
-                frame.offset_seconds, child_score, [daughter_box], len(boxes)
+                frame.offset_seconds,
+                child_score,
+                [daughter_box],
+                len(boxes),
+                "face_age",
             )
 
         boxes, score = self._detect_onnx(frame.path)
@@ -134,7 +150,34 @@ class DaughterDetector:
             score,
             boxes,
             max(1, len(context.get("person_boxes", []))),
+            "daughter_onnx",
         )
+
+    def _relative_child_box(
+        self, boxes: list[list[float]]
+    ) -> list[float] | None:
+        if not self.settings.daughter_body_fallback_enabled or len(boxes) < 2:
+            return None
+        valid = [
+            box for box in boxes
+            if float(box[2]) > 0 and float(box[3]) > 0
+        ]
+        if len(valid) < 2:
+            return None
+        smallest = min(valid, key=lambda box: float(box[2]) * float(box[3]))
+        largest = max(valid, key=lambda box: float(box[2]) * float(box[3]))
+        small_area = float(smallest[2]) * float(smallest[3])
+        large_area = float(largest[2]) * float(largest[3])
+        if large_area <= 0 or float(largest[3]) <= 0:
+            return None
+        height_ratio = float(smallest[3]) / float(largest[3])
+        area_ratio = small_area / large_area
+        if (
+            height_ratio <= self.settings.daughter_body_height_ratio
+            and area_ratio <= self.settings.daughter_body_area_ratio
+        ):
+            return smallest
+        return None
 
     def _detect_onnx(self, path: Path) -> tuple[list[list[float]], float]:
         self._init_onnx()
@@ -270,6 +313,7 @@ class DaughterDetector:
                         "duration_seconds": round(duration, 3),
                         "activity_score": round(activity, 4),
                         "max_person_count": max(item.person_count for item in group),
+                        "evidence": sorted({item.evidence for item in group if item.evidence}),
                         "median_bbox_area": round(median(areas), 6) if areas else 0.0,
                     },
                     local_child_confirmed=True,

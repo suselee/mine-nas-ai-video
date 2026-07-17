@@ -75,6 +75,9 @@ def test_new_window_and_quota_defaults(monkeypatch):
     assert settings.daughter_scan_fps == 0.5
     assert settings.daughter_event_min_hits == 2
     assert settings.daughter_age_check_every == 3
+    assert settings.daughter_body_fallback_enabled is True
+    assert settings.daughter_body_height_ratio == 0.72
+    assert settings.daughter_body_area_ratio == 0.5
     assert settings.moment_category_targets == "active:3,multi_person:3,quiet:2"
 
 
