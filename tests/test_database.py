@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from nas_video_summarizer.database import Database
@@ -144,3 +144,39 @@ def test_migrate_adds_detector_columns_to_existing_moments_table(tmp_path):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(moments)")}
 
     assert {"analysis_backend", "category", "selection_score", "clip_started_at"} <= columns
+
+
+def test_migrate_converts_legacy_utc_created_at_to_local_iso(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "legacy-time.sqlite3"
+    database = Database(path)
+    database.migrate()
+    with database.connect() as conn:
+        conn.execute(
+            "INSERT INTO events(event_type, message, created_at) VALUES (?, ?, ?)",
+            ("legacy", "old", "2026-07-17 01:02:03"),
+        )
+
+    database.migrate()
+
+    event = database.recent_events(limit=1)[0]
+    expected = datetime(2026, 7, 17, 1, 2, 3, tzinfo=timezone.utc).astimezone()
+    assert event["created_at"] == expected.isoformat(timespec="seconds")
+
+
+def test_new_database_timestamps_are_local_iso(tmp_path):
+    database = Database(tmp_path / "local-time.sqlite3")
+    database.migrate()
+    database.add_event("test", "message")
+    _insert_segment(
+        database,
+        stream_role="low",
+        path="/buffer/low/local-time.mp4",
+        started_at="2026-07-17T10:00:00+08:00",
+    )
+
+    event_time = datetime.fromisoformat(database.recent_events(limit=1)[0]["created_at"])
+    segment_time = datetime.fromisoformat(database.latest_segment("low")["created_at"])
+    assert event_time.tzinfo is not None
+    assert segment_time.tzinfo is not None

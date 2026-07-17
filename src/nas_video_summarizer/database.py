@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-def utc_now_iso() -> str:
+def local_now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def utc_now_iso() -> str:
+    """Backward-compatible name; timestamps are local ISO values."""
+    return local_now_iso()
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -51,7 +56,7 @@ class Database:
                     analysis_attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
                     deleted_at TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_segments_role_time
@@ -78,7 +83,7 @@ class Database:
                     clip_started_at TEXT,
                     clip_ended_at TEXT,
                     favorited INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    created_at TEXT NOT NULL,
                     FOREIGN KEY(source_low_segment_id) REFERENCES segments(id)
                 );
 
@@ -89,7 +94,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_type TEXT NOT NULL,
                     message TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL
                 );
                 """
             )
@@ -118,12 +123,39 @@ class Database:
                 "UPDATE moments SET clip_ended_at=source_ended_at "
                 "WHERE clip_ended_at IS NULL"
             )
+            self._migrate_created_at_to_local(conn)
+
+    @staticmethod
+    def _migrate_created_at_to_local(conn: sqlite3.Connection) -> None:
+        """Convert legacy SQLite CURRENT_TIMESTAMP values from UTC to local ISO."""
+        for table in ("segments", "moments", "events"):
+            rows = conn.execute(
+                f"SELECT id, created_at FROM {table} WHERE created_at NOT LIKE '%T%'"
+            ).fetchall()
+            updates: list[tuple[str, int]] = []
+            for row in rows:
+                value = str(row["created_at"] or "").strip()
+                if not value:
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(value)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                updates.append(
+                    (parsed.astimezone().isoformat(timespec="seconds"), int(row["id"]))
+                )
+            if updates:
+                conn.executemany(
+                    f"UPDATE {table} SET created_at=? WHERE id=?", updates
+                )
 
     def add_event(self, event_type: str, message: str) -> None:
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO events(event_type, message) VALUES (?, ?)",
-                (event_type, message[:2000]),
+                "INSERT INTO events(event_type, message, created_at) VALUES (?, ?, ?)",
+                (event_type, message[:2000], local_now_iso()),
             )
 
     def upsert_segment(
@@ -142,9 +174,9 @@ class Database:
                 """
                 INSERT INTO segments(
                     camera_name, stream_role, path, started_at, ended_at,
-                    duration_seconds, size_bytes
+                    duration_seconds, size_bytes, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     ended_at=excluded.ended_at,
                     duration_seconds=excluded.duration_seconds,
@@ -158,6 +190,7 @@ class Database:
                     ended_at,
                     duration_seconds,
                     size_bytes,
+                    local_now_iso(),
                 ),
             )
             row = conn.execute("SELECT id FROM segments WHERE path = ?", (str(path),)).fetchone()
@@ -176,6 +209,7 @@ class Database:
                 segment["ended_at"],
                 segment["duration_seconds"],
                 segment["size_bytes"],
+                local_now_iso(),
             )
             for segment in segments
         ]
@@ -184,9 +218,9 @@ class Database:
                 """
                 INSERT INTO segments(
                     camera_name, stream_role, path, started_at, ended_at,
-                    duration_seconds, size_bytes
+                    duration_seconds, size_bytes, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     ended_at=excluded.ended_at,
                     duration_seconds=excluded.duration_seconds,
@@ -311,9 +345,9 @@ class Database:
                     camera_name, title, summary, tags_json, confidence,
                     source_low_segment_id, source_started_at, source_ended_at,
                     clip_path, metadata_path, analysis_backend, category,
-                    selection_score, clip_started_at, clip_ended_at
+                    selection_score, clip_started_at, clip_ended_at, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     camera_name,
@@ -331,6 +365,7 @@ class Database:
                     confidence if selection_score is None else selection_score,
                     clip_started_at or source_started_at,
                     clip_ended_at or source_ended_at,
+                    local_now_iso(),
                 ),
             )
             return int(cursor.lastrowid)
