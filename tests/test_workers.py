@@ -1027,6 +1027,92 @@ def test_pending_board_case_waits_for_indexed_segments(tmp_path, monkeypatch):
     assert database.count_pending_board_cases() == 1
 
 
+def test_pending_board_case_obeys_daily_cap_and_is_finalized(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "output",
+        max_moments_per_day=1,
+        max_moments_per_period=0,
+        moment_cooldown_seconds=0,
+        context_after_seconds=10,
+        detector_comparison_enabled=True,
+    )
+    database = Database(tmp_path / "board-cap.sqlite3")
+    database.migrate()
+    low_path = tmp_path / "low.mp4"
+    high_path = tmp_path / "high.mp4"
+    low_path.write_bytes(b"low")
+    high_path.write_bytes(b"high")
+    low_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="low",
+        path=low_path,
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:02:00+08:00",
+        duration_seconds=120,
+        size_bytes=3,
+    )
+    database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="high",
+        path=high_path,
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:02:00+08:00",
+        duration_seconds=120,
+        size_bytes=4,
+    )
+    existing_clip = tmp_path / "output" / "2026-07-19" / "existing.mp4"
+    existing_clip.parent.mkdir(parents=True)
+    existing_clip.write_bytes(b"existing")
+    existing_metadata = existing_clip.with_suffix(".json")
+    existing_metadata.write_text("{}")
+    database.create_moment(
+        camera_name="home-camera",
+        title="strong existing moment",
+        summary="",
+        tags=[],
+        confidence=0.95,
+        source_low_segment_id=low_id,
+        source_started_at="2026-07-19T10:00:00+08:00",
+        source_ended_at="2026-07-19T10:02:00+08:00",
+        clip_path=existing_clip,
+        metadata_path=existing_metadata,
+        analysis_backend="daughter_detector",
+        selection_score=0.95,
+        clip_started_at="2026-07-19T10:00:05+08:00",
+        clip_ended_at="2026-07-19T10:00:30+08:00",
+    )
+    event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
+    case, _ = database.record_detector_event(
+        event_key="board:daily-cap",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at=event_time.isoformat(timespec="seconds"),
+        ended_at=(event_time + timedelta(seconds=1)).isoformat(timespec="seconds"),
+        confidence=0.2,
+        payload={
+            "event": "end",
+            "identity": "probable",
+            "best_ts": event_time.timestamp(),
+        },
+        merge_gap_seconds=15,
+    )
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    saved = asyncio.run(supervisor._process_pending_board_cases())
+
+    assert saved == 0
+    assert database.count_moments_on_day("2026-07-19") == 1
+    assert database.count_pending_board_cases() == 0
+    stored = database.get_comparison_case(int(case["id"]))
+    assert stored is not None
+    assert stored["save_status"] == "daily-cap"
+
+
 def test_rv1106_backend_finalizes_segments_without_detector(tmp_path, monkeypatch):
     settings = replace(
         load_settings("/nonexistent.env"),

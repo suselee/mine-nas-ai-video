@@ -283,6 +283,12 @@ class CapPlan:
     evictions: tuple[tuple[dict[str, Any], str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class MomentSaveOutcome:
+    moment_id: int = -1
+    skip: MomentSkip | None = None
+
+
 class Supervisor:
     def __init__(self, settings: Settings, database: Database):
         self.settings = settings
@@ -293,6 +299,10 @@ class Supervisor:
         self._llama_circuit_open_until: datetime | None = None
         self._last_board_saved_at: str | None = None
         self._last_board_moment_id: int | None = None
+        # NAS analysis and RV1106 comparison run as separate tasks. Serialize
+        # cap checks with clip publication so both cannot observe count=23 and
+        # independently publish the 24th/25th moments.
+        self._moment_save_lock = asyncio.Lock()
         self.state: dict[str, Any] = {
             "started_at": utc_now_iso(),
             "recorders": {
@@ -623,9 +633,17 @@ class Supervisor:
                 category=f"rv1106_{identity}",
                 selection_score=selection_score,
             )
-            moment_id = await self._save_moment(
+            outcome = await self._save_capped_moment(
                 segment, result, analyzer=None, detector=None
             )
+            moment_id = outcome.moment_id
+            if outcome.skip is not None:
+                await asyncio.to_thread(
+                    self.database.mark_comparison_case_skipped,
+                    int(case["id"]),
+                    int(segment["id"]),
+                    outcome.skip.event_type,
+                )
             if moment_id >= 0:
                 await asyncio.to_thread(
                     self.database.attach_comparison_moment,
@@ -1095,6 +1113,31 @@ class Supervisor:
             return CapDecision("evict", "daily", weakest)
         return CapDecision("blocked", "daily")
 
+    async def _save_capped_moment(
+        self,
+        segment: dict[str, Any],
+        result: ClipCandidate,
+        analyzer: LlamaAnalyzer | None,
+        detector: DaughterDetector | None = None,
+    ) -> MomentSaveOutcome:
+        """Apply every clip limit atomically across all producer tasks."""
+        async with self._moment_save_lock:
+            cap_plan = self._apply_moment_caps(segment, result)
+            if cap_plan.skip is not None:
+                self.database.add_event(
+                    cap_plan.skip.event_type, cap_plan.skip.message
+                )
+                return MomentSaveOutcome(skip=cap_plan.skip)
+            moment_id = await self._save_moment(
+                segment, result, analyzer=analyzer, detector=detector
+            )
+            if moment_id >= 0:
+                for moment, event_type, scope in cap_plan.evictions:
+                    self._evict_moment(
+                        moment, event_type=event_type, scope=scope
+                    )
+            return MomentSaveOutcome(moment_id=moment_id)
+
     async def _analyzer_loop(self) -> None:
         backend = self.settings.analysis_backend
         analyzer = LlamaAnalyzer(self.settings) if backend == "vlm" else None
@@ -1220,25 +1263,15 @@ class Supervisor:
                             f"({result.local_child_score:.2f}): {result.title}",
                         )
                     if should_save:
-                        cap_plan = self._apply_moment_caps(segment, result)
-                        if cap_plan.skip is not None:
+                        outcome = await self._save_capped_moment(
+                            segment, result, analyzer=analyzer, detector=detector
+                        )
+                        if outcome.moment_id >= 0:
+                            saved_any = True
                             self.database.add_event(
-                                cap_plan.skip.event_type, cap_plan.skip.message
+                                "moment",
+                                f"saved moment {outcome.moment_id}: {result.title}",
                             )
-                        else:
-                            moment_id = await self._save_moment(
-                                segment, result, analyzer=analyzer, detector=detector
-                            )
-                            if moment_id >= 0:
-                                saved_any = True
-                                for moment, event_type, scope in cap_plan.evictions:
-                                    self._evict_moment(
-                                        moment, event_type=event_type, scope=scope
-                                    )
-                                self.database.add_event(
-                                    "moment",
-                                    f"saved moment {moment_id}: {result.title}",
-                                )
                     if not should_save:
                         self.database.add_event(
                             "analysis-skip",
@@ -1350,9 +1383,17 @@ class Supervisor:
         if existing_moment is not None:
             self._refresh_comparison_metadata(int(case["id"]), int(existing_moment))
             return int(existing_moment)
-        moment_id = await self._save_moment(
+        outcome = await self._save_capped_moment(
             segment, result, analyzer=None, detector=detector
         )
+        moment_id = outcome.moment_id
+        if outcome.skip is not None:
+            await asyncio.to_thread(
+                self.database.mark_comparison_case_skipped,
+                int(case["id"]),
+                int(segment["id"]),
+                outcome.skip.event_type,
+            )
         if moment_id >= 0:
             await asyncio.to_thread(
                 self.database.attach_comparison_moment,

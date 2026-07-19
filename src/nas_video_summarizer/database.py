@@ -113,6 +113,7 @@ class Database:
                     board_last_event_at TEXT,
                     match_status TEXT NOT NULL DEFAULT 'pending',
                     moment_id INTEGER,
+                    save_status TEXT,
                     source_low_segment_id INTEGER,
                     control_sample INTEGER NOT NULL DEFAULT 0,
                     control_clip_path TEXT,
@@ -167,6 +168,7 @@ class Database:
                 ("board_identity", "TEXT"),
                 ("board_best_ts", "REAL"),
                 ("board_last_event_at", "TEXT"),
+                ("save_status", "TEXT"),
             )
             for name, declaration in comparison_additions:
                 if name not in comparison_columns:
@@ -184,6 +186,10 @@ class Database:
             conn.execute(
                 "UPDATE moments SET clip_ended_at=source_ended_at "
                 "WHERE clip_ended_at IS NULL"
+            )
+            conn.execute(
+                "UPDATE comparison_cases SET save_status='saved' "
+                "WHERE moment_id IS NOT NULL AND save_status IS NULL"
             )
             self._migrate_created_at_to_local(conn)
 
@@ -590,7 +596,8 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT * FROM comparison_cases
-                WHERE control_sample=0 AND board_score IS NOT NULL AND moment_id IS NULL
+                WHERE control_sample=0 AND board_score IS NOT NULL
+                  AND moment_id IS NULL AND save_status IS NULL
                 ORDER BY started_at ASC
                 LIMIT ?
                 """,
@@ -603,7 +610,8 @@ class Database:
             row = conn.execute(
                 """
                 SELECT COUNT(*) FROM comparison_cases
-                WHERE control_sample=0 AND board_score IS NOT NULL AND moment_id IS NULL
+                WHERE control_sample=0 AND board_score IS NOT NULL
+                  AND moment_id IS NULL AND save_status IS NULL
                 """
             ).fetchone()
         return int(row[0]) if row else 0
@@ -615,10 +623,23 @@ class Database:
             conn.execute(
                 """
                 UPDATE comparison_cases
-                SET moment_id=?, source_low_segment_id=?, updated_at=?
+                SET moment_id=?, source_low_segment_id=?, save_status='saved', updated_at=?
                 WHERE id=?
                 """,
                 (moment_id, source_low_segment_id, local_now_iso(), case_id),
+            )
+
+    def mark_comparison_case_skipped(
+        self, case_id: int, source_low_segment_id: int, reason: str
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE comparison_cases
+                SET source_low_segment_id=?, save_status=?, updated_at=?
+                WHERE id=?
+                """,
+                (source_low_segment_id, reason[:100], local_now_iso(), case_id),
             )
 
     def list_comparison_cases(

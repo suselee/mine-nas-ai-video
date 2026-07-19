@@ -287,6 +287,41 @@ def test_rv1106_session_updates_merge_beyond_time_gap(tmp_path):
     assert stored["board_best_ts"] == 120.0
 
 
+def test_skipped_board_case_is_not_returned_as_pending(tmp_path):
+    database = Database(tmp_path / "skipped-case.sqlite3")
+    database.migrate()
+    segment_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="low",
+        path=tmp_path / "low.mp4",
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:02:00+08:00",
+        duration_seconds=120,
+        size_bytes=1,
+    )
+    case, _ = database.record_detector_event(
+        event_key="board:cap-skip",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:00:01+08:00",
+        confidence=0.7,
+        payload={"event": "end", "identity": "probable"},
+        merge_gap_seconds=15,
+    )
+
+    assert database.count_pending_board_cases() == 1
+    database.mark_comparison_case_skipped(
+        int(case["id"]), segment_id, "daily-cap"
+    )
+
+    assert database.count_pending_board_cases() == 0
+    stored = database.get_comparison_case(int(case["id"]))
+    assert stored is not None
+    assert stored["save_status"] == "daily-cap"
+    assert stored["source_low_segment_id"] == segment_id
+
+
 def test_comparison_review_metrics(tmp_path):
     database = Database(tmp_path / "metrics.sqlite3")
     database.migrate()
