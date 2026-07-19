@@ -34,8 +34,10 @@ Important values:
 - `RTSP_HIGH_URL`: the camera's 4K stream, for saved clips.
 - `RTSP_USERNAME` / `RTSP_PASSWORD`: optional shared credentials for both RTSP streams.
 - `NEXTCLOUD_OUTPUT_DIR`: a folder mounted into this jail and exposed to Nextcloud.
-- `ANALYSIS_BACKEND`: `vlm` or `daughter_detector`; detector mode makes no LLM requests.
+- `ANALYSIS_BACKEND`: `vlm`, `daughter_detector`, or `rv1106`; edge-only mode runs no NAS vision inference.
 - `DAUGHTER_DETECTOR_MODE`: `heuristic` initially, or `onnx` for a trained one-class daughter model.
+- `MQTT_ENABLED`: subscribe to RV1106 daughter identity hits; requires a separate MQTT broker.
+- `DETECTOR_COMPARISON_ENABLED`: temporarily compare RV1106 hits with the preserved NAS YOLO11n path.
 - `LLAMA_BASE_URL`: your llama.cpp jail's OpenAI-compatible base URL, usually ending in `/v1`.
 - `LLAMA_MODEL`: the multimodal model name served by llama.cpp.
 - `RETENTION_HOURS`: how long raw rolling-buffer segments remain on disk.
@@ -100,3 +102,4 @@ If analysis still falls behind badly, try the camera low stream at `352x288` and
 ## FreeBSD Service Sketch
 
 See [docs/freebsd-jail.md](docs/freebsd-jail.md) for jail setup, storage layout, and an `rc.d` template.
+See [docs/rv1106-mqtt.md](docs/rv1106-mqtt.md) for Mosquitto and the seven-day detector comparison.

@@ -180,3 +180,99 @@ def test_new_database_timestamps_are_local_iso(tmp_path):
     segment_time = datetime.fromisoformat(database.latest_segment("low")["created_at"])
     assert event_time.tzinfo is not None
     assert segment_time.tzinfo is not None
+
+
+def test_detector_events_merge_board_and_yolo_and_deduplicate(tmp_path):
+    database = Database(tmp_path / "comparison.sqlite3")
+    database.migrate()
+
+    board_case, inserted = database.record_detector_event(
+        event_key="board:1",
+        source="rv1106_face",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:10+08:00",
+        ended_at="2026-07-19T10:00:11+08:00",
+        confidence=0.72,
+        payload={"seq": 1},
+        merge_gap_seconds=15,
+    )
+    yolo_case, yolo_inserted = database.record_detector_event(
+        event_key="yolo:1",
+        source="nas_yolo11n",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:20+08:00",
+        ended_at="2026-07-19T10:00:25+08:00",
+        confidence=0.61,
+        payload={"segment_id": 1},
+        merge_gap_seconds=15,
+    )
+    duplicate_case, duplicate_inserted = database.record_detector_event(
+        event_key="board:1",
+        source="rv1106_face",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:10+08:00",
+        ended_at="2026-07-19T10:00:11+08:00",
+        confidence=0.72,
+        payload={"seq": 1},
+        merge_gap_seconds=15,
+    )
+
+    assert inserted is True
+    assert yolo_inserted is True
+    assert duplicate_inserted is False
+    assert board_case["id"] == yolo_case["id"] == duplicate_case["id"]
+    stored = database.get_comparison_case(int(board_case["id"]))
+    assert stored["match_status"] == "both"
+    assert stored["board_score"] == 0.72
+    assert stored["yolo_score"] == 0.61
+    assert stored["board_payload"] == {"seq": 1}
+
+
+def test_comparison_review_metrics(tmp_path):
+    database = Database(tmp_path / "metrics.sqlite3")
+    database.migrate()
+    case, _ = database.record_detector_event(
+        event_key="board:positive",
+        source="rv1106_face",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:00:01+08:00",
+        confidence=0.8,
+        payload={},
+        merge_gap_seconds=1,
+    )
+    assert database.set_comparison_review(int(case["id"]), "present") is True
+
+    metrics = database.comparison_metrics()
+
+    assert metrics["board"]["precision"] == 1.0
+    assert metrics["board"]["relative_union_recall"] == 1.0
+    assert metrics["yolo"]["relative_union_recall"] == 0.0
+
+
+def test_control_case_is_listed_separately(tmp_path):
+    database = Database(tmp_path / "controls.sqlite3")
+    database.migrate()
+    segment_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="low",
+        path=tmp_path / "low.mp4",
+        started_at="2026-07-18T10:00:00+08:00",
+        ended_at="2026-07-18T10:02:00+08:00",
+        duration_seconds=120,
+        size_bytes=100,
+    )
+    case_id = database.create_control_case(
+        segment_id=segment_id,
+        camera_name="home-camera",
+        started_at="2026-07-18T10:00:30+08:00",
+        ended_at="2026-07-18T10:00:50+08:00",
+    )
+
+    case = database.get_comparison_case(case_id)
+    metrics = database.comparison_metrics()
+
+    assert case["control_sample"] is True
+    assert case["match_status"] == "control"
+    assert metrics["cases"] == 0
+    assert metrics["controls"]["total"] == 1

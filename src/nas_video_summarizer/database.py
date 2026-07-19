@@ -96,6 +96,47 @@ class Database:
                     message TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS comparison_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    camera_name TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    board_score REAL,
+                    yolo_score REAL,
+                    board_payload_json TEXT,
+                    yolo_payload_json TEXT,
+                    match_status TEXT NOT NULL DEFAULT 'pending',
+                    moment_id INTEGER,
+                    source_low_segment_id INTEGER,
+                    control_sample INTEGER NOT NULL DEFAULT 0,
+                    control_clip_path TEXT,
+                    review_label TEXT NOT NULL DEFAULT 'unreviewed',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(moment_id) REFERENCES moments(id) ON DELETE SET NULL,
+                    FOREIGN KEY(source_low_segment_id) REFERENCES segments(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_comparison_cases_time
+                ON comparison_cases(camera_name, started_at, ended_at);
+
+                CREATE TABLE IF NOT EXISTS detector_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key TEXT NOT NULL UNIQUE,
+                    source TEXT NOT NULL,
+                    camera_name TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    comparison_case_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(comparison_case_id) REFERENCES comparison_cases(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_detector_events_case
+                ON detector_events(comparison_case_id, source);
                 """
             )
             columns = {
@@ -157,6 +198,151 @@ class Database:
                 "INSERT INTO events(event_type, message, created_at) VALUES (?, ?, ?)",
                 (event_type, message[:2000], local_now_iso()),
             )
+
+    @staticmethod
+    def _comparison_status(board_score: float | None, yolo_score: float | None) -> str:
+        if board_score is not None and yolo_score is not None:
+            return "both"
+        if board_score is not None:
+            return "board_only"
+        if yolo_score is not None:
+            return "yolo_only"
+        return "pending"
+
+    def record_detector_event(
+        self,
+        *,
+        event_key: str,
+        source: str,
+        camera_name: str,
+        started_at: str,
+        ended_at: str,
+        confidence: float,
+        payload: dict[str, Any],
+        merge_gap_seconds: float,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one detector hit and merge it into a nearby comparison case."""
+        if source not in {"rv1106_face", "nas_yolo11n"}:
+            raise ValueError(f"unsupported detector event source: {source}")
+        start = datetime.fromisoformat(started_at)
+        end = datetime.fromisoformat(ended_at)
+        gap = max(0.0, merge_gap_seconds)
+        search_start = (start.timestamp() - gap)
+        search_end = (end.timestamp() + gap)
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        now = local_now_iso()
+        with self.connect() as conn:
+            existing_event = conn.execute(
+                "SELECT comparison_case_id FROM detector_events WHERE event_key=?",
+                (event_key,),
+            ).fetchone()
+            if existing_event:
+                row = conn.execute(
+                    "SELECT * FROM comparison_cases WHERE id=?",
+                    (int(existing_event["comparison_case_id"]),),
+                ).fetchone()
+                return row_to_dict(row), False
+
+            rows = conn.execute(
+                """
+                SELECT * FROM comparison_cases
+                WHERE camera_name=? AND control_sample=0
+                ORDER BY updated_at DESC
+                """,
+                (camera_name,),
+            ).fetchall()
+            case_row = None
+            for row in rows:
+                row_start = datetime.fromisoformat(str(row["started_at"])).timestamp()
+                row_end = datetime.fromisoformat(str(row["ended_at"])).timestamp()
+                if row_end >= search_start and row_start <= search_end:
+                    case_row = row
+                    break
+
+            if case_row is None:
+                board_score = confidence if source == "rv1106_face" else None
+                yolo_score = confidence if source == "nas_yolo11n" else None
+                cursor = conn.execute(
+                    """
+                    INSERT INTO comparison_cases(
+                        camera_name, started_at, ended_at, board_score, yolo_score,
+                        board_payload_json, yolo_payload_json, match_status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        camera_name,
+                        started_at,
+                        ended_at,
+                        board_score,
+                        yolo_score,
+                        payload_text if source == "rv1106_face" else None,
+                        payload_text if source == "nas_yolo11n" else None,
+                        self._comparison_status(board_score, yolo_score),
+                        now,
+                        now,
+                    ),
+                )
+                case_id = int(cursor.lastrowid)
+            else:
+                case_id = int(case_row["id"])
+                merged_start = min(start, datetime.fromisoformat(str(case_row["started_at"])))
+                merged_end = max(end, datetime.fromisoformat(str(case_row["ended_at"])))
+                board_score = (
+                    max(float(case_row["board_score"] or 0), confidence)
+                    if source == "rv1106_face"
+                    else case_row["board_score"]
+                )
+                yolo_score = (
+                    max(float(case_row["yolo_score"] or 0), confidence)
+                    if source == "nas_yolo11n"
+                    else case_row["yolo_score"]
+                )
+                conn.execute(
+                    """
+                    UPDATE comparison_cases
+                    SET started_at=?, ended_at=?, board_score=?, yolo_score=?,
+                        board_payload_json=COALESCE(?, board_payload_json),
+                        yolo_payload_json=COALESCE(?, yolo_payload_json),
+                        match_status=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        merged_start.isoformat(timespec="seconds"),
+                        merged_end.isoformat(timespec="seconds"),
+                        board_score,
+                        yolo_score,
+                        payload_text if source == "rv1106_face" else None,
+                        payload_text if source == "nas_yolo11n" else None,
+                        self._comparison_status(board_score, yolo_score),
+                        now,
+                        case_id,
+                    ),
+                )
+
+            conn.execute(
+                """
+                INSERT INTO detector_events(
+                    event_key, source, camera_name, started_at, ended_at,
+                    confidence, payload_json, comparison_case_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    source,
+                    camera_name,
+                    started_at,
+                    ended_at,
+                    confidence,
+                    payload_text,
+                    case_id,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM comparison_cases WHERE id=?", (case_id,)
+            ).fetchone()
+            return row_to_dict(row), True
 
     def upsert_segment(
         self,
@@ -319,6 +505,259 @@ class Database:
             ).fetchall()
             return [row_to_dict(row) for row in rows]
 
+    def find_segment_at(
+        self, *, stream_role: str, timestamp: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM segments
+                WHERE stream_role=? AND deleted_at IS NULL
+                  AND started_at <= ? AND ended_at > ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (stream_role, timestamp, timestamp),
+            ).fetchone()
+        return row_to_dict(row) if row else None
+
+    def get_comparison_case(self, case_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM comparison_cases WHERE id=?", (case_id,)
+            ).fetchone()
+        return self._decode_comparison_case(row_to_dict(row)) if row else None
+
+    def pending_board_cases(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM comparison_cases
+                WHERE control_sample=0 AND board_score IS NOT NULL AND moment_id IS NULL
+                ORDER BY started_at ASC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [self._decode_comparison_case(row_to_dict(row)) for row in rows]
+
+    def count_pending_board_cases(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM comparison_cases
+                WHERE control_sample=0 AND board_score IS NOT NULL AND moment_id IS NULL
+                """
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def attach_comparison_moment(
+        self, case_id: int, moment_id: int, source_low_segment_id: int
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE comparison_cases
+                SET moment_id=?, source_low_segment_id=?, updated_at=?
+                WHERE id=?
+                """,
+                (moment_id, source_low_segment_id, local_now_iso(), case_id),
+            )
+
+    def list_comparison_cases(
+        self, *, limit: int = 200, since_iso: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if since_iso:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM comparison_cases
+                    WHERE started_at >= ?
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (since_iso, max(1, limit)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM comparison_cases
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, limit),),
+                ).fetchall()
+        return [self._decode_comparison_case(row_to_dict(row)) for row in rows]
+
+    @staticmethod
+    def _decode_comparison_case(case: dict[str, Any]) -> dict[str, Any]:
+        for key in ("board_payload_json", "yolo_payload_json"):
+            raw = case.pop(key, None)
+            try:
+                case[key.removesuffix("_json")] = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                case[key.removesuffix("_json")] = None
+        case["control_sample"] = bool(case.get("control_sample"))
+        return case
+
+    def set_comparison_review(self, case_id: int, label: str) -> bool:
+        if label not in {"present", "false_positive", "uncertain", "unreviewed"}:
+            raise ValueError("invalid comparison review label")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE comparison_cases SET review_label=?, updated_at=? WHERE id=?",
+                (label, local_now_iso(), case_id),
+            )
+            return cursor.rowcount > 0
+
+    def comparison_metrics(self, *, since_iso: str | None = None) -> dict[str, Any]:
+        cases = self.list_comparison_cases(limit=10000, since_iso=since_iso)
+        detections = [case for case in cases if not case["control_sample"]]
+        controls = [case for case in cases if case["control_sample"]]
+        reviewed_positive = [case for case in detections if case["review_label"] == "present"]
+
+        def source_metrics(score_key: str) -> dict[str, Any]:
+            source_cases = [case for case in detections if case.get(score_key) is not None]
+            reviewed = [
+                case
+                for case in source_cases
+                if case["review_label"] in {"present", "false_positive"}
+            ]
+            true_hits = sum(case["review_label"] == "present" for case in reviewed)
+            relative_hits = sum(case.get(score_key) is not None for case in reviewed_positive)
+            return {
+                "hits": len(source_cases),
+                "reviewed": len(reviewed),
+                "confirmed": true_hits,
+                "precision": round(true_hits / len(reviewed), 4) if reviewed else None,
+                "relative_union_recall": (
+                    round(relative_hits / len(reviewed_positive), 4)
+                    if reviewed_positive
+                    else None
+                ),
+            }
+
+        reviewed_controls = [
+            case
+            for case in controls
+            if case["review_label"] in {"present", "false_positive"}
+        ]
+        missed_controls = sum(case["review_label"] == "present" for case in reviewed_controls)
+        status_counts = {
+            status: sum(case["match_status"] == status for case in detections)
+            for status in ("board_only", "yolo_only", "both")
+        }
+        return {
+            "cases": len(detections),
+            "reviewed_cases": sum(
+                case["review_label"] in {"present", "false_positive"}
+                for case in detections
+            ),
+            "status_counts": status_counts,
+            "board": source_metrics("board_score"),
+            "yolo": source_metrics("yolo_score"),
+            "controls": {
+                "total": len(controls),
+                "reviewed": len(reviewed_controls),
+                "daughter_present": missed_controls,
+                "common_miss_rate": (
+                    round(missed_controls / len(reviewed_controls), 4)
+                    if reviewed_controls
+                    else None
+                ),
+            },
+        }
+
+    def control_candidates_between(
+        self, *, start_iso: str, end_iso: str, limit: int
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.* FROM segments s
+                WHERE s.stream_role='low' AND s.deleted_at IS NULL
+                  AND s.started_at >= ? AND s.started_at < ?
+                  AND s.processed_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM comparison_cases c
+                      WHERE c.control_sample=0
+                        AND c.started_at < s.ended_at AND c.ended_at > s.started_at
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM comparison_cases c
+                      WHERE c.control_sample=1 AND c.source_low_segment_id=s.id
+                  )
+                ORDER BY RANDOM()
+                LIMIT ?
+                """,
+                (start_iso, end_iso, max(0, limit)),
+            ).fetchall()
+        return [row_to_dict(row) for row in rows]
+
+    def create_control_case(
+        self,
+        *,
+        segment_id: int,
+        camera_name: str,
+        started_at: str,
+        ended_at: str,
+    ) -> int:
+        now = local_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM comparison_cases
+                WHERE control_sample=1 AND source_low_segment_id=?
+                """,
+                (segment_id,),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+            cursor = conn.execute(
+                """
+                INSERT INTO comparison_cases(
+                    camera_name, started_at, ended_at, match_status,
+                    source_low_segment_id, control_sample, created_at, updated_at
+                ) VALUES (?, ?, ?, 'control', ?, 1, ?, ?)
+                """,
+                (camera_name, started_at, ended_at, segment_id, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def count_control_cases_between(self, start_iso: str, end_iso: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM comparison_cases
+                WHERE control_sample=1 AND started_at >= ? AND started_at < ?
+                """,
+                (start_iso, end_iso),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_comparison_case(self, case_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM comparison_cases WHERE id=?", (case_id,))
+
+    def set_control_clip_path(self, case_id: int, path: Path) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE comparison_cases SET control_clip_path=?, updated_at=? WHERE id=?",
+                (str(path), local_now_iso(), case_id),
+            )
+
+    def expired_control_cases(self, cutoff_iso: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM comparison_cases
+                WHERE control_sample=1 AND ended_at < ?
+                ORDER BY ended_at ASC
+                """,
+                (cutoff_iso,),
+            ).fetchall()
+        return [self._decode_comparison_case(row_to_dict(row)) for row in rows]
+
     def create_moment(
         self,
         *,
@@ -478,6 +917,14 @@ class Database:
 
     def delete_moment_by_clip(self, clip_path: str) -> None:
         with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM moments WHERE clip_path=?", (str(clip_path),)
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "DELETE FROM comparison_cases WHERE moment_id=?",
+                    (int(row["id"]),),
+                )
             conn.execute(
                 "DELETE FROM moments WHERE clip_path = ?", (str(clip_path),)
             )
@@ -518,6 +965,9 @@ class Database:
 
     def delete_moment_record(self, moment_id: int) -> None:
         with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM comparison_cases WHERE moment_id=?", (moment_id,)
+            )
             conn.execute("DELETE FROM moments WHERE id = ?", (moment_id,))
 
     def count_pending_segments(self, *, stream_role: str = "low") -> int:

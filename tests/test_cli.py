@@ -1,6 +1,6 @@
 from dataclasses import replace
 
-from nas_video_summarizer.cli import _person_filter_check, _redact_url
+from nas_video_summarizer.cli import _person_filter_check, _redact_url, build_checks
 from nas_video_summarizer.config import load_settings
 
 
@@ -43,3 +43,18 @@ def test_person_filter_check_explains_freebsd_venv_fix(monkeypatch):
     assert check.ok is False
     assert check.required is True
     assert "--system-site-packages" in check.detail
+
+
+def test_rv1106_backend_skips_nas_person_filter(monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        analysis_backend="rv1106",
+        person_filter_enabled=True,
+    )
+
+    check = _person_filter_check(settings)
+    backend = next(item for item in build_checks(settings) if item.name == "analysis backend")
+
+    assert check.ok is True
+    assert check.detail == "inactive in rv1106 mode"
+    assert backend.ok is True

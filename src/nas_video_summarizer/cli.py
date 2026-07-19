@@ -52,8 +52,9 @@ def _rtsp_credentials_check(settings: Settings) -> tuple[bool, str]:
 
 
 def _person_filter_check(settings: Settings) -> Check:
-    if not settings.person_filter_enabled:
-        return Check("person filter", True, "disabled", required=False)
+    if not settings.person_filter_enabled or settings.analysis_backend == "rv1106":
+        detail = "inactive in rv1106 mode" if settings.analysis_backend == "rv1106" else "disabled"
+        return Check("person filter", True, detail, required=False)
 
     try:
         detector = PersonFilter(
@@ -106,7 +107,7 @@ def build_checks(settings: Settings) -> list[Check]:
     return [
         Check(
             "analysis backend",
-            settings.analysis_backend in {"vlm", "daughter_detector"},
+            settings.analysis_backend in {"vlm", "daughter_detector", "rv1106"},
             settings.analysis_backend,
         ),
         Check(
@@ -161,6 +162,28 @@ def build_checks(settings: Settings) -> list[Check]:
             "database parent",
             settings.database_path.parent.exists(),
             str(settings.database_path.parent),
+        ),
+        Check(
+            "MQTT configuration",
+            not settings.mqtt_enabled
+            or (
+                bool(settings.mqtt_host)
+                and 0 < settings.mqtt_port < 65536
+                and bool(settings.mqtt_daughter_topic)
+                and (not settings.mqtt_password or bool(settings.mqtt_username))
+            ),
+            (
+                "disabled"
+                if not settings.mqtt_enabled
+                else f"{settings.mqtt_host}:{settings.mqtt_port} {settings.mqtt_daughter_topic}"
+            ),
+            required=settings.mqtt_enabled,
+        ),
+        Check(
+            "comparison directory",
+            _path_writable(settings.detector_comparison_dir),
+            str(settings.detector_comparison_dir),
+            required=settings.detector_comparison_enabled,
         ),
         _person_filter_check(settings),
         _daughter_detector_check(settings),

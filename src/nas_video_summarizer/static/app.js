@@ -1,5 +1,7 @@
 const statusGrid = document.querySelector("#status-grid");
 const momentsContainer = document.querySelector("#moments");
+const comparisonSummary = document.querySelector("#comparison-summary");
+const comparisonCases = document.querySelector("#comparison-cases");
 const refreshButton = document.querySelector("#refresh-button");
 
 function escapeHtml(value) {
@@ -49,6 +51,8 @@ function renderHealth(health) {
   const analyzer = workers.analyzer || {};
   const lowRecorder = workers.recorders?.low || {};
   const highRecorder = workers.recorders?.high || {};
+  const mqtt = workers.mqtt || {};
+  const comparison = workers.comparison || {};
 
   const cards = [
     {
@@ -97,6 +101,18 @@ function renderHealth(health) {
       value: "Nextcloud folder",
       meta: health.configured.output_dir,
     },
+    {
+      label: "MQTT",
+      value: mqtt.status || "unknown",
+      meta: mqtt.last_hit_at
+        ? `Last hit: ${formatDate(mqtt.last_hit_at)}`
+        : mqtt.message || `${health.configured.mqtt_host || ""}:${health.configured.mqtt_port || ""}`,
+    },
+    {
+      label: "Comparison",
+      value: comparison.status || "unknown",
+      meta: `${comparison.metrics?.cases || 0} detector cases`,
+    },
   ];
 
   statusGrid.innerHTML = cards
@@ -109,6 +125,51 @@ function renderHealth(health) {
         </article>
       `,
     )
+    .join("");
+}
+
+function percent(value) {
+  return value == null ? "—" : `${Math.round(value * 100)}%`;
+}
+
+function renderComparison(payload) {
+  const metrics = payload.metrics || {};
+  const board = metrics.board || {};
+  const yolo = metrics.yolo || {};
+  const controls = metrics.controls || {};
+  comparisonSummary.innerHTML = `
+    <article class="status-card"><span>RV1106</span><strong>${board.hits || 0} hits</strong><small>Precision ${percent(board.precision)} · Relative recall ${percent(board.relative_union_recall)}</small></article>
+    <article class="status-card"><span>NAS YOLO11n</span><strong>${yolo.hits || 0} hits</strong><small>Precision ${percent(yolo.precision)} · Relative recall ${percent(yolo.relative_union_recall)}</small></article>
+    <article class="status-card"><span>Agreement</span><strong>${metrics.status_counts?.both || 0} both</strong><small>${metrics.status_counts?.board_only || 0} board only · ${metrics.status_counts?.yolo_only || 0} YOLO only</small></article>
+    <article class="status-card"><span>Negative controls</span><strong>${controls.reviewed || 0}/${controls.total || 0} reviewed</strong><small>Common miss rate ${percent(controls.common_miss_rate)}</small></article>
+  `;
+
+  const cases = payload.cases || [];
+  if (!cases.length) {
+    comparisonCases.innerHTML = `<div class="empty-state"><h3>No comparison cases yet</h3><p>Cases appear after an RV1106 or NAS detector hit.</p></div>`;
+    return;
+  }
+  comparisonCases.innerHTML = cases
+    .map((item) => {
+      const source = item.control_sample ? "control" : item.match_status;
+      const video = item.video_url
+        ? `<video src="${item.video_url}" preload="metadata" controls></video>`
+        : `<div class="video-waiting">Video pending</div>`;
+      return `
+        <article class="moment-card comparison-card" data-id="${item.id}">
+          ${video}
+          <div class="moment-body">
+            <div class="moment-title-row"><h3>${escapeHtml(source)}</h3><span class="confidence">${escapeHtml(item.review_label)}</span></div>
+            <p>${escapeHtml(formatDate(item.started_at))}</p>
+            <div class="moment-meta"><span>Board ${item.board_score == null ? "—" : Number(item.board_score).toFixed(3)}</span><span>YOLO ${item.yolo_score == null ? "—" : Number(item.yolo_score).toFixed(3)}</span></div>
+            <div class="actions review-actions">
+              <button class="button secondary" data-review="present">Has daughter</button>
+              <button class="button danger" data-review="false_positive">False positive</button>
+              <button class="button secondary" data-review="uncertain">Uncertain</button>
+            </div>
+          </div>
+        </article>`;
+    })
     .join("");
 }
 
@@ -159,12 +220,14 @@ function renderMoments(moments) {
 async function loadAll() {
   refreshButton.disabled = true;
   try {
-    const [health, moments] = await Promise.all([
+    const [health, moments, comparison] = await Promise.all([
       fetchJson("/api/health"),
       fetchJson("/api/moments"),
+      fetchJson("/api/comparison"),
     ]);
     renderHealth(health);
     renderMoments(moments.moments || []);
+    renderComparison(comparison);
   } finally {
     refreshButton.disabled = false;
   }
@@ -192,6 +255,17 @@ momentsContainer.addEventListener("click", async (event) => {
     await fetchJson(`/api/moments/${id}`, { method: "DELETE" });
     await loadAll();
   }
+});
+
+comparisonCases.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-review]");
+  if (!button) return;
+  const card = button.closest(".comparison-card");
+  await fetchJson(`/api/comparison/${card.dataset.id}/review`, {
+    method: "POST",
+    body: JSON.stringify({ label: button.dataset.review }),
+  });
+  await loadAll();
 });
 
 refreshButton.addEventListener("click", loadAll);

@@ -79,6 +79,13 @@ def test_new_window_and_quota_defaults(monkeypatch):
     assert settings.daughter_body_height_ratio == 0.72
     assert settings.daughter_body_area_ratio == 0.5
     assert settings.moment_category_targets == "active:3,multi_person:3,quiet:2"
+    assert settings.mqtt_enabled is False
+    assert settings.mqtt_port == 1883
+    assert settings.mqtt_daughter_topic == "homecam/daughter/hit"
+    assert settings.detector_comparison_enabled is False
+    assert settings.detector_comparison_days == 7
+    assert settings.detector_control_samples_per_day == 6
+    assert settings.detector_comparison_dir == settings.data_dir / "detector_comparison"
 
 
 def test_env_overrides_window_and_quota():

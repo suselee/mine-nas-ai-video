@@ -35,6 +35,7 @@ from .ffmpeg_tools import (
     segment_time_window,
 )
 from .llm import AnalysisResult, DaughterVerification, LlamaAnalyzer
+from .mqtt import MQTTSubscriber, decode_json_payload
 
 
 class PersonFilterSkip(Exception):
@@ -290,6 +291,8 @@ class Supervisor:
         self.tasks: list[asyncio.Task[None]] = []
         self._llama_timeout_count = 0
         self._llama_circuit_open_until: datetime | None = None
+        self._last_board_saved_at: str | None = None
+        self._last_board_moment_id: int | None = None
         self.state: dict[str, Any] = {
             "started_at": utc_now_iso(),
             "recorders": {
@@ -300,6 +303,8 @@ class Supervisor:
             "prefilter": {"status": "not-started"},
             "stream_alignment": {"status": "unknown"},
             "analyzer": {"status": "not-started"},
+            "mqtt": {"status": "not-started"},
+            "comparison": {"status": "not-started"},
             "cleanup": {"status": "not-started"},
             "day_archive": {"status": "not-started"},
         }
@@ -313,6 +318,13 @@ class Supervisor:
         self.tasks.append(asyncio.create_task(self._cleanup_loop(), name="buffer-cleanup"))
         self.tasks.append(asyncio.create_task(self._analyzer_loop(), name="segment-analyzer"))
         self.tasks.append(asyncio.create_task(self._day_archive_loop(), name="day-archive"))
+        self.tasks.append(
+            asyncio.create_task(self._comparison_loop(), name="detector-comparison")
+        )
+        if self.settings.mqtt_enabled:
+            self.tasks.append(asyncio.create_task(self._mqtt_loop(), name="mqtt-subscriber"))
+        else:
+            self.state["mqtt"] = {"status": "disabled", "reason": "MQTT_ENABLED=false"}
 
         low_rtsp_url = self.settings.rtsp_low_url_for_ffmpeg
         high_rtsp_url = self.settings.rtsp_high_url_for_ffmpeg
@@ -352,6 +364,319 @@ class Supervisor:
         except Exception:
             # Worker error reporting must never terminate the worker itself.
             pass
+
+    def _set_mqtt_state(self, state: dict[str, Any]) -> None:
+        self.state["mqtt"] = {**state, "updated_at": utc_now_iso()}
+
+    def _comparison_since_iso(self) -> str:
+        return (
+            _now() - timedelta(days=max(1, self.settings.detector_comparison_days))
+        ).isoformat(timespec="seconds")
+
+    async def _mqtt_loop(self) -> None:
+        subscriber = MQTTSubscriber(
+            host=self.settings.mqtt_host,
+            port=self.settings.mqtt_port,
+            client_id=self.settings.mqtt_client_id,
+            topic=self.settings.mqtt_daughter_topic,
+            username=self.settings.mqtt_username,
+            password=self.settings.mqtt_password,
+            keepalive_seconds=self.settings.mqtt_keepalive_seconds,
+        )
+        await subscriber.run(
+            self._handle_mqtt_message, self._set_mqtt_state, self.stop_event
+        )
+
+    async def _handle_mqtt_message(self, topic: str, raw_payload: bytes) -> None:
+        if topic != self.settings.mqtt_daughter_topic:
+            return
+        try:
+            payload = decode_json_payload(raw_payload)
+            timestamp = float(payload["ts"])
+            score = max(0.0, min(1.0, float(payload["score"])))
+            camera_id = str(payload.get("camera_id") or self.settings.camera_name)
+            sequence = str(payload.get("seq", ""))
+            event_time = datetime.fromtimestamp(timestamp).astimezone()
+            event_end = event_time + timedelta(seconds=1)
+            event_key = (
+                f"rv1106:{camera_id}:{timestamp:.3f}:{sequence}:"
+                f"{json.dumps(payload.get('box'), separators=(',', ':'))}"
+            )
+            case, inserted = await asyncio.to_thread(
+                self.database.record_detector_event,
+                event_key=event_key,
+                source="rv1106_face",
+                camera_name=camera_id,
+                started_at=event_time.isoformat(timespec="milliseconds"),
+                ended_at=event_end.isoformat(timespec="milliseconds"),
+                confidence=score,
+                payload=payload,
+                merge_gap_seconds=self.settings.mqtt_event_merge_gap_seconds,
+            )
+            now = _now()
+            self.state["mqtt"] = {
+                "status": "connected",
+                "host": self.settings.mqtt_host,
+                "port": self.settings.mqtt_port,
+                "last_topic": topic,
+                "last_hit_at": event_time.isoformat(timespec="seconds"),
+                "last_case_id": int(case["id"]),
+                "event_lag_seconds": round(max(0.0, (now - event_time).total_seconds()), 3),
+                "duplicate": not inserted,
+                "updated_at": utc_now_iso(),
+            }
+            if inserted:
+                self._safe_add_event(
+                    "edge-daughter-hit",
+                    json.dumps(
+                        {
+                            "case_id": int(case["id"]),
+                            "camera_id": camera_id,
+                            "score": score,
+                            "ts": timestamp,
+                            "seq": payload.get("seq"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+        except Exception as exc:
+            self._safe_add_event("mqtt-message-error", str(exc))
+            self.state["mqtt"] = {
+                **self.state.get("mqtt", {}),
+                "status": "message-error",
+                "message": str(exc),
+                "updated_at": utc_now_iso(),
+            }
+
+    async def _comparison_loop(self) -> None:
+        if not self.settings.detector_comparison_enabled:
+            self.state["comparison"] = {
+                "status": "disabled",
+                "reason": "DETECTOR_COMPARISON_ENABLED=false",
+            }
+            return
+        while not self.stop_event.is_set():
+            try:
+                saved = await self._process_pending_board_cases()
+                controls = await self._ensure_yesterday_control_samples()
+                expired_controls = await self._cleanup_expired_control_samples()
+                metrics = await asyncio.to_thread(
+                    self.database.comparison_metrics,
+                    since_iso=self._comparison_since_iso(),
+                )
+                pending_board = await asyncio.to_thread(
+                    self.database.count_pending_board_cases
+                )
+                self.state["comparison"] = {
+                    "status": "ok",
+                    "saved_board_cases": saved,
+                    "new_control_samples": controls,
+                    "expired_control_samples": expired_controls,
+                    "metrics": metrics,
+                    "pending_board_cases": pending_board,
+                    "last_board_saved_at": self._last_board_saved_at,
+                    "last_board_moment_id": self._last_board_moment_id,
+                    "updated_at": utc_now_iso(),
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.state["comparison"] = {
+                    "status": "error",
+                    "message": str(exc),
+                    "updated_at": utc_now_iso(),
+                }
+                self._safe_add_event("comparison-error", str(exc))
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _process_pending_board_cases(self) -> int:
+        cases = await asyncio.to_thread(self.database.pending_board_cases, limit=20)
+        saved = 0
+        for case in cases:
+            event_time = _parse_iso(str(case["started_at"]))
+            wanted_end = _parse_iso(str(case["ended_at"])) + timedelta(
+                seconds=self.settings.context_after_seconds
+            )
+            segment = await asyncio.to_thread(
+                self.database.find_segment_at,
+                stream_role="low",
+                timestamp=event_time.isoformat(timespec="seconds"),
+            )
+            if not segment or not Path(segment["path"]).exists():
+                continue
+            high_segments = await asyncio.to_thread(
+                self.database.find_segments_between,
+                stream_role="high",
+                started_before=wanted_end.isoformat(timespec="seconds"),
+                ended_after=event_time.isoformat(timespec="seconds"),
+            )
+            if not high_segments or max(
+                _parse_iso(str(row["ended_at"])) for row in high_segments
+            ) < wanted_end:
+                continue
+            source_start = _parse_iso(str(segment["started_at"]))
+            start_offset = max(0, int((event_time - source_start).total_seconds()))
+            end_offset = max(
+                start_offset + 1,
+                int((_parse_iso(str(case["ended_at"])) - source_start).total_seconds()),
+            )
+            score = float(case["board_score"] or 0)
+            result = ClipCandidate(
+                keep=True,
+                title="Daughter recognized by RV1106",
+                summary="开发板通过人脸特征比对识别到女儿出现在画面中。",
+                tags=["daughter", "rv1106", "face_identity"],
+                confidence=score,
+                start_offset_seconds=start_offset,
+                end_offset_seconds=end_offset,
+                raw={
+                    "comparison_case_id": int(case["id"]),
+                    "board": case.get("board_payload"),
+                    "trigger_sources": [
+                        source
+                        for source, value in (
+                            ("rv1106_face", case.get("board_score")),
+                            ("nas_yolo11n", case.get("yolo_score")),
+                        )
+                        if value is not None
+                    ],
+                },
+                local_child_confirmed=True,
+                local_child_score=score,
+                analysis_backend="rv1106_face",
+                category="face_identity",
+                selection_score=score,
+            )
+            moment_id = await self._save_moment(
+                segment, result, analyzer=None, detector=None
+            )
+            if moment_id >= 0:
+                await asyncio.to_thread(
+                    self.database.attach_comparison_moment,
+                    int(case["id"]),
+                    moment_id,
+                    int(segment["id"]),
+                )
+                self._refresh_comparison_metadata(int(case["id"]), moment_id)
+                self._safe_add_event(
+                    "moment", f"saved edge-triggered moment {moment_id}"
+                )
+                self._last_board_saved_at = utc_now_iso()
+                self._last_board_moment_id = moment_id
+                saved += 1
+        return saved
+
+    def _refresh_comparison_metadata(self, case_id: int, moment_id: int) -> None:
+        case = self.database.get_comparison_case(case_id)
+        moment = self.database.get_moment(moment_id)
+        if not case or not moment:
+            return
+        path = Path(str(moment["metadata_path"]))
+        try:
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        metadata["detector_comparison"] = {
+            "case_id": case_id,
+            "match_status": case["match_status"],
+            "board_score": case.get("board_score"),
+            "yolo_score": case.get("yolo_score"),
+            "trigger_sources": [
+                source
+                for source, value in (
+                    ("rv1106_face", case.get("board_score")),
+                    ("nas_yolo11n", case.get("yolo_score")),
+                )
+                if value is not None
+            ],
+        }
+        path.write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    async def _ensure_yesterday_control_samples(self) -> int:
+        target = max(0, self.settings.detector_control_samples_per_day)
+        if target == 0 or not ffmpeg_available(self.settings):
+            return 0
+        now = _now()
+        day = (now - timedelta(days=1)).date()
+        day_start = datetime.combine(day, datetime.min.time(), tzinfo=now.tzinfo)
+        day_end = day_start + timedelta(days=1)
+        start_iso = day_start.isoformat(timespec="seconds")
+        end_iso = day_end.isoformat(timespec="seconds")
+        existing = await asyncio.to_thread(
+            self.database.count_control_cases_between, start_iso, end_iso
+        )
+        needed = max(0, target - existing)
+        if needed == 0:
+            return 0
+        segments = await asyncio.to_thread(
+            self.database.control_candidates_between,
+            start_iso=start_iso,
+            end_iso=end_iso,
+            limit=needed,
+        )
+        created = 0
+        duration = max(5, self.settings.detector_control_clip_seconds)
+        for segment in segments:
+            source_duration = max(1, int(float(segment["duration_seconds"])))
+            clip_duration = min(duration, source_duration)
+            available = max(0, source_duration - clip_duration)
+            start_offset = int(segment["id"]) % (available + 1) if available else 0
+            clip_start = _parse_iso(str(segment["started_at"])) + timedelta(
+                seconds=start_offset
+            )
+            clip_end = clip_start + timedelta(seconds=clip_duration)
+            case_id = await asyncio.to_thread(
+                self.database.create_control_case,
+                segment_id=int(segment["id"]),
+                camera_name=str(segment["camera_name"]),
+                started_at=clip_start.isoformat(timespec="seconds"),
+                ended_at=clip_end.isoformat(timespec="seconds"),
+            )
+            output_path = (
+                self.settings.detector_comparison_dir
+                / day.isoformat()
+                / f"control-{case_id}.mp4"
+            )
+            try:
+                await extract_clip(
+                    self.settings,
+                    [Path(str(segment["path"]))],
+                    output_path,
+                    start_offset_seconds=start_offset,
+                    duration_seconds=clip_duration,
+                )
+                await asyncio.to_thread(
+                    self.database.set_control_clip_path, case_id, output_path
+                )
+                created += 1
+            except Exception:
+                output_path.unlink(missing_ok=True)
+                await asyncio.to_thread(
+                    self.database.delete_comparison_case, case_id
+                )
+                raise
+        return created
+
+    async def _cleanup_expired_control_samples(self) -> int:
+        cutoff = self._comparison_since_iso()
+        cases = await asyncio.to_thread(
+            self.database.expired_control_cases, cutoff
+        )
+        removed = 0
+        for case in cases:
+            path_text = case.get("control_clip_path")
+            if path_text:
+                Path(str(path_text)).unlink(missing_ok=True)
+            await asyncio.to_thread(
+                self.database.delete_comparison_case, int(case["id"])
+            )
+            removed += 1
+        return removed
 
     async def _recorder_loop(self, role: str, rtsp_url: str) -> None:
         while not self.stop_event.is_set():
@@ -706,7 +1031,7 @@ class Supervisor:
                 self.state["analyzer"] = {"status": "disabled", "reason": "ANALYSIS_ENABLED=false"}
                 await asyncio.sleep(self.settings.analysis_interval_seconds)
                 continue
-            if backend != "daughter_detector" and not _in_analysis_window(
+            if backend not in {"daughter_detector", "rv1106"} and not _in_analysis_window(
                 _now(),
                 self.settings.analysis_window_start,
                 self.settings.analysis_window_end,
@@ -774,6 +1099,16 @@ class Supervisor:
                 "segment": segment["path"],
                 "updated_at": utc_now_iso(),
             }
+            if backend == "rv1106":
+                self.database.mark_segment_processed(int(segment["id"]))
+                self.state["analyzer"] = {
+                    "status": "edge-only",
+                    "last_segment": segment["path"],
+                    "last_keep": False,
+                    "backend": backend,
+                    "updated_at": utc_now_iso(),
+                }
+                continue
             try:
                 if backend == "vlm":
                     assert analyzer is not None
@@ -793,6 +1128,16 @@ class Supervisor:
                         else self.settings.moment_keep_threshold
                     )
                     should_save = result.should_save(keep_threshold)
+                    if (
+                        should_save
+                        and self.settings.detector_comparison_enabled
+                        and result.analysis_backend == "daughter_detector"
+                    ):
+                        moment_id = await self._handle_yolo_comparison_candidate(
+                            segment, result, detector
+                        )
+                        saved_any = saved_any or moment_id >= 0
+                        continue
                     if result.keep_consistency_repaired(
                         self.settings.moment_keep_threshold
                     ):
@@ -897,6 +1242,56 @@ class Supervisor:
             finally:
                 if self.settings.analysis_cooldown_seconds > 0:
                     await asyncio.sleep(self.settings.analysis_cooldown_seconds)
+
+    async def _handle_yolo_comparison_candidate(
+        self,
+        segment: dict[str, Any],
+        result: ClipCandidate,
+        detector: DaughterDetector | None,
+    ) -> int:
+        source_start = _parse_iso(str(segment["started_at"]))
+        started = source_start + timedelta(seconds=result.start_offset_seconds)
+        ended = source_start + timedelta(seconds=result.end_offset_seconds)
+        event_key = (
+            f"nas-yolo:{segment['id']}:{result.start_offset_seconds}:"
+            f"{result.end_offset_seconds}:{result.category}"
+        )
+        payload = {
+            "segment_id": int(segment["id"]),
+            "category": result.category,
+            "selection_score": result.effective_selection_score,
+            "raw": result.raw,
+        }
+        case, _ = await asyncio.to_thread(
+            self.database.record_detector_event,
+            event_key=event_key,
+            source="nas_yolo11n",
+            camera_name=str(segment["camera_name"]),
+            started_at=started.isoformat(timespec="seconds"),
+            ended_at=ended.isoformat(timespec="seconds"),
+            confidence=result.confidence,
+            payload=payload,
+            merge_gap_seconds=self.settings.mqtt_event_merge_gap_seconds,
+        )
+        existing_moment = case.get("moment_id")
+        if existing_moment is not None:
+            self._refresh_comparison_metadata(int(case["id"]), int(existing_moment))
+            return int(existing_moment)
+        moment_id = await self._save_moment(
+            segment, result, analyzer=None, detector=detector
+        )
+        if moment_id >= 0:
+            await asyncio.to_thread(
+                self.database.attach_comparison_moment,
+                int(case["id"]),
+                moment_id,
+                int(segment["id"]),
+            )
+            self._refresh_comparison_metadata(int(case["id"]), moment_id)
+            self._safe_add_event(
+                "moment", f"saved comparison moment {moment_id}: {result.title}"
+            )
+        return moment_id
 
     async def _analyze_segment(self, analyzer: LlamaAnalyzer, segment: dict[str, Any]) -> AnalysisResult:
         with tempfile.TemporaryDirectory(prefix="nas-video-frames-") as temp_dir:
@@ -1154,6 +1549,11 @@ class Supervisor:
                 verified_final = await self._verify_detector_saved_clip(
                     detector, staged_clip_path, duration_seconds
                 )
+            elif result.analysis_backend == "rv1106_face":
+                # The comparison must measure the board independently. Running
+                # the NAS detector here would turn a board-only hit into a NAS
+                # detector decision and bias the result.
+                verified_final = True
             else:
                 assert analyzer is not None
                 verified_final = await self._verify_saved_clip(
@@ -1545,6 +1945,13 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "daughter_event_max_gap_seconds": settings.daughter_event_max_gap_seconds,
             "daughter_event_min_seconds": settings.daughter_event_min_seconds,
             "moment_category_targets": settings.moment_category_targets,
+            "mqtt_enabled": settings.mqtt_enabled,
+            "mqtt_host": settings.mqtt_host,
+            "mqtt_port": settings.mqtt_port,
+            "mqtt_daughter_topic": settings.mqtt_daughter_topic,
+            "detector_comparison_enabled": settings.detector_comparison_enabled,
+            "detector_comparison_days": settings.detector_comparison_days,
+            "detector_control_samples_per_day": settings.detector_control_samples_per_day,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
             "llama_analysis_temperature": settings.llama_analysis_temperature,

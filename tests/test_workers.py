@@ -795,6 +795,52 @@ def test_final_source_verification_fails_closed(tmp_path, monkeypatch):
     assert not list((tmp_path / "output").rglob("*.mp4"))
 
 
+def test_rv1106_moment_is_not_rejected_by_nas_detector(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        analysis_stream_role="high",
+        output_dir=tmp_path / "output",
+    )
+    database = Database(tmp_path / "edge.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    segment_path = tmp_path / "segment.mp4"
+    segment_path.write_bytes(b"source")
+    segment_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="high",
+        path=segment_path,
+        started_at="2026-07-15T08:34:15+08:00",
+        ended_at="2026-07-15T08:36:15+08:00",
+        duration_seconds=120,
+        size_bytes=6,
+    )
+    segment = {
+        "id": segment_id,
+        "camera_name": "home-camera",
+        "path": str(segment_path),
+        "started_at": "2026-07-15T08:34:15+08:00",
+        "ended_at": "2026-07-15T08:36:15+08:00",
+    }
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        output_path.write_bytes(b"edge-source")
+
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    result = replace(
+        _result(0.8),
+        analysis_backend="rv1106_face",
+        local_child_confirmed=True,
+    )
+
+    moment_id = asyncio.run(
+        supervisor._save_moment(segment, result, analyzer=None, detector=None)
+    )
+
+    assert moment_id > 0
+    assert next((tmp_path / "output").rglob("*.mp4")).read_bytes() == b"edge-source"
+
+
 def test_published_clip_uses_camera_offset_and_final_source(tmp_path, monkeypatch):
     settings = replace(
         load_settings("/nonexistent.env"),
@@ -847,3 +893,105 @@ def test_published_clip_uses_camera_offset_and_final_source(tmp_path, monkeypatc
     metadata = json.loads(clip.with_suffix(".json").read_text())
     assert metadata["clip_start"] == "2026-07-15T08:33:51+08:00"
     assert clip.read_bytes() == b"verified-source"
+
+
+def test_mqtt_hit_is_persisted_and_duplicate_is_ignored(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        mqtt_enabled=True,
+        mqtt_daughter_topic="homecam/daughter/hit",
+        detector_comparison_enabled=True,
+    )
+    database = Database(tmp_path / "mqtt.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    payload = json.dumps(
+        {
+            "ts": datetime.fromisoformat("2026-07-19T10:00:00+08:00").timestamp(),
+            "score": 0.73,
+            "camera_id": "home-camera",
+            "box": [1, 2, 3, 4],
+            "seq": 9,
+        }
+    ).encode()
+
+    asyncio.run(supervisor._handle_mqtt_message("homecam/daughter/hit", payload))
+    asyncio.run(supervisor._handle_mqtt_message("homecam/daughter/hit", payload))
+
+    cases = database.list_comparison_cases()
+    assert len(cases) == 1
+    assert cases[0]["match_status"] == "board_only"
+    assert cases[0]["board_score"] == 0.73
+    assert supervisor.state["mqtt"]["duplicate"] is True
+
+
+def test_pending_board_case_waits_for_indexed_segments(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"), detector_comparison_enabled=True
+    )
+    database = Database(tmp_path / "pending-board.sqlite3")
+    database.migrate()
+    database.record_detector_event(
+        event_key="board:pending",
+        source="rv1106_face",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:00:01+08:00",
+        confidence=0.8,
+        payload={},
+        merge_gap_seconds=15,
+    )
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+
+    saved = asyncio.run(supervisor._process_pending_board_cases())
+
+    assert saved == 0
+    assert database.count_pending_board_cases() == 1
+
+
+def test_rv1106_backend_finalizes_segments_without_detector(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        analysis_backend="rv1106",
+        analysis_delay_seconds=0,
+        analysis_interval_seconds=1,
+    )
+    database = Database(tmp_path / "edge-only.sqlite3")
+    database.migrate()
+    segment_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="low",
+        path=tmp_path / "low.mp4",
+        started_at="2026-07-18T10:00:00+08:00",
+        ended_at="2026-07-18T10:02:00+08:00",
+        duration_seconds=120,
+        size_bytes=100,
+    )
+    supervisor = Supervisor(settings, database)
+
+    async def stop_after_idle(seconds):
+        supervisor.stop_event.set()
+
+    monkeypatch.setattr("nas_video_summarizer.workers.ffmpeg_available", lambda settings: True)
+    monkeypatch.setattr(asyncio, "sleep", stop_after_idle)
+
+    asyncio.run(supervisor._analyzer_loop())
+
+    with database.connect() as conn:
+        row = conn.execute(
+            "SELECT processed_at, analysis_attempts FROM segments WHERE id=?",
+            (segment_id,),
+        ).fetchone()
+    assert row["processed_at"] is not None
+    assert row["analysis_attempts"] == 0
+    assert supervisor.state["analyzer"]["status"] == "idle"
