@@ -65,6 +65,9 @@ h2 {
 }
 
 .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 40px;
   border: 1px solid var(--accent);
   border-radius: 8px;
@@ -74,6 +77,7 @@ h2 {
   font: inherit;
   font-weight: 650;
   cursor: pointer;
+  text-decoration: none;
 }
 
 .button:hover {
@@ -112,15 +116,6 @@ h2 {
 
 .comparison-cases {
   margin-bottom: 32px;
-}
-
-.video-waiting {
-  display: grid;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  place-items: center;
-  background: #e8ece9;
-  color: var(--muted);
 }
 
 .review-actions {
@@ -174,13 +169,6 @@ h2 {
 .moment-card {
   min-width: 0;
   overflow: hidden;
-}
-
-.moment-card video {
-  display: block;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  background: #111716;
 }
 
 .moment-body {
@@ -255,6 +243,11 @@ h2 {
 
 .actions {
   justify-content: flex-end;
+}
+
+.clip-pending {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .empty-state {

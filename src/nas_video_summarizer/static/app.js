@@ -165,17 +165,17 @@ function renderComparison(payload) {
   comparisonCases.innerHTML = cases
     .map((item) => {
       const source = item.control_sample ? "control" : item.match_status;
-      const video = item.video_url
-        ? `<video src="${item.video_url}" preload="metadata" controls></video>`
-        : `<div class="video-waiting">Video pending</div>`;
+      const download = item.download_url
+        ? `<a class="button secondary" href="${item.download_url}" download>Download clip</a>`
+        : `<span class="clip-pending">Clip pending</span>`;
       return `
         <article class="moment-card comparison-card" data-id="${item.id}">
-          ${video}
           <div class="moment-body">
             <div class="moment-title-row"><h3>${escapeHtml(source)}</h3><span class="confidence">${escapeHtml(item.review_label)}</span></div>
             <p>${escapeHtml(formatDate(item.started_at))}</p>
             <div class="moment-meta"><span>Board ${item.board_score == null ? "—" : Number(item.board_score).toFixed(3)}</span><span>${escapeHtml(item.board_identity || "legacy")}</span><span>${escapeHtml(item.board_event_state || "hit")}</span><span>YOLO ${item.yolo_score == null ? "—" : Number(item.yolo_score).toFixed(3)}</span></div>
             <div class="actions review-actions">
+              ${download}
               <button class="button secondary" data-review="present">Has daughter</button>
               <button class="button danger" data-review="false_positive">False positive</button>
               <button class="button secondary" data-review="uncertain">Uncertain</button>
@@ -204,7 +204,6 @@ function renderMoments(moments) {
         .join("");
       return `
         <article class="moment-card" data-id="${moment.id}" data-favorited="${moment.favorited}">
-          <video src="${moment.video_url}" preload="metadata" controls></video>
           <div class="moment-body">
             <div class="moment-title-row">
               <h3>${escapeHtml(moment.title)}</h3>
@@ -218,6 +217,7 @@ function renderMoments(moments) {
               <span>${escapeHtml(moment.category || moment.analysis_backend || "vlm")}</span>
             </div>
             <div class="actions">
+              <a class="button secondary" href="${moment.download_url}" download>Download clip</a>
               <button class="button secondary" data-action="favorite">${
                 moment.favorited ? "Unfavorite" : "Favorite"
               }</button>

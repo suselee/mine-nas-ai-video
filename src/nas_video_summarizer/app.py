@@ -54,7 +54,7 @@ def _html_shell() -> str:
           <section class="section-header">
             <div>
               <h2>Saved Moments</h2>
-              <p>Automatically saved clips from the 4K stream.</p>
+              <p>Automatically saved 4K clips. Download them for local playback in VLC.</p>
             </div>
           </section>
 
@@ -156,6 +156,13 @@ def _comparison_id_from_path(path: str, suffix: str = "") -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+def _moment_api_payload(database: Database, limit: int) -> list[dict[str, Any]]:
+    moments = database.list_moments(limit=max(1, min(limit, 500)))
+    for moment in moments:
+        moment["download_url"] = f"/api/moments/{moment['id']}/download"
+    return moments
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "NASVideo/0.1"
     state: AppState
@@ -169,14 +176,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_static(path, include_body=False)
             return
 
-        moment_id = _moment_id_from_path(path, "/video")
+        moment_id = _moment_id_from_path(path, "/download")
         if moment_id is not None:
-            self._send_moment_video(moment_id, include_body=False)
+            self._send_moment_download(moment_id, include_body=False)
             return
 
-        comparison_id = _comparison_id_from_path(path, "/video")
+        comparison_id = _comparison_id_from_path(path, "/download")
         if comparison_id is not None:
-            self._send_comparison_video(comparison_id, include_body=False)
+            self._send_comparison_download(comparison_id, include_body=False)
             return
 
         self._send_error_json(HTTPStatus.NOT_FOUND, "not found", include_body=False)
@@ -195,15 +202,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/moments":
             query = parse_qs(parsed.query)
-            limit = int(query.get("limit", ["200"])[0])
-            moments = self.state.database.list_moments(limit=max(1, min(limit, 500)))
-            for moment in moments:
-                moment["video_url"] = f"/api/moments/{moment['id']}/video"
+            limit = int(query.get("limit", ["100"])[0])
+            moments = _moment_api_payload(self.state.database, limit)
             self._send_json({"moments": moments})
             return
         if path == "/api/comparison":
             query = parse_qs(parsed.query)
-            limit = int(query.get("limit", ["200"])[0])
+            limit = int(query.get("limit", ["100"])[0])
             since_iso = (
                 datetime.now().astimezone()
                 - timedelta(days=max(1, self.state.settings.detector_comparison_days))
@@ -213,7 +218,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             for case in cases:
                 if case.get("moment_id") or case.get("control_clip_path"):
-                    case["video_url"] = f"/api/comparison/{case['id']}/video"
+                    case["download_url"] = f"/api/comparison/{case['id']}/download"
             self._send_json(
                 {
                     "cases": cases,
@@ -224,14 +229,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        moment_id = _moment_id_from_path(path, "/video")
+        moment_id = _moment_id_from_path(path, "/download")
         if moment_id is not None:
-            self._send_moment_video(moment_id)
+            self._send_moment_download(moment_id)
             return
 
-        comparison_id = _comparison_id_from_path(path, "/video")
+        comparison_id = _comparison_id_from_path(path, "/download")
         if comparison_id is not None:
-            self._send_comparison_video(comparison_id)
+            self._send_comparison_download(comparison_id)
             return
 
         self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
@@ -345,7 +350,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
         self._send_file(file_path, content_type, include_body=include_body)
 
-    def _send_moment_video(self, moment_id: int, *, include_body: bool = True) -> None:
+    def _send_moment_download(self, moment_id: int, *, include_body: bool = True) -> None:
         moment = self.state.database.get_moment(moment_id)
         if not moment:
             self._send_error_json(HTTPStatus.NOT_FOUND, "moment not found", include_body=include_body)
@@ -354,9 +359,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not clip_path.exists():
             self._send_error_json(HTTPStatus.NOT_FOUND, "clip file not found", include_body=include_body)
             return
-        self._send_file(clip_path, "video/mp4", allow_range=True, include_body=include_body)
+        self._send_file(
+            clip_path,
+            "application/octet-stream",
+            include_body=include_body,
+            download_name=clip_path.name,
+        )
 
-    def _send_comparison_video(
+    def _send_comparison_download(
         self, comparison_id: int, *, include_body: bool = True
     ) -> None:
         case = self.state.database.get_comparison_case(comparison_id)
@@ -374,11 +384,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             clip_path = Path(str(case["control_clip_path"]))
         if clip_path is None or not clip_path.exists():
             self._send_error_json(
-                HTTPStatus.NOT_FOUND, "comparison video not ready", include_body=include_body
+                HTTPStatus.NOT_FOUND, "comparison clip not ready", include_body=include_body
             )
             return
         self._send_file(
-            clip_path, "video/mp4", allow_range=True, include_body=include_body
+            clip_path,
+            "application/octet-stream",
+            include_body=include_body,
+            download_name=clip_path.name,
         )
 
     def _send_file(
@@ -388,6 +401,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         *,
         allow_range: bool = False,
         include_body: bool = True,
+        download_name: str | None = None,
     ) -> None:
         size = path.stat().st_size
         start = 0
@@ -414,6 +428,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status.value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
+        if download_name:
+            safe_name = download_name.replace('"', "").replace("\r", "").replace("\n", "")
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{safe_name}"'
+            )
         if allow_range:
             self.send_header("Accept-Ranges", "bytes")
         if status == HTTPStatus.PARTIAL_CONTENT:
