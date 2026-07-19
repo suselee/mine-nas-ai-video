@@ -304,6 +304,7 @@ class Supervisor:
             "stream_alignment": {"status": "unknown"},
             "analyzer": {"status": "not-started"},
             "mqtt": {"status": "not-started"},
+            "rv1106": {"status": "not-started"},
             "comparison": {"status": "not-started"},
             "cleanup": {"status": "not-started"},
             "day_archive": {"status": "not-started"},
@@ -378,7 +379,14 @@ class Supervisor:
             host=self.settings.mqtt_host,
             port=self.settings.mqtt_port,
             client_id=self.settings.mqtt_client_id,
-            topic=self.settings.mqtt_daughter_topic,
+            topic=tuple(
+                topic
+                for topic in (
+                    self.settings.mqtt_daughter_topic,
+                    self.settings.mqtt_status_topic,
+                )
+                if topic
+            ),
             username=self.settings.mqtt_username,
             password=self.settings.mqtt_password,
             keepalive_seconds=self.settings.mqtt_keepalive_seconds,
@@ -388,6 +396,17 @@ class Supervisor:
         )
 
     async def _handle_mqtt_message(self, topic: str, raw_payload: bytes) -> None:
+        if topic == self.settings.mqtt_status_topic:
+            try:
+                payload = decode_json_payload(raw_payload)
+                self.state["rv1106"] = {
+                    "status": "online",
+                    **payload,
+                    "updated_at": utc_now_iso(),
+                }
+            except Exception as exc:
+                self._safe_add_event("mqtt-status-error", str(exc))
+            return
         if topic != self.settings.mqtt_daughter_topic:
             return
         try:
@@ -396,16 +415,35 @@ class Supervisor:
             score = max(0.0, min(1.0, float(payload["score"])))
             camera_id = str(payload.get("camera_id") or self.settings.camera_name)
             sequence = str(payload.get("seq", ""))
-            event_time = datetime.fromtimestamp(timestamp).astimezone()
-            event_end = event_time + timedelta(seconds=1)
+            event_state = str(payload.get("event") or "hit").strip().lower()
+            identity = str(payload.get("identity") or "confirmed").strip().lower()
+            if identity == "probable" and not self.settings.rv1106_accept_probable:
+                self.state["mqtt"] = {
+                    **self.state.get("mqtt", {}),
+                    "status": "connected",
+                    "last_ignored_identity": identity,
+                    "updated_at": utc_now_iso(),
+                }
+                return
+            session_id = str(payload.get("session_id") or "").strip()
+            try:
+                session_start = float(payload.get("session_start_ts", timestamp))
+            except (TypeError, ValueError):
+                session_start = timestamp
+            event_time = datetime.fromtimestamp(session_start).astimezone()
+            event_end = datetime.fromtimestamp(timestamp).astimezone()
+            if event_end <= event_time:
+                event_end = event_time + timedelta(seconds=1)
+            session_token = session_id or f"{timestamp:.3f}"
             event_key = (
-                f"rv1106:{camera_id}:{timestamp:.3f}:{sequence}:"
+                f"rv1106:{camera_id}:{session_token}:"
+                f"{event_state}:{timestamp:.3f}:{sequence}:"
                 f"{json.dumps(payload.get('box'), separators=(',', ':'))}"
             )
             case, inserted = await asyncio.to_thread(
                 self.database.record_detector_event,
                 event_key=event_key,
-                source="rv1106_face",
+                source="rv1106_edge",
                 camera_name=camera_id,
                 started_at=event_time.isoformat(timespec="milliseconds"),
                 ended_at=event_end.isoformat(timespec="milliseconds"),
@@ -419,9 +457,11 @@ class Supervisor:
                 "host": self.settings.mqtt_host,
                 "port": self.settings.mqtt_port,
                 "last_topic": topic,
-                "last_hit_at": event_time.isoformat(timespec="seconds"),
+                "last_hit_at": event_end.isoformat(timespec="seconds"),
+                "last_event": event_state,
+                "last_identity": identity,
                 "last_case_id": int(case["id"]),
-                "event_lag_seconds": round(max(0.0, (now - event_time).total_seconds()), 3),
+                "event_lag_seconds": round(max(0.0, (now - event_end).total_seconds()), 3),
                 "duplicate": not inserted,
                 "updated_at": utc_now_iso(),
             }
@@ -435,6 +475,9 @@ class Supervisor:
                             "score": score,
                             "ts": timestamp,
                             "seq": payload.get("seq"),
+                            "event": event_state,
+                            "identity": identity,
+                            "session_id": session_id,
                         },
                         ensure_ascii=False,
                     ),
@@ -496,8 +539,23 @@ class Supervisor:
         cases = await asyncio.to_thread(self.database.pending_board_cases, limit=20)
         saved = 0
         for case in cases:
-            event_time = _parse_iso(str(case["started_at"]))
-            wanted_end = _parse_iso(str(case["ended_at"])) + timedelta(
+            event_state = str(case.get("board_event_state") or "hit").lower()
+            if event_state not in {"end", "hit"}:
+                last_event = _parse_iso(
+                    str(case.get("board_last_event_at") or case["updated_at"])
+                )
+                if (_now() - last_event).total_seconds() < max(
+                    1.0, self.settings.rv1106_session_timeout_seconds
+                ):
+                    continue
+            best_ts = case.get("board_best_ts")
+            if best_ts is None and case.get("board_payload"):
+                best_ts = case["board_payload"].get("best_ts")
+            try:
+                event_time = datetime.fromtimestamp(float(best_ts)).astimezone()
+            except (TypeError, ValueError):
+                event_time = _parse_iso(str(case["started_at"]))
+            wanted_end = event_time + timedelta(
                 seconds=self.settings.context_after_seconds
             )
             segment = await asyncio.to_thread(
@@ -519,36 +577,51 @@ class Supervisor:
                 continue
             source_start = _parse_iso(str(segment["started_at"]))
             start_offset = max(0, int((event_time - source_start).total_seconds()))
-            end_offset = max(
-                start_offset + 1,
-                int((_parse_iso(str(case["ended_at"])) - source_start).total_seconds()),
-            )
+            end_offset = start_offset + 1
             score = float(case["board_score"] or 0)
+            identity = str(case.get("board_identity") or "confirmed").lower()
+            payload = case.get("board_payload") or {}
+            activity_score = max(
+                0.0, min(1.0, float(payload.get("activity_score") or 0.0))
+            )
+            selection_score = min(1.0, score * 0.75 + activity_score * 0.25)
+            confirmed = identity == "confirmed"
             result = ClipCandidate(
                 keep=True,
-                title="Daughter recognized by RV1106",
-                summary="开发板通过人脸特征比对识别到女儿出现在画面中。",
-                tags=["daughter", "rv1106", "face_identity"],
+                title=(
+                    "Daughter confirmed by RV1106"
+                    if confirmed
+                    else "Probable daughter activity"
+                ),
+                summary=(
+                    "开发板通过人脸特征与人体轨迹融合确认女儿出现在画面中。"
+                    if confirmed
+                    else "开发板检测到持续稳定的儿童体型活动轨迹，作为高召回候选保存。"
+                ),
+                tags=["daughter", "rv1106", identity, "person_tracking"],
                 confidence=score,
                 start_offset_seconds=start_offset,
                 end_offset_seconds=end_offset,
                 raw={
                     "comparison_case_id": int(case["id"]),
-                    "board": case.get("board_payload"),
+                    "board": payload,
+                    "session_id": case.get("board_session_id"),
+                    "identity": identity,
+                    "activity_score": activity_score,
                     "trigger_sources": [
                         source
                         for source, value in (
-                            ("rv1106_face", case.get("board_score")),
+                            ("rv1106_edge", case.get("board_score")),
                             ("nas_yolo11n", case.get("yolo_score")),
                         )
                         if value is not None
                     ],
                 },
-                local_child_confirmed=True,
+                local_child_confirmed=confirmed,
                 local_child_score=score,
-                analysis_backend="rv1106_face",
-                category="face_identity",
-                selection_score=score,
+                analysis_backend="rv1106_edge",
+                category=f"rv1106_{identity}",
+                selection_score=selection_score,
             )
             moment_id = await self._save_moment(
                 segment, result, analyzer=None, detector=None
@@ -587,7 +660,7 @@ class Supervisor:
             "trigger_sources": [
                 source
                 for source, value in (
-                    ("rv1106_face", case.get("board_score")),
+                    ("rv1106_edge", case.get("board_score")),
                     ("nas_yolo11n", case.get("yolo_score")),
                 )
                 if value is not None
@@ -1549,7 +1622,7 @@ class Supervisor:
                 verified_final = await self._verify_detector_saved_clip(
                     detector, staged_clip_path, duration_seconds
                 )
-            elif result.analysis_backend == "rv1106_face":
+            elif result.analysis_backend in {"rv1106_face", "rv1106_edge"}:
                 # The comparison must measure the board independently. Running
                 # the NAS detector here would turn a board-only hit into a NAS
                 # detector decision and bias the result.
@@ -1949,6 +2022,9 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "mqtt_host": settings.mqtt_host,
             "mqtt_port": settings.mqtt_port,
             "mqtt_daughter_topic": settings.mqtt_daughter_topic,
+            "mqtt_status_topic": settings.mqtt_status_topic,
+            "rv1106_accept_probable": settings.rv1106_accept_probable,
+            "rv1106_session_timeout_seconds": settings.rv1106_session_timeout_seconds,
             "detector_comparison_enabled": settings.detector_comparison_enabled,
             "detector_comparison_days": settings.detector_comparison_days,
             "detector_control_samples_per_day": settings.detector_control_samples_per_day,

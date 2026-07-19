@@ -82,6 +82,9 @@ def test_new_window_and_quota_defaults(monkeypatch):
     assert settings.mqtt_enabled is False
     assert settings.mqtt_port == 1883
     assert settings.mqtt_daughter_topic == "homecam/daughter/hit"
+    assert settings.mqtt_status_topic == "homecam/daughter/status"
+    assert settings.rv1106_session_timeout_seconds == 20.0
+    assert settings.rv1106_accept_probable is True
     assert settings.detector_comparison_enabled is False
     assert settings.detector_comparison_days == 7
     assert settings.detector_control_samples_per_day == 6

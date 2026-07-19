@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 
@@ -59,6 +59,18 @@ def subscribe_packet(*, packet_id: int, topic: str, qos: int = 1) -> bytes:
     return b"\x82" + encode_remaining_length(len(body)) + body
 
 
+def subscribe_topics_packet(
+    *, packet_id: int, topics: Sequence[str], qos: int = 1
+) -> bytes:
+    if not topics:
+        raise ValueError("at least one MQTT topic is required")
+    body = bytearray(packet_id.to_bytes(2, "big"))
+    for topic in topics:
+        body += encode_string(topic)
+        body += bytes((qos & 1,))
+    return b"\x82" + encode_remaining_length(len(body)) + bytes(body)
+
+
 class MQTTSubscriber:
     """Small MQTT 3.1.1 QoS 1 subscriber built only on asyncio streams."""
 
@@ -68,7 +80,7 @@ class MQTTSubscriber:
         host: str,
         port: int,
         client_id: str,
-        topic: str,
+        topic: str | Sequence[str],
         username: str = "",
         password: str = "",
         keepalive_seconds: int = 30,
@@ -76,7 +88,10 @@ class MQTTSubscriber:
         self.host = host
         self.port = port
         self.client_id = client_id
-        self.topic = topic
+        self.topics = (topic,) if isinstance(topic, str) else tuple(topic)
+        if not self.topics:
+            raise ValueError("at least one MQTT topic is required")
+        self.topic = self.topics[0]
         self.username = username
         self.password = password
         self.keepalive_seconds = max(5, keepalive_seconds)
@@ -144,15 +159,15 @@ class MQTTSubscriber:
 
             packet_id = 1
             writer.write(
-                subscribe_packet(packet_id=packet_id, topic=self.topic, qos=1)
+                subscribe_topics_packet(packet_id=packet_id, topics=self.topics, qos=1)
             )
             await writer.drain()
             first, body = await asyncio.wait_for(
                 self._read_packet(reader), timeout=10
             )
-            if first != 0x90 or len(body) < 3 or body[:2] != packet_id.to_bytes(2, "big"):
+            if first != 0x90 or len(body) < 2 + len(self.topics) or body[:2] != packet_id.to_bytes(2, "big"):
                 raise ConnectionError("MQTT SUBACK missing or invalid")
-            if body[2] == 0x80:
+            if any(code == 0x80 for code in body[2 : 2 + len(self.topics)]):
                 raise ConnectionError("MQTT subscription rejected")
 
             state_callback({"status": "connected", "host": self.host, "port": self.port})

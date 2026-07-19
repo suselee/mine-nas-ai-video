@@ -9,6 +9,7 @@ from nas_video_summarizer.mqtt import (
     decode_json_payload,
     encode_remaining_length,
     subscribe_packet,
+    subscribe_topics_packet,
 )
 
 
@@ -34,6 +35,17 @@ def test_connect_and_subscribe_packets_include_credentials_and_topic():
     assert b"secret" in connect
     assert subscribe[0] == 0x82
     assert b"homecam/daughter/hit" in subscribe
+
+
+def test_multi_topic_subscribe_packet_contains_all_topics():
+    packet = subscribe_topics_packet(
+        packet_id=3,
+        topics=("homecam/daughter/hit", "homecam/daughter/status"),
+    )
+
+    assert packet[0] == 0x82
+    assert b"homecam/daughter/hit" in packet
+    assert b"homecam/daughter/status" in packet
 
 
 def test_publish_packet_parser_handles_qos1():

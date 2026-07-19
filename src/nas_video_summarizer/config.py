@@ -213,9 +213,12 @@ class Settings:
     mqtt_username: str
     mqtt_password: str
     mqtt_daughter_topic: str
+    mqtt_status_topic: str
     mqtt_client_id: str
     mqtt_keepalive_seconds: int
     mqtt_event_merge_gap_seconds: float
+    rv1106_session_timeout_seconds: float
+    rv1106_accept_probable: bool
     detector_comparison_enabled: bool
     detector_comparison_days: int
     detector_control_samples_per_day: int
@@ -358,11 +361,18 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         mqtt_daughter_topic=os.getenv(
             "MQTT_DAUGHTER_TOPIC", "homecam/daughter/hit"
         ).strip(),
+        mqtt_status_topic=os.getenv(
+            "MQTT_STATUS_TOPIC", "homecam/daughter/status"
+        ).strip(),
         mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "nas-video").strip(),
         mqtt_keepalive_seconds=_int("MQTT_KEEPALIVE_SECONDS", 30),
         mqtt_event_merge_gap_seconds=_float(
             "MQTT_EVENT_MERGE_GAP_SECONDS", 15.0
         ),
+        rv1106_session_timeout_seconds=_float(
+            "RV1106_SESSION_TIMEOUT_SECONDS", 20.0
+        ),
+        rv1106_accept_probable=_bool("RV1106_ACCEPT_PROBABLE", True),
         detector_comparison_enabled=_bool("DETECTOR_COMPARISON_ENABLED", False),
         detector_comparison_days=_int("DETECTOR_COMPARISON_DAYS", 7),
         detector_control_samples_per_day=_int(

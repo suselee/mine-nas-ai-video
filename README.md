@@ -103,3 +103,7 @@ If analysis still falls behind badly, try the camera low stream at `352x288` and
 
 See [docs/freebsd-jail.md](docs/freebsd-jail.md) for jail setup, storage layout, and an `rc.d` template.
 See [docs/rv1106-mqtt.md](docs/rv1106-mqtt.md) for Mosquitto and the seven-day detector comparison.
+The versioned RV1106 C++ service, performance probe, and deployment scripts are
+under [`edge/rv1106/`](edge/rv1106/README.md). The fusion build uses RockIVA
+person tracking plus on-demand face identity and publishes confirmed/probable
+MQTT sessions without storing video on the board.

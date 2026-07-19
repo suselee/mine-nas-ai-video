@@ -170,12 +170,16 @@ def build_checks(settings: Settings) -> list[Check]:
                 bool(settings.mqtt_host)
                 and 0 < settings.mqtt_port < 65536
                 and bool(settings.mqtt_daughter_topic)
+                and bool(settings.mqtt_status_topic)
                 and (not settings.mqtt_password or bool(settings.mqtt_username))
             ),
             (
                 "disabled"
                 if not settings.mqtt_enabled
-                else f"{settings.mqtt_host}:{settings.mqtt_port} {settings.mqtt_daughter_topic}"
+                else (
+                    f"{settings.mqtt_host}:{settings.mqtt_port} "
+                    f"{settings.mqtt_daughter_topic}, {settings.mqtt_status_topic}"
+                )
             ),
             required=settings.mqtt_enabled,
         ),

@@ -52,6 +52,7 @@ function renderHealth(health) {
   const lowRecorder = workers.recorders?.low || {};
   const highRecorder = workers.recorders?.high || {};
   const mqtt = workers.mqtt || {};
+  const rv1106 = workers.rv1106 || {};
   const comparison = workers.comparison || {};
 
   const cards = [
@@ -109,6 +110,18 @@ function renderHealth(health) {
         : mqtt.message || `${health.configured.mqtt_host || ""}:${health.configured.mqtt_port || ""}`,
     },
     {
+      label: "RV1106",
+      value: rv1106.pipeline || rv1106.status || "unknown",
+      meta:
+        rv1106.status === "online"
+          ? `CPU ${Number(rv1106.cpu_percent || 0).toFixed(1)}% · ${Number(
+              rv1106.temperature_c || 0,
+            ).toFixed(1)}°C · p95 ${Number(rv1106.detector_p95_ms || 0).toFixed(1)}ms · ${
+              rv1106.confirmed_tracks || 0
+            } confirmed / ${rv1106.probable_tracks || 0} probable`
+          : "Waiting for board heartbeat",
+    },
+    {
       label: "Comparison",
       value: comparison.status || "unknown",
       meta: `${comparison.metrics?.cases || 0} detector cases`,
@@ -138,7 +151,7 @@ function renderComparison(payload) {
   const yolo = metrics.yolo || {};
   const controls = metrics.controls || {};
   comparisonSummary.innerHTML = `
-    <article class="status-card"><span>RV1106</span><strong>${board.hits || 0} hits</strong><small>Precision ${percent(board.precision)} · Relative recall ${percent(board.relative_union_recall)}</small></article>
+    <article class="status-card"><span>RV1106</span><strong>${board.hits || 0} hits</strong><small>Precision ${percent(board.precision)} · Recall ${percent(board.relative_union_recall)} · ${metrics.identity_counts?.confirmed || 0} confirmed / ${metrics.identity_counts?.probable || 0} probable</small></article>
     <article class="status-card"><span>NAS YOLO11n</span><strong>${yolo.hits || 0} hits</strong><small>Precision ${percent(yolo.precision)} · Relative recall ${percent(yolo.relative_union_recall)}</small></article>
     <article class="status-card"><span>Agreement</span><strong>${metrics.status_counts?.both || 0} both</strong><small>${metrics.status_counts?.board_only || 0} board only · ${metrics.status_counts?.yolo_only || 0} YOLO only</small></article>
     <article class="status-card"><span>Negative controls</span><strong>${controls.reviewed || 0}/${controls.total || 0} reviewed</strong><small>Common miss rate ${percent(controls.common_miss_rate)}</small></article>
@@ -161,7 +174,7 @@ function renderComparison(payload) {
           <div class="moment-body">
             <div class="moment-title-row"><h3>${escapeHtml(source)}</h3><span class="confidence">${escapeHtml(item.review_label)}</span></div>
             <p>${escapeHtml(formatDate(item.started_at))}</p>
-            <div class="moment-meta"><span>Board ${item.board_score == null ? "—" : Number(item.board_score).toFixed(3)}</span><span>YOLO ${item.yolo_score == null ? "—" : Number(item.yolo_score).toFixed(3)}</span></div>
+            <div class="moment-meta"><span>Board ${item.board_score == null ? "—" : Number(item.board_score).toFixed(3)}</span><span>${escapeHtml(item.board_identity || "legacy")}</span><span>${escapeHtml(item.board_event_state || "hit")}</span><span>YOLO ${item.yolo_score == null ? "—" : Number(item.yolo_score).toFixed(3)}</span></div>
             <div class="actions review-actions">
               <button class="button secondary" data-review="present">Has daughter</button>
               <button class="button danger" data-review="false_positive">False positive</button>

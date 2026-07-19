@@ -1,6 +1,6 @@
 # RV1106 MQTT detector comparison
 
-The RV1106 publishes daughter face-identity hits to
+The RV1106 publishes daughter identity/body-track sessions to
 `homecam/daughter/hit`. The NAS application subscribes with its built-in
 standard-library MQTT 3.1.1 client. A separate broker is still required.
 
@@ -37,6 +37,9 @@ MQTT_PORT=1883
 MQTT_USERNAME=nas-video
 MQTT_PASSWORD=replace-with-the-mosquitto-password
 MQTT_DAUGHTER_TOPIC=homecam/daughter/hit
+MQTT_STATUS_TOPIC=homecam/daughter/status
+RV1106_ACCEPT_PROBABLE=true
+RV1106_SESSION_TIMEOUT_SECONDS=20
 
 DETECTOR_COMPARISON_ENABLED=true
 DETECTOR_COMPARISON_DAYS=7
@@ -54,6 +57,12 @@ dashboard labels cases as `board_only`, `yolo_only`, or `both` and provides
 three review buttons. Six low-resolution negative controls are sampled from the
 previous completed day and stored under `DATA_DIR/detector_comparison`; they do
 not enter the Nextcloud diary or moment quotas.
+
+Fusion-capable board builds publish `start`, `update`, and `end` messages with a
+stable `session_id`. NAS waits for `end` (or 20 seconds without an update) and
+extracts around the board's `best_ts`. `identity=confirmed` means face identity
+was matched; `identity=probable` is a persistent child-sized track saved for
+recall. Legacy one-shot face payloads remain accepted.
 
 After seven days, compare reviewed precision, relative union recall, and the
 negative-control common miss rate. If the board is satisfactory, switch to the

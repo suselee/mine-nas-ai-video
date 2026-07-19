@@ -228,6 +228,65 @@ def test_detector_events_merge_board_and_yolo_and_deduplicate(tmp_path):
     assert stored["board_payload"] == {"seq": 1}
 
 
+def test_rv1106_session_updates_merge_beyond_time_gap(tmp_path):
+    database = Database(tmp_path / "fusion-session.sqlite3")
+    database.migrate()
+
+    start, _ = database.record_detector_event(
+        event_key="edge:s1:start",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:00:01+08:00",
+        confidence=0.55,
+        payload={
+            "session_id": "s1",
+            "event": "start",
+            "identity": "probable",
+            "best_ts": 100.0,
+        },
+        merge_gap_seconds=15,
+    )
+    update, _ = database.record_detector_event(
+        event_key="edge:s1:update",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:02:00+08:00",
+        confidence=0.72,
+        payload={
+            "session_id": "s1",
+            "event": "update",
+            "identity": "confirmed",
+            "best_ts": 120.0,
+        },
+        merge_gap_seconds=15,
+    )
+    end, _ = database.record_detector_event(
+        event_key="edge:s1:end",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:00+08:00",
+        ended_at="2026-07-19T10:03:00+08:00",
+        confidence=0.72,
+        payload={
+            "session_id": "s1",
+            "event": "end",
+            "identity": "confirmed",
+            "best_ts": 120.0,
+        },
+        merge_gap_seconds=15,
+    )
+
+    assert start["id"] == update["id"] == end["id"]
+    stored = database.get_comparison_case(int(start["id"]))
+    assert stored["board_session_id"] == "s1"
+    assert stored["board_event_state"] == "end"
+    assert stored["board_identity"] == "confirmed"
+    assert stored["board_score"] == 0.72
+    assert stored["board_best_ts"] == 120.0
+
+
 def test_comparison_review_metrics(tmp_path):
     database = Database(tmp_path / "metrics.sqlite3")
     database.migrate()

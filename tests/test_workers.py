@@ -930,6 +930,74 @@ def test_mqtt_hit_is_persisted_and_duplicate_is_ignored(tmp_path, monkeypatch):
     assert supervisor.state["mqtt"]["duplicate"] is True
 
 
+def test_mqtt_status_heartbeat_updates_rv1106_health(tmp_path):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        mqtt_enabled=True,
+        mqtt_status_topic="homecam/daughter/status",
+    )
+    database = Database(tmp_path / "mqtt-status.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    payload = json.dumps(
+        {
+            "pipeline": "rockiva_fusion_v1",
+            "cpu_percent": 48.2,
+            "temperature_c": 61.0,
+            "detector_p95_ms": 29.6,
+        }
+    ).encode()
+
+    asyncio.run(
+        supervisor._handle_mqtt_message("homecam/daughter/status", payload)
+    )
+
+    assert supervisor.state["rv1106"]["status"] == "online"
+    assert supervisor.state["rv1106"]["pipeline"] == "rockiva_fusion_v1"
+
+
+def test_mqtt_fusion_session_records_start_update_end(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        mqtt_enabled=True,
+        mqtt_daughter_topic="homecam/daughter/hit",
+        detector_comparison_enabled=True,
+    )
+    database = Database(tmp_path / "mqtt-session.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    base = datetime.fromisoformat("2026-07-19T10:00:00+08:00").timestamp()
+    for index, event in enumerate(("start", "update", "end")):
+        payload = json.dumps(
+            {
+                "ts": base + index * 30,
+                "session_start_ts": base,
+                "best_ts": base + 30,
+                "score": 0.55 if index == 0 else 0.72,
+                "camera_id": "home-camera",
+                "box": [1, 2, 3, 4],
+                "seq": index + 1,
+                "session_id": "track-7-1",
+                "event": event,
+                "identity": "probable" if index == 0 else "confirmed",
+            }
+        ).encode()
+        asyncio.run(
+            supervisor._handle_mqtt_message("homecam/daughter/hit", payload)
+        )
+
+    cases = database.list_comparison_cases()
+    assert len(cases) == 1
+    assert cases[0]["board_event_state"] == "end"
+    assert cases[0]["board_identity"] == "confirmed"
+    assert cases[0]["board_session_id"] == "track-7-1"
+
+
 def test_pending_board_case_waits_for_indexed_segments(tmp_path, monkeypatch):
     settings = replace(
         load_settings("/nonexistent.env"), detector_comparison_enabled=True

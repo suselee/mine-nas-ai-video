@@ -106,6 +106,11 @@ class Database:
                     yolo_score REAL,
                     board_payload_json TEXT,
                     yolo_payload_json TEXT,
+                    board_session_id TEXT,
+                    board_event_state TEXT,
+                    board_identity TEXT,
+                    board_best_ts REAL,
+                    board_last_event_at TEXT,
                     match_status TEXT NOT NULL DEFAULT 'pending',
                     moment_id INTEGER,
                     source_low_segment_id INTEGER,
@@ -152,6 +157,22 @@ class Database:
             for name, declaration in additions:
                 if name not in columns:
                     conn.execute(f"ALTER TABLE moments ADD COLUMN {name} {declaration}")
+            comparison_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(comparison_cases)").fetchall()
+            }
+            comparison_additions = (
+                ("board_session_id", "TEXT"),
+                ("board_event_state", "TEXT"),
+                ("board_identity", "TEXT"),
+                ("board_best_ts", "REAL"),
+                ("board_last_event_at", "TEXT"),
+            )
+            for name, declaration in comparison_additions:
+                if name not in comparison_columns:
+                    conn.execute(
+                        f"ALTER TABLE comparison_cases ADD COLUMN {name} {declaration}"
+                    )
             conn.execute(
                 "UPDATE moments SET selection_score=confidence "
                 "WHERE selection_score=0 AND confidence!=0"
@@ -222,8 +243,16 @@ class Database:
         merge_gap_seconds: float,
     ) -> tuple[dict[str, Any], bool]:
         """Persist one detector hit and merge it into a nearby comparison case."""
-        if source not in {"rv1106_face", "nas_yolo11n"}:
+        if source not in {"rv1106_face", "rv1106_edge", "nas_yolo11n"}:
             raise ValueError(f"unsupported detector event source: {source}")
+        is_board = source in {"rv1106_face", "rv1106_edge"}
+        session_id = str(payload.get("session_id") or "").strip() if is_board else ""
+        event_state = str(payload.get("event") or "hit").strip().lower() if is_board else None
+        identity = str(payload.get("identity") or "confirmed").strip().lower() if is_board else None
+        try:
+            best_ts = float(payload.get("best_ts")) if is_board and payload.get("best_ts") is not None else None
+        except (TypeError, ValueError):
+            best_ts = None
         start = datetime.fromisoformat(started_at)
         end = datetime.fromisoformat(ended_at)
         gap = max(0.0, merge_gap_seconds)
@@ -252,7 +281,14 @@ class Database:
                 (camera_name,),
             ).fetchall()
             case_row = None
+            if is_board and session_id:
+                case_row = next(
+                    (row for row in rows if str(row["board_session_id"] or "") == session_id),
+                    None,
+                )
             for row in rows:
+                if case_row is not None:
+                    break
                 row_start = datetime.fromisoformat(str(row["started_at"])).timestamp()
                 row_end = datetime.fromisoformat(str(row["ended_at"])).timestamp()
                 if row_end >= search_start and row_start <= search_end:
@@ -260,15 +296,17 @@ class Database:
                     break
 
             if case_row is None:
-                board_score = confidence if source == "rv1106_face" else None
+                board_score = confidence if is_board else None
                 yolo_score = confidence if source == "nas_yolo11n" else None
                 cursor = conn.execute(
                     """
                     INSERT INTO comparison_cases(
                         camera_name, started_at, ended_at, board_score, yolo_score,
                         board_payload_json, yolo_payload_json, match_status,
+                        board_session_id, board_event_state, board_identity,
+                        board_best_ts, board_last_event_at,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         camera_name,
@@ -276,9 +314,14 @@ class Database:
                         ended_at,
                         board_score,
                         yolo_score,
-                        payload_text if source == "rv1106_face" else None,
+                        payload_text if is_board else None,
                         payload_text if source == "nas_yolo11n" else None,
                         self._comparison_status(board_score, yolo_score),
+                        session_id or None,
+                        event_state if is_board else None,
+                        identity if is_board else None,
+                        best_ts,
+                        ended_at if is_board else None,
                         now,
                         now,
                     ),
@@ -290,7 +333,7 @@ class Database:
                 merged_end = max(end, datetime.fromisoformat(str(case_row["ended_at"])))
                 board_score = (
                     max(float(case_row["board_score"] or 0), confidence)
-                    if source == "rv1106_face"
+                    if is_board
                     else case_row["board_score"]
                 )
                 yolo_score = (
@@ -304,6 +347,14 @@ class Database:
                     SET started_at=?, ended_at=?, board_score=?, yolo_score=?,
                         board_payload_json=COALESCE(?, board_payload_json),
                         yolo_payload_json=COALESCE(?, yolo_payload_json),
+                        board_session_id=COALESCE(?, board_session_id),
+                        board_event_state=COALESCE(?, board_event_state),
+                        board_identity=CASE
+                            WHEN ?='confirmed' THEN 'confirmed'
+                            ELSE COALESCE(board_identity, ?)
+                        END,
+                        board_best_ts=COALESCE(?, board_best_ts),
+                        board_last_event_at=COALESCE(?, board_last_event_at),
                         match_status=?, updated_at=?
                     WHERE id=?
                     """,
@@ -312,8 +363,14 @@ class Database:
                         merged_end.isoformat(timespec="seconds"),
                         board_score,
                         yolo_score,
-                        payload_text if source == "rv1106_face" else None,
+                        payload_text if is_board else None,
                         payload_text if source == "nas_yolo11n" else None,
+                        session_id or None if is_board else None,
+                        event_state if is_board else None,
+                        identity if is_board else None,
+                        identity if is_board else None,
+                        best_ts,
+                        ended_at if is_board else None,
                         self._comparison_status(board_score, yolo_score),
                         now,
                         case_id,
@@ -647,6 +704,10 @@ class Database:
             status: sum(case["match_status"] == status for case in detections)
             for status in ("board_only", "yolo_only", "both")
         }
+        identity_counts = {
+            identity: sum(case.get("board_identity") == identity for case in detections)
+            for identity in ("confirmed", "probable")
+        }
         return {
             "cases": len(detections),
             "reviewed_cases": sum(
@@ -654,6 +715,7 @@ class Database:
                 for case in detections
             ),
             "status_counts": status_counts,
+            "identity_counts": identity_counts,
             "board": source_metrics("board_score"),
             "yolo": source_metrics("yolo_score"),
             "controls": {
