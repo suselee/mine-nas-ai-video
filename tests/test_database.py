@@ -182,273 +182,85 @@ def test_new_database_timestamps_are_local_iso(tmp_path):
     assert segment_time.tzinfo is not None
 
 
-def test_detector_events_merge_board_and_yolo_and_deduplicate(tmp_path):
-    database = Database(tmp_path / "comparison.sqlite3")
+def test_migrate_preserves_retired_comparison_data(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "comparison-history.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE detector_events (
+                id INTEGER PRIMARY KEY,
+                event_key TEXT NOT NULL
+            );
+            CREATE TABLE comparison_cases (
+                id INTEGER PRIMARY KEY,
+                review_label TEXT NOT NULL
+            );
+            INSERT INTO detector_events(id, event_key) VALUES (1, 'edge:1');
+            INSERT INTO comparison_cases(id, review_label) VALUES (1, 'present');
+            """
+        )
+
+    database = Database(path)
     database.migrate()
 
-    board_case, inserted = database.record_detector_event(
-        event_key="board:1",
-        source="rv1106_face",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:10+08:00",
-        ended_at="2026-07-19T10:00:11+08:00",
-        confidence=0.72,
-        payload={"seq": 1},
-        merge_gap_seconds=15,
+    with database.connect() as conn:
+        event = conn.execute("SELECT event_key FROM detector_events").fetchone()
+        review = conn.execute("SELECT review_label FROM comparison_cases").fetchone()
+    assert event[0] == "edge:1"
+    assert review[0] == "present"
+
+
+def test_board_events_are_durable_and_deduplicated(tmp_path):
+    path = tmp_path / "board-events.sqlite3"
+    database = Database(path)
+    database.migrate()
+    base = datetime.fromisoformat("2026-07-19T10:00:00+08:00").timestamp()
+    common = {
+        "session_key": "home-camera:session:s1",
+        "session_id": "s1",
+        "camera_id": "home-camera",
+        "session_start": base,
+        "identity": "confirmed",
+        "score": 0.8,
+        "best_ts": base + 5,
+        "last_event_at": base + 10,
+        "payload": {"session_id": "s1", "seq": 2},
+        "event_state": "end",
+    }
+
+    session, inserted = database.record_board_event(
+        event_key="home-camera:session:s1:end:2", **common
     )
-    yolo_case, yolo_inserted = database.record_detector_event(
-        event_key="yolo:1",
-        source="nas_yolo11n",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:20+08:00",
-        ended_at="2026-07-19T10:00:25+08:00",
-        confidence=0.61,
-        payload={"segment_id": 1},
-        merge_gap_seconds=15,
-    )
-    duplicate_case, duplicate_inserted = database.record_detector_event(
-        event_key="board:1",
-        source="rv1106_face",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:10+08:00",
-        ended_at="2026-07-19T10:00:11+08:00",
-        confidence=0.72,
-        payload={"seq": 1},
-        merge_gap_seconds=15,
+    duplicate, duplicate_inserted = database.record_board_event(
+        event_key="home-camera:session:s1:end:2", **common
     )
 
     assert inserted is True
-    assert yolo_inserted is True
     assert duplicate_inserted is False
-    assert board_case["id"] == yolo_case["id"] == duplicate_case["id"]
-    stored = database.get_comparison_case(int(board_case["id"]))
-    assert stored["match_status"] == "both"
-    assert stored["board_score"] == 0.72
-    assert stored["yolo_score"] == 0.61
-    assert stored["board_payload"] == {"seq": 1}
+    assert session["status"] == duplicate["status"] == "ready"
+    reopened = Database(path)
+    assert reopened.pending_board_sessions()[0]["key"] == "home-camera:session:s1"
 
 
-def test_rv1106_session_updates_merge_beyond_time_gap(tmp_path):
-    database = Database(tmp_path / "fusion-session.sqlite3")
+def test_stale_board_session_is_finalized_with_configurable_cutoff(tmp_path):
+    database = Database(tmp_path / "stale-board.sqlite3")
     database.migrate()
-
-    start, _ = database.record_detector_event(
-        event_key="edge:s1:start",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:00+08:00",
-        ended_at="2026-07-19T10:00:01+08:00",
-        confidence=0.55,
-        payload={
-            "session_id": "s1",
-            "event": "start",
-            "identity": "probable",
-            "best_ts": 100.0,
-        },
-        merge_gap_seconds=15,
-    )
-    update, _ = database.record_detector_event(
-        event_key="edge:s1:update",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:00+08:00",
-        ended_at="2026-07-19T10:02:00+08:00",
-        confidence=0.72,
-        payload={
-            "session_id": "s1",
-            "event": "update",
-            "identity": "confirmed",
-            "best_ts": 120.0,
-        },
-        merge_gap_seconds=15,
-    )
-    end, _ = database.record_detector_event(
-        event_key="edge:s1:end",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:00+08:00",
-        ended_at="2026-07-19T10:03:00+08:00",
-        confidence=0.72,
-        payload={
-            "session_id": "s1",
-            "event": "end",
-            "identity": "confirmed",
-            "best_ts": 120.0,
-        },
-        merge_gap_seconds=15,
+    database.record_board_event(
+        event_key="home-camera:session:s1:start:1",
+        session_key="home-camera:session:s1",
+        session_id="s1",
+        camera_id="home-camera",
+        session_start=100.0,
+        identity="probable",
+        score=0.6,
+        best_ts=100.0,
+        last_event_at=105.0,
+        payload={"session_id": "s1", "seq": 1},
+        event_state="start",
     )
 
-    assert start["id"] == update["id"] == end["id"]
-    stored = database.get_comparison_case(int(start["id"]))
-    assert stored["board_session_id"] == "s1"
-    assert stored["board_event_state"] == "end"
-    assert stored["board_identity"] == "confirmed"
-    assert stored["board_score"] == 0.72
-    assert stored["board_best_ts"] == 120.0
-
-
-def test_skipped_board_case_is_not_returned_as_pending(tmp_path):
-    database = Database(tmp_path / "skipped-case.sqlite3")
-    database.migrate()
-    segment_id = database.upsert_segment(
-        camera_name="home-camera",
-        stream_role="low",
-        path=tmp_path / "low.mp4",
-        started_at="2026-07-19T10:00:00+08:00",
-        ended_at="2026-07-19T10:02:00+08:00",
-        duration_seconds=120,
-        size_bytes=1,
-    )
-    case, _ = database.record_detector_event(
-        event_key="board:cap-skip",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:00+08:00",
-        ended_at="2026-07-19T10:00:01+08:00",
-        confidence=0.7,
-        payload={"event": "end", "identity": "probable"},
-        merge_gap_seconds=15,
-    )
-
-    assert database.count_pending_board_cases() == 1
-    database.mark_comparison_case_skipped(
-        int(case["id"]), segment_id, "daily-cap"
-    )
-
-    assert database.count_pending_board_cases() == 0
-    stored = database.get_comparison_case(int(case["id"]))
-    assert stored is not None
-    assert stored["save_status"] == "daily-cap"
-    assert stored["source_low_segment_id"] == segment_id
-
-
-def test_comparison_case_filters_clip_and_review_state(tmp_path):
-    database = Database(tmp_path / "comparison-filters.sqlite3")
-    database.migrate()
-    segment_path = tmp_path / "low.mp4"
-    segment_path.write_bytes(b"low")
-    segment_id = database.upsert_segment(
-        camera_name="home-camera",
-        stream_role="low",
-        path=segment_path,
-        started_at="2026-07-19T09:00:00+08:00",
-        ended_at="2026-07-19T09:02:00+08:00",
-        duration_seconds=120,
-        size_bytes=3,
-    )
-
-    ready, _ = database.record_detector_event(
-        event_key="board:ready",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at="2026-07-19T09:00:10+08:00",
-        ended_at="2026-07-19T09:00:11+08:00",
-        confidence=0.8,
-        payload={"identity": "confirmed", "face_score": 0.6},
-        merge_gap_seconds=1,
-    )
-    clip = tmp_path / "ready.mp4"
-    metadata = tmp_path / "ready.json"
-    clip.write_bytes(b"clip")
-    metadata.write_text("{}")
-    moment_id = database.create_moment(
-        camera_name="home-camera",
-        title="ready",
-        summary="",
-        tags=[],
-        confidence=0.8,
-        source_low_segment_id=segment_id,
-        source_started_at="2026-07-19T09:00:00+08:00",
-        source_ended_at="2026-07-19T09:02:00+08:00",
-        clip_path=clip,
-        metadata_path=metadata,
-    )
-    database.attach_comparison_moment(int(ready["id"]), moment_id, segment_id)
-
-    skipped, _ = database.record_detector_event(
-        event_key="board:skipped",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:10+08:00",
-        ended_at="2026-07-19T10:00:11+08:00",
-        confidence=0.7,
-        payload={"identity": "probable"},
-        merge_gap_seconds=1,
-    )
-    database.mark_comparison_case_skipped(
-        int(skipped["id"]), segment_id, "daily-cap"
-    )
-
-    pending, _ = database.record_detector_event(
-        event_key="board:pending-filter",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at="2026-07-19T11:00:10+08:00",
-        ended_at="2026-07-19T11:00:11+08:00",
-        confidence=0.6,
-        payload={"identity": "probable"},
-        merge_gap_seconds=1,
-    )
-    database.set_comparison_review(int(pending["id"]), "uncertain")
-
-    assert [row["id"] for row in database.list_comparison_cases(clip_state="ready")] == [
-        ready["id"]
-    ]
-    assert [row["id"] for row in database.list_comparison_cases(clip_state="skipped")] == [
-        skipped["id"]
-    ]
-    pending_rows = database.list_comparison_cases(
-        match_status="board_only", review_label="uncertain", clip_state="pending"
-    )
-    assert [row["id"] for row in pending_rows] == [pending["id"]]
-    assert pending_rows[0]["clip_state"] == "pending"
-
-
-def test_comparison_review_metrics(tmp_path):
-    database = Database(tmp_path / "metrics.sqlite3")
-    database.migrate()
-    case, _ = database.record_detector_event(
-        event_key="board:positive",
-        source="rv1106_face",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:00+08:00",
-        ended_at="2026-07-19T10:00:01+08:00",
-        confidence=0.8,
-        payload={},
-        merge_gap_seconds=1,
-    )
-    assert database.set_comparison_review(int(case["id"]), "present") is True
-
-    metrics = database.comparison_metrics()
-
-    assert metrics["board"]["precision"] == 1.0
-    assert metrics["board"]["relative_union_recall"] == 1.0
-    assert metrics["yolo"]["relative_union_recall"] == 0.0
-
-
-def test_control_case_is_listed_separately(tmp_path):
-    database = Database(tmp_path / "controls.sqlite3")
-    database.migrate()
-    segment_id = database.upsert_segment(
-        camera_name="home-camera",
-        stream_role="low",
-        path=tmp_path / "low.mp4",
-        started_at="2026-07-18T10:00:00+08:00",
-        ended_at="2026-07-18T10:02:00+08:00",
-        duration_seconds=120,
-        size_bytes=100,
-    )
-    case_id = database.create_control_case(
-        segment_id=segment_id,
-        camera_name="home-camera",
-        started_at="2026-07-18T10:00:30+08:00",
-        ended_at="2026-07-18T10:00:50+08:00",
-    )
-
-    case = database.get_comparison_case(case_id)
-    metrics = database.comparison_metrics()
-
-    assert case["control_sample"] is True
-    assert case["match_status"] == "control"
-    assert metrics["cases"] == 0
-    assert metrics["controls"]["total"] == 1
+    assert database.finalize_stale_board_sessions(104.0) == 0
+    assert database.finalize_stale_board_sessions(105.0) == 1
+    assert database.pending_board_sessions()[0]["status"] == "ready"

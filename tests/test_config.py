@@ -85,10 +85,6 @@ def test_new_window_and_quota_defaults(monkeypatch):
     assert settings.mqtt_status_topic == "homecam/daughter/status"
     assert settings.rv1106_session_timeout_seconds == 20.0
     assert settings.rv1106_accept_probable is True
-    assert settings.detector_comparison_enabled is False
-    assert settings.detector_comparison_days == 7
-    assert settings.detector_control_samples_per_day == 6
-    assert settings.detector_comparison_dir == settings.data_dir / "detector_comparison"
 
 
 def test_env_overrides_window_and_quota():

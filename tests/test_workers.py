@@ -2,6 +2,7 @@ import asyncio
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from nas_video_summarizer.config import load_settings
 from nas_video_summarizer.database import Database
@@ -895,12 +896,11 @@ def test_published_clip_uses_camera_offset_and_final_source(tmp_path, monkeypatc
     assert clip.read_bytes() == b"verified-source"
 
 
-def test_mqtt_hit_is_persisted_and_duplicate_is_ignored(tmp_path, monkeypatch):
+def test_mqtt_hit_is_persisted_and_updates_state(tmp_path, monkeypatch):
     settings = replace(
         load_settings("/nonexistent.env"),
         mqtt_enabled=True,
         mqtt_daughter_topic="homecam/daughter/hit",
-        detector_comparison_enabled=True,
     )
     database = Database(tmp_path / "mqtt.sqlite3")
     database.migrate()
@@ -917,17 +917,20 @@ def test_mqtt_hit_is_persisted_and_duplicate_is_ignored(tmp_path, monkeypatch):
             "camera_id": "home-camera",
             "box": [1, 2, 3, 4],
             "seq": 9,
+            "identity": "confirmed",
         }
     ).encode()
 
     asyncio.run(supervisor._handle_mqtt_message("homecam/daughter/hit", payload))
-    asyncio.run(supervisor._handle_mqtt_message("homecam/daughter/hit", payload))
 
-    cases = database.list_comparison_cases()
-    assert len(cases) == 1
-    assert cases[0]["match_status"] == "board_only"
-    assert cases[0]["board_score"] == 0.73
-    assert supervisor.state["mqtt"]["duplicate"] is True
+    sessions = database.pending_board_sessions()
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session["score"] == 0.73
+    assert session["identity"] == "confirmed"
+    assert session["status"] == "ready"
+    assert supervisor.state["mqtt"]["status"] == "connected"
+    assert supervisor.state["mqtt"]["last_identity"] == "confirmed"
 
 
 def test_mqtt_status_heartbeat_updates_rv1106_health(tmp_path):
@@ -956,12 +959,11 @@ def test_mqtt_status_heartbeat_updates_rv1106_health(tmp_path):
     assert supervisor.state["rv1106"]["pipeline"] == "rockiva_fusion_v1"
 
 
-def test_mqtt_fusion_session_records_start_update_end(tmp_path, monkeypatch):
+def test_mqtt_fusion_session_persists_start_update_end(tmp_path, monkeypatch):
     settings = replace(
         load_settings("/nonexistent.env"),
         mqtt_enabled=True,
         mqtt_daughter_topic="homecam/daughter/hit",
-        detector_comparison_enabled=True,
     )
     database = Database(tmp_path / "mqtt-session.sqlite3")
     database.migrate()
@@ -991,54 +993,125 @@ def test_mqtt_fusion_session_records_start_update_end(tmp_path, monkeypatch):
             supervisor._handle_mqtt_message("homecam/daughter/hit", payload)
         )
 
-    cases = database.list_comparison_cases()
-    assert len(cases) == 1
-    assert cases[0]["board_event_state"] == "end"
-    assert cases[0]["board_identity"] == "confirmed"
-    assert cases[0]["board_session_id"] == "track-7-1"
+    ready = database.pending_board_sessions()
+    assert len(ready) == 1
+    finished = ready[0]
+    assert finished["session_id"] == "track-7-1"
+    assert finished["identity"] == "confirmed"
+    assert finished["score"] == 0.72
+    assert finished["best_ts"] == base + 30
 
 
-def test_pending_board_case_waits_for_indexed_segments(tmp_path, monkeypatch):
+def test_duplicate_mqtt_end_is_ignored_and_survives_restart(tmp_path, monkeypatch):
     settings = replace(
-        load_settings("/nonexistent.env"), detector_comparison_enabled=True
+        load_settings("/nonexistent.env"),
+        mqtt_enabled=True,
+        mqtt_daughter_topic="homecam/daughter/hit",
     )
-    database = Database(tmp_path / "pending-board.sqlite3")
+    path = tmp_path / "mqtt-dedupe.sqlite3"
+    database = Database(path)
     database.migrate()
-    database.record_detector_event(
-        event_key="board:pending",
-        source="rv1106_face",
-        camera_name="home-camera",
-        started_at="2026-07-19T10:00:00+08:00",
-        ended_at="2026-07-19T10:00:01+08:00",
-        confidence=0.8,
-        payload={},
-        merge_gap_seconds=15,
-    )
     supervisor = Supervisor(settings, database)
 
     async def immediate_to_thread(function, /, *args, **kwargs):
         return function(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    timestamp = datetime.fromisoformat("2026-07-19T10:00:00+08:00").timestamp()
+    payload = json.dumps(
+        {
+            "ts": timestamp,
+            "best_ts": timestamp,
+            "score": 0.8,
+            "camera_id": "home-camera",
+            "seq": 7,
+            "session_id": "track-1-1",
+            "event": "end",
+            "identity": "confirmed",
+        }
+    ).encode()
 
-    saved = asyncio.run(supervisor._process_pending_board_cases())
+    asyncio.run(supervisor._handle_mqtt_message("homecam/daughter/hit", payload))
+    asyncio.run(supervisor._handle_mqtt_message("homecam/daughter/hit", payload))
 
-    assert saved == 0
-    assert database.count_pending_board_cases() == 1
+    assert database.count_pending_board_sessions() == 1
+    assert supervisor.state["mqtt"]["duplicate"] is True
+    reopened = Database(path)
+    assert len(reopened.pending_board_sessions()) == 1
 
 
-def test_pending_board_case_obeys_daily_cap_and_is_finalized(tmp_path, monkeypatch):
-    settings = replace(
-        load_settings("/nonexistent.env"),
-        output_dir=tmp_path / "output",
-        max_moments_per_day=1,
-        max_moments_per_period=0,
-        moment_cooldown_seconds=0,
-        context_after_seconds=10,
-        detector_comparison_enabled=True,
-    )
-    database = Database(tmp_path / "board-cap.sqlite3")
+def test_board_restart_can_reuse_session_counter_without_key_collision(tmp_path):
+    settings = load_settings("/nonexistent.env")
+    database = Database(tmp_path / "session-reuse.sqlite3")
     database.migrate()
+    supervisor = Supervisor(settings, database)
+    first = {
+        "session_id": "1-1",
+        "session_start_ts": 100.0,
+        "seq": 1,
+        "event": "start",
+    }
+    after_restart = {**first, "session_start_ts": 200.0}
+
+    first_session, first_event = supervisor._board_event_keys(
+        "home-camera", first, 100.0, "start"
+    )
+    second_session, second_event = supervisor._board_event_keys(
+        "home-camera", after_restart, 200.0, "start"
+    )
+
+    assert first_session != second_session
+    assert first_event != second_event
+
+
+def test_board_session_dropped_when_segments_never_indexed(tmp_path, monkeypatch):
+    settings = replace(load_settings("/nonexistent.env"))
+    database = Database(tmp_path / "pending-board.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def instant_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    session = {
+        "session_id": "s-1",
+        "key": "s-1",
+        "camera_id": "home-camera",
+        "session_start": datetime.fromisoformat("2026-07-19T10:00:00+08:00").timestamp(),
+        "identity": "confirmed",
+        "score": 0.8,
+        "best_ts": datetime.fromisoformat("2026-07-19T10:00:00+08:00").timestamp(),
+        "last_event_at": datetime.fromisoformat("2026-07-19T10:00:01+08:00").timestamp(),
+        "payload": {},
+    }
+
+    asyncio.run(supervisor._save_board_session(session))
+
+    assert database.list_moments() == []
+    events = database.recent_events(limit=5)
+    assert any("board-session-dropped" in event["event_type"] for event in events)
+
+
+def _board_session(best_ts: float, *, identity: str = "confirmed", score: float = 0.8):
+    return {
+        "session_id": "s-1",
+        "key": "s-1",
+        "camera_id": "home-camera",
+        "session_start": best_ts - 10,
+        "identity": identity,
+        "score": score,
+        "best_ts": best_ts,
+        "last_event_at": best_ts + 5,
+        "payload": {"activity_score": 0.4},
+    }
+
+
+def _index_low_high_segments(database, tmp_path):
     low_path = tmp_path / "low.mp4"
     high_path = tmp_path / "high.mp4"
     low_path.write_bytes(b"low")
@@ -1061,6 +1134,21 @@ def test_pending_board_case_obeys_daily_cap_and_is_finalized(tmp_path, monkeypat
         duration_seconds=120,
         size_bytes=4,
     )
+    return low_id
+
+
+def test_board_session_obeys_daily_cap(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "output",
+        max_moments_per_day=1,
+        max_moments_per_period=0,
+        moment_cooldown_seconds=0,
+        context_after_seconds=10,
+    )
+    database = Database(tmp_path / "board-cap.sqlite3")
+    database.migrate()
+    low_id = _index_low_high_segments(database, tmp_path)
     existing_clip = tmp_path / "output" / "2026-07-19" / "existing.mp4"
     existing_clip.parent.mkdir(parents=True)
     existing_clip.write_bytes(b"existing")
@@ -1082,35 +1170,57 @@ def test_pending_board_case_obeys_daily_cap_and_is_finalized(tmp_path, monkeypat
         clip_started_at="2026-07-19T10:00:05+08:00",
         clip_ended_at="2026-07-19T10:00:30+08:00",
     )
-    event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
-    case, _ = database.record_detector_event(
-        event_key="board:daily-cap",
-        source="rv1106_edge",
-        camera_name="home-camera",
-        started_at=event_time.isoformat(timespec="seconds"),
-        ended_at=(event_time + timedelta(seconds=1)).isoformat(timespec="seconds"),
-        confidence=0.2,
-        payload={
-            "event": "end",
-            "identity": "probable",
-            "best_ts": event_time.timestamp(),
-        },
-        merge_gap_seconds=15,
-    )
     supervisor = Supervisor(settings, database)
 
     async def immediate_to_thread(function, /, *args, **kwargs):
         return function(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
-    saved = asyncio.run(supervisor._process_pending_board_cases())
+    event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
+    asyncio.run(
+        supervisor._save_board_session(
+            _board_session(event_time.timestamp(), identity="probable", score=0.2)
+        )
+    )
 
-    assert saved == 0
     assert database.count_moments_on_day("2026-07-19") == 1
-    assert database.count_pending_board_cases() == 0
-    stored = database.get_comparison_case(int(case["id"]))
-    assert stored is not None
-    assert stored["save_status"] == "daily-cap"
+
+
+def test_board_session_saves_moment_from_buffered_segments(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "output",
+        context_after_seconds=10,
+    )
+    database = Database(tmp_path / "board-save.sqlite3")
+    database.migrate()
+    _index_low_high_segments(database, tmp_path)
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        output_path.write_bytes(b"edge-clip")
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
+    asyncio.run(
+        supervisor._save_board_session(_board_session(event_time.timestamp()))
+    )
+    asyncio.run(
+        supervisor._save_board_session(_board_session(event_time.timestamp()))
+    )
+
+    moments = database.list_moments()
+    assert len(moments) == 1
+    assert moments[0]["analysis_backend"] == "rv1106_edge"
+    assert moments[0]["category"] == "rv1106_confirmed"
+    assert Path(moments[0]["clip_path"]).read_bytes() == b"edge-clip"
+    assert moments[0]["trigger_key"] == "s-1"
+    assert supervisor._last_board_moment_id == moments[0]["id"]
+    assert supervisor._last_board_saved_at is not None
 
 
 def test_rv1106_backend_finalizes_segments_without_detector(tmp_path, monkeypatch):

@@ -183,12 +183,6 @@ def build_checks(settings: Settings) -> list[Check]:
             ),
             required=settings.mqtt_enabled,
         ),
-        Check(
-            "comparison directory",
-            _path_writable(settings.detector_comparison_dir),
-            str(settings.detector_comparison_dir),
-            required=settings.detector_comparison_enabled,
-        ),
         _person_filter_check(settings),
         _daughter_detector_check(settings),
     ]

@@ -185,12 +185,15 @@ class MQTTSubscriber:
                 packet_type = first >> 4
                 if packet_type == 3:
                     topic, payload, publish_id = self._publish_payload(first, body)
-                    if publish_id is not None:
-                        writer.write(b"\x40\x02" + publish_id.to_bytes(2, "big"))
-                        await writer.drain()
                     outcome = callback(topic, payload)
                     if inspect.isawaitable(outcome):
                         await outcome
+                    # QoS 1 is acknowledged only after the callback has
+                    # durably accepted the message. If persistence raises, the
+                    # connection closes without PUBACK and the broker retries.
+                    if publish_id is not None:
+                        writer.write(b"\x40\x02" + publish_id.to_bytes(2, "big"))
+                        await writer.drain()
                 elif packet_type in {9, 13}:
                     continue
         finally:

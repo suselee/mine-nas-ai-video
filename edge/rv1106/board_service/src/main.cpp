@@ -42,6 +42,107 @@ static int h264_nal_type(const uint8_t* data, int len) {
     return off < len ? data[off] & 0x1F : -1;
 }
 
+// One scheduled face-recognition job: a region of the frame (normalized
+// coordinates) plus the track the recognized identity should be applied to.
+struct FaceRoi {
+    uint32_t track_id;
+    float x1, y1, x2, y2;
+    bool rockiva_anchored;
+};
+
+// Crop the region out of the full RGB frame, run RetinaFace on the crop
+// (the detector letterboxes any input size to 320x320, so small faces are
+// upscaled and become detectable), then map the detections back to
+// full-frame normalized coordinates.
+static std::vector<FaceBox> detect_faces_in_region(
+        FaceDetector& detector, const std::vector<uint8_t>& rgb,
+        int frame_w, int frame_h, const FaceRoi& roi, float margin,
+        float det_score) {
+    float roi_w = roi.x2 - roi.x1;
+    float roi_h = roi.y2 - roi.y1;
+    float x1 = std::max(0.0f, roi.x1 - roi_w * margin);
+    float y1 = std::max(0.0f, roi.y1 - roi_h * margin);
+    float x2 = std::min(1.0f, roi.x2 + roi_w * margin);
+    float y2 = std::min(1.0f, roi.y2 + roi_h * margin);
+    int px1 = (int)(x1 * frame_w), py1 = (int)(y1 * frame_h);
+    int px2 = std::min(frame_w, (int)(x2 * frame_w + 0.9999f));
+    int py2 = std::min(frame_h, (int)(y2 * frame_h + 0.9999f));
+    int cw = px2 - px1, ch = py2 - py1;
+    std::vector<FaceBox> empty;
+    if (cw < 16 || ch < 16) return empty;
+
+    std::vector<uint8_t> crop((size_t)cw * ch * 3);
+    for (int y = 0; y < ch; ++y)
+        memcpy(crop.data() + (size_t)y * cw * 3,
+               rgb.data() + ((size_t)(py1 + y) * frame_w + px1) * 3,
+               (size_t)cw * 3);
+
+    std::vector<FaceBox> faces = detector.detect(crop.data(), cw, ch, det_score);
+    float region_w = x2 - x1, region_h = y2 - y1;
+    for (size_t i = 0; i < faces.size(); ++i) {
+        FaceBox& f = faces[i];
+        f.x1 = x1 + f.x1 * region_w; f.x2 = x1 + f.x2 * region_w;
+        f.y1 = y1 + f.y1 * region_h; f.y2 = y1 + f.y2 * region_h;
+        for (int k = 0; k < 5; ++k) {
+            f.lmk[k * 2 + 0] = x1 + f.lmk[k * 2 + 0] * region_w;
+            f.lmk[k * 2 + 1] = y1 + f.lmk[k * 2 + 1] * region_h;
+        }
+    }
+    return faces;
+}
+
+static float face_roi_iou(const FaceBox& face, const FaceRoi& roi) {
+    float x1 = std::max(face.x1, roi.x1);
+    float y1 = std::max(face.y1, roi.y1);
+    float x2 = std::min(face.x2, roi.x2);
+    float y2 = std::min(face.y2, roi.y2);
+    float intersection = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+    float face_area = std::max(0.0f, face.x2 - face.x1) *
+                      std::max(0.0f, face.y2 - face.y1);
+    float roi_area = std::max(0.0f, roi.x2 - roi.x1) *
+                     std::max(0.0f, roi.y2 - roi.y1);
+    float total = face_area + roi_area - intersection;
+    return total > 0 ? intersection / total : 0;
+}
+
+// RetinaFace may return more than one face from an expanded crop. Only accept
+// the detection that still maps to the scheduled track. For RockIVA-anchored
+// jobs, also require geometric agreement with the original face box.
+static int select_face_for_job(const std::vector<FaceBox>& faces,
+                               const FaceRoi& job,
+                               const TrackFusion& fusion) {
+    int best = -1;
+    float best_rank = -1e9f;
+    float anchor_cx = (job.x1 + job.x2) * 0.5f;
+    float anchor_cy = (job.y1 + job.y2) * 0.5f;
+    float anchor_diag = sqrtf(
+        (job.x2 - job.x1) * (job.x2 - job.x1) +
+        (job.y2 - job.y1) * (job.y2 - job.y1));
+    anchor_diag = std::max(0.01f, anchor_diag);
+    for (size_t i = 0; i < faces.size(); ++i) {
+        float cx = (faces[i].x1 + faces[i].x2) * 0.5f;
+        float cy = (faces[i].y1 + faces[i].y2) * 0.5f;
+        if (fusion.track_for_face(cx, cy) != job.track_id) continue;
+
+        float dx = cx - anchor_cx;
+        float dy = cy - anchor_cy;
+        float distance = sqrtf(dx * dx + dy * dy) / anchor_diag;
+        float overlap = face_roi_iou(faces[i], job);
+        if (job.rockiva_anchored) {
+            bool center_in_anchor = cx >= job.x1 && cx <= job.x2 &&
+                                    cy >= job.y1 && cy <= job.y2;
+            if (!center_in_anchor && overlap < 0.05f) continue;
+        }
+        float rank = faces[i].score - distance * 0.25f;
+        if (job.rockiva_anchored) rank += overlap * 3.0f;
+        if (rank > best_rank) {
+            best_rank = rank;
+            best = (int)i;
+        }
+    }
+    return best;
+}
+
 static std::string event_payload(const FusionEvent& event, const std::string& camera,
                                  long sequence, int width, int height,
                                  const char* pipeline) {
@@ -109,8 +210,9 @@ int main(int argc, char* argv[]) {
 
     float threshold = (float)cfg.get_double("recognize.threshold", 0.35);
     float high_threshold = (float)cfg.get_double("recognize.high_threshold", 0.55);
-    int min_face = cfg.get_int("recognize.min_face", 28);
+    int min_face = cfg.get_int("recognize.min_face", 24);
     float det_score = (float)cfg.get_double("recognize.det_score", 0.50);
+    float roi_det_score = (float)cfg.get_double("recognize.roi_det_score", 0.40);
 
     std::string mqtt_host = cfg.get("mqtt.host", "127.0.0.1");
     int mqtt_port = cfg.get_int("mqtt.port", 1883);
@@ -152,12 +254,16 @@ int main(int argc, char* argv[]) {
     fusion_cfg.child_max_height_ratio = cfg.get_double("pipeline.child_max_height_ratio", 0.45);
     fusion_cfg.relative_child_height_ratio = cfg.get_double("pipeline.relative_child_height_ratio", 0.75);
     fusion_cfg.face_check_interval_seconds = cfg.get_double("pipeline.face_check_interval_seconds", 1.0);
+    fusion_cfg.face_hit_window_seconds = cfg.get_double("pipeline.face_hit_window_seconds", 6.0);
     fusion_cfg.confirmed_ttl_seconds = cfg.get_double("pipeline.confirmed_ttl_seconds", 8.0);
     fusion_cfg.track_lost_seconds = cfg.get_double("pipeline.track_lost_seconds", 6.0);
     fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 5.0);
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;
     TrackFusion fusion(fusion_cfg);
+    int max_face_rois = cfg.get_int("pipeline.max_face_rois_per_scan", 2);
+    float face_roi_margin = (float)cfg.get_double("pipeline.face_roi_margin", 0.50);
+    float head_roi_ratio = (float)cfg.get_double("pipeline.head_roi_ratio", 0.55);
 
     MqttPublisher mqtt;
     if (!mqtt.connect(mqtt_host, mqtt_port, mqtt_cid, mqtt_user, mqtt_pass))
@@ -191,6 +297,7 @@ int main(int argc, char* argv[]) {
     long reconnects = 0;
     unsigned long long rockiva_face_detections = 0;
     unsigned long long face_scan_attempts = 0;
+    unsigned long long roi_scans = 0;
     unsigned long long retinaface_detections = 0;
     unsigned long long eligible_face_detections = 0;
     unsigned long long face_track_matches = 0;
@@ -274,26 +381,70 @@ int main(int argc, char* argv[]) {
                 fusion.observe(now, objects);
                 rockiva_face_detections += objects.faces.size();
 
-                if (fusion.has_due_face_candidate(now)) {
+                // Schedule recognition jobs: RockIVA face boxes anchored to
+                // tracks first (precise attribution, works even when the
+                // child is held), then head regions of due child-like tracks.
+                std::vector<TrackSnapshot> snaps = fusion.snapshot(now);
+                std::vector<FaceRoi> jobs;
+                std::vector<uint32_t> roi_tracks;
+                for (size_t i = 0; i < objects.faces.size(); ++i) {
+                    const IvaObject& iva_face = objects.faces[i];
+                    float cx = (iva_face.x1 + iva_face.x2) * 0.5f;
+                    float cy = (iva_face.y1 + iva_face.y2) * 0.5f;
+                    uint32_t track = fusion.track_for_face(cx, cy);
+                    if (!track || !fusion.should_check_face(track, now)) continue;
+                    if (std::find(roi_tracks.begin(), roi_tracks.end(), track) != roi_tracks.end())
+                        continue;
+                    FaceRoi job;
+                    job.track_id = track;
+                    job.x1 = iva_face.x1; job.y1 = iva_face.y1;
+                    job.x2 = iva_face.x2; job.y2 = iva_face.y2;
+                    job.rockiva_anchored = true;
+                    jobs.push_back(job);
+                    roi_tracks.push_back(track);
+                }
+                for (size_t i = 0; i < snaps.size(); ++i) {
+                    const TrackSnapshot& snap = snaps[i];
+                    if (!snap.child_like || snap.ambiguous) continue;
+                    if (!fusion.should_check_face(snap.id, now)) continue;
+                    if (std::find(roi_tracks.begin(), roi_tracks.end(), snap.id) != roi_tracks.end())
+                        continue;
+                    FaceRoi job;
+                    job.track_id = snap.id;
+                    job.x1 = snap.box.x1;
+                    job.y1 = snap.box.y1;
+                    job.x2 = snap.box.x2;
+                    job.y2 = snap.box.y1 + (snap.box.y2 - snap.box.y1) * head_roi_ratio;
+                    job.rockiva_anchored = false;
+                    jobs.push_back(job);
+                    roi_tracks.push_back(snap.id);
+                }
+
+                if (!jobs.empty()) {
                     face_scan_attempts++;
                     if (frame.to_rgb(rgb)) {
-                        std::vector<FaceBox> faces = face_detector.detect(
-                            rgb.data(), frame.width(), frame.height(), det_score);
-                        retinaface_detections += faces.size();
-                        for (size_t i = 0; i < faces.size(); ++i) {
-                            int face_w = (int)((faces[i].x2 - faces[i].x1) * frame.width());
-                            int face_h = (int)((faces[i].y2 - faces[i].y1) * frame.height());
+                        int budget = max_face_rois;
+                        for (size_t i = 0; i < jobs.size() && budget > 0; ++i, --budget) {
+                            const FaceRoi& job = jobs[i];
+                            fusion.mark_face_checked(job.track_id, now);
+                            roi_scans++;
+                            std::vector<FaceBox> faces = detect_faces_in_region(
+                                face_detector, rgb, frame.width(), frame.height(),
+                                job, face_roi_margin, roi_det_score);
+                            retinaface_detections += faces.size();
+                            int selected = select_face_for_job(faces, job, fusion);
+                            if (selected < 0) continue;
+                            const FaceBox& face = faces[(size_t)selected];
+                            int face_w = (int)((face.x2 - face.x1) * frame.width());
+                            int face_h = (int)((face.y2 - face.y1) * frame.height());
                             if (face_w < min_face || face_h < min_face) continue;
                             eligible_face_detections++;
-                            uint32_t track = fusion.track_for_face(
-                                (faces[i].x1 + faces[i].x2) * 0.5f,
-                                (faces[i].y1 + faces[i].y2) * 0.5f);
-                            if (!track || !fusion.should_check_face(track, now)) continue;
                             face_track_matches++;
-                            fusion.mark_face_checked(track, now);
-                            if (!recognizer.extract(rgb.data(), frame.width(), frame.height(), faces[i], embedding)) {
-                                printf("[FACE] track=%u det=%.3f size=%dx%d result=embedding-failed\n",
-                                       track, faces[i].score, face_w, face_h);
+                            if (!recognizer.extract(rgb.data(), frame.width(), frame.height(), face, embedding)) {
+                                printf("[FACE] t=%.1f track=%u roi=%s det=%.3f size=%dx%d result=embedding-failed\n",
+                                       now, job.track_id,
+                                       job.rockiva_anchored ? "iva" : "head",
+                                       face.score, face_w, face_h);
                                 continue;
                             }
                             embedding_successes++;
@@ -302,14 +453,15 @@ int main(int argc, char* argv[]) {
                             max_face_similarity = std::max(max_face_similarity, similarity);
                             if (similarity >= threshold) threshold_hits++;
                             if (similarity >= high_threshold) high_threshold_hits++;
-                            printf("[FACE] track=%u det=%.3f size=%dx%d similarity=%.4f result=%s\n",
-                                   track, faces[i].score, face_w, face_h, similarity,
+                            printf("[FACE] t=%.1f track=%u roi=%s det=%.3f size=%dx%d similarity=%.4f result=%s\n",
+                                   now, job.track_id,
+                                   job.rockiva_anchored ? "iva" : "head",
+                                   face.score, face_w, face_h, similarity,
                                    similarity >= high_threshold ? "high-hit" :
                                    (similarity >= threshold ? "hit" : "below-threshold"));
-                            fusion.apply_face_score(track, similarity, now);
+                            fusion.apply_face_score(job.track_id, similarity, now);
                         }
                     }
-                    fusion.mark_due_face_candidates_checked(now);
                 }
 
                 std::vector<FusionEvent> events = fusion.collect_events(now);
@@ -358,25 +510,27 @@ int main(int argc, char* argv[]) {
                          "\"available_memory_mb\":%.1f,\"temperature_c\":%.1f,"
                          "\"detector_p95_ms\":%.1f,\"person_scan_fps\":%.2f,"
                          "\"active_tracks\":%d,\"confirmed_tracks\":%d,"
-                         "\"probable_tracks\":%d,"
+                         "\"probable_tracks\":%d,\"confirmed_sessions\":%d,"
                          "\"rockiva_face_detections\":%llu,\"face_scan_attempts\":%llu,"
+                         "\"roi_scans\":%llu,"
                          "\"retinaface_detections\":%llu,\"eligible_face_detections\":%llu,"
                          "\"face_track_matches\":%llu,\"embedding_successes\":%llu,"
                          "\"similarity_samples\":%llu,\"max_face_similarity\":%.4f,"
                          "\"face_threshold_hits\":%llu,\"face_high_threshold_hits\":%llu,"
                          "\"decoded_frames\":%ld,"
                          "\"scanned_frames\":%ld,\"rtsp_reconnects\":%ld}",
-                         now, camera_id.c_str(), fusion_enabled ? "rockiva_fusion_v1" : "face_only",
-                         level, stats.cpu_percent, stats.available_memory_kb / 1024.0,
-                         stats.temperature_c, p95,
-                         level == 0 ? person_fps : (level == 1 ? 0.5 : 1.0),
-                         fusion.active_tracks(), fusion.confirmed_tracks(),
-                         fusion.probable_tracks(), rockiva_face_detections,
-                         face_scan_attempts, retinaface_detections,
-                         eligible_face_detections, face_track_matches,
-                         embedding_successes, similarity_samples,
-                         max_face_similarity, threshold_hits, high_threshold_hits,
-                         decoded_frames, scanned_frames, reconnects);
+                          now, camera_id.c_str(), fusion_enabled ? "rockiva_fusion_v1" : "face_only",
+                          level, stats.cpu_percent, stats.available_memory_kb / 1024.0,
+                          stats.temperature_c, p95,
+                          level == 0 ? person_fps : (level == 1 ? 0.5 : 1.0),
+                          fusion.active_tracks(), fusion.confirmed_tracks(),
+                          fusion.probable_tracks(), fusion.confirmed_sessions(),
+                          rockiva_face_detections, face_scan_attempts, roi_scans,
+                          retinaface_detections,
+                          eligible_face_detections, face_track_matches,
+                          embedding_successes, similarity_samples,
+                          max_face_similarity, threshold_hits, high_threshold_hits,
+                          decoded_frames, scanned_frames, reconnects);
                 if (!status_topic.empty()) mqtt.publish(status_topic, status, 0);
                 printf("[HEALTH] cpu=%.1f%% mem=%.1fMB temp=%.1fC p95=%.1fms guard=%d\n",
                        stats.cpu_percent, stats.available_memory_kb / 1024.0,

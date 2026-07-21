@@ -1,13 +1,14 @@
-# RV1106 MQTT detector comparison
+# RV1106 MQTT integration
 
 The RV1106 publishes daughter identity/body-track sessions to
 `homecam/daughter/hit`. The NAS application subscribes with its built-in
-standard-library MQTT 3.1.1 client. A separate broker is still required.
+standard-library MQTT 3.1.1 client and saves selected clips from the 4K rolling
+buffer. A separate MQTT broker is required.
 
 ## Broker on the NAS
 
-Install and configure Mosquitto on the network namespace that owns
-`192.168.123.201`:
+Install and configure Mosquitto on the network namespace that owns the NAS
+address:
 
 ```sh
 pkg install mosquitto
@@ -20,16 +21,16 @@ sockstat -4 -l | grep 1883
 
 Use the same username and password in the RV1106 `[mqtt]` section and the NAS
 `.env`. Do not expose port 1883 to the Internet.
-After the broker is running, restart `daughter_watch` once so its startup log
-immediately confirms the broker connection instead of waiting for the next hit.
 
-## Seven-day comparison configuration
+## NAS configuration
 
-Keep the existing NAS detector enabled while the board is being evaluated:
+For edge-only analysis, keep analysis enabled so indexed low-stream segments
+are finalized without running a NAS vision model:
 
 ```env
-ANALYSIS_BACKEND=daughter_detector
-DAUGHTER_DETECTOR_MODE=heuristic
+ANALYSIS_ENABLED=true
+ANALYSIS_BACKEND=rv1106
+PERSON_FILTER_ENABLED=false
 
 MQTT_ENABLED=true
 MQTT_HOST=192.168.123.201
@@ -38,45 +39,39 @@ MQTT_USERNAME=nas-video
 MQTT_PASSWORD=replace-with-the-mosquitto-password
 MQTT_DAUGHTER_TOPIC=homecam/daughter/hit
 MQTT_STATUS_TOPIC=homecam/daughter/status
-RV1106_ACCEPT_PROBABLE=true
+MQTT_CLIENT_ID=nas-video-home-camera
 RV1106_SESSION_TIMEOUT_SECONDS=20
-
-DETECTOR_COMPARISON_ENABLED=true
-DETECTOR_COMPARISON_DAYS=7
-DETECTOR_CONTROL_SAMPLES_PER_DAY=6
+RV1106_ACCEPT_PROBABLE=true
 ```
+
+`RV1106_ACCEPT_PROBABLE=false` saves only face-confirmed sessions. With the
+default `true`, persistent child-sized tracks are also kept as
+`rv1106_probable` moments for higher recall.
 
 Run `uv run nas-video-check`, restart the service, then inspect `/api/health`.
-`workers.mqtt.status=connected` confirms the subscription. A real daughter hit
-should create an `edge-daughter-hit` event and later a comparison case after the
-corresponding high-resolution segment is stable.
+`workers.mqtt.status=connected` confirms the subscription. The RV1106 status
+heartbeat appears under `workers.rv1106`.
 
-During comparison, an RV1106 or NAS YOLO11n hit can save a clip. Hits within
-`MQTT_EVENT_MERGE_GAP_SECONDS` are represented by one case and one video. The
-dashboard labels cases as `board_only`, `yolo_only`, or `both` and provides
-three review buttons. Six low-resolution negative controls are sampled from the
-previous completed day and stored under `DATA_DIR/detector_comparison`; they do
-not enter the Nextcloud diary or moment quotas.
+## Delivery and recovery behavior
 
-Fusion-capable board builds publish `start`, `update`, and `end` messages with a
-stable `session_id`. NAS waits for `end` (or 20 seconds without an update) and
-extracts around the board's `best_ts`. `identity=confirmed` means face identity
-was matched; `identity=probable` is a persistent child-sized track saved for
-recall. Legacy one-shot face payloads remain accepted.
+Fusion builds publish `start`, `update`, and `end` messages with a stable
+`session_id` and sequence number. The NAS stores every accepted message in
+SQLite before clip processing:
 
-After seven days, compare reviewed precision, relative union recall, and the
-negative-control common miss rate. If the board is satisfactory, switch to the
-low-power production mode:
+- MQTT QoS 1 duplicate deliveries are ignored by a persistent event key.
+- Active and completed sessions survive NAS restarts.
+- If `end` is lost, the session becomes ready after
+  `RV1106_SESSION_TIMEOUT_SECONDS` without an update.
+- A unique moment trigger key prevents the same session from publishing two
+  clips after crash recovery.
+- Legacy one-shot `event=hit` payloads remain supported and are finalized
+  immediately.
 
-```env
-ANALYSIS_ENABLED=true
-ANALYSIS_BACKEND=rv1106
-PERSON_FILTER_ENABLED=false
-MQTT_ENABLED=true
-DETECTOR_COMPARISON_ENABLED=true
-DETECTOR_CONTROL_SAMPLES_PER_DAY=0
-```
+The worker waits for matching low-stream indexing and complete 4K coverage,
+then extracts around the board's `best_ts`. Session payload, identity,
+similarity/activity scores, and the persistent trigger key are written to the
+moment metadata.
 
-`ANALYSIS_ENABLED` deliberately remains true: `rv1106` mode finalizes indexed
-low-stream segments without running YOLO or a VLM, preventing an ever-growing
-pending backlog while MQTT continues to trigger high-resolution clips.
+The retired RV1106-versus-YOLO comparison UI is no longer active. Existing
+`detector_events` and `comparison_cases` tables are preserved during migration
+so earlier manually reviewed results are not destroyed.

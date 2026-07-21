@@ -12,3 +12,4 @@ edge/rv1106/board_service/decode_test
 edge/rv1106/board_service/rockiva_probe
 edge/rv1106/board_service/track_fusion_test
 edge/rv1106/board_service/install/
+/check*_*.onnx

@@ -59,6 +59,5 @@ def test_web_lists_downloads_without_video_previews(tmp_path):
     ).read_text()
     assert "<video" not in javascript
     assert 'preload="metadata"' not in javascript
-    assert "Review board-only" in _html_shell()
-    assert 'query.set("match_status"' in javascript
-    assert 'item.clip_state === "skipped"' in javascript
+    assert "/api/comparison" not in javascript
+    assert "comparison" not in _html_shell()

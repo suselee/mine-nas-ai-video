@@ -216,14 +216,8 @@ class Settings:
     mqtt_status_topic: str
     mqtt_client_id: str
     mqtt_keepalive_seconds: int
-    mqtt_event_merge_gap_seconds: float
     rv1106_session_timeout_seconds: float
     rv1106_accept_probable: bool
-    detector_comparison_enabled: bool
-    detector_comparison_days: int
-    detector_control_samples_per_day: int
-    detector_control_clip_seconds: int
-    detector_comparison_dir: Path
 
     @property
     def low_buffer_dir(self) -> Path:
@@ -366,23 +360,10 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ).strip(),
         mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "nas-video").strip(),
         mqtt_keepalive_seconds=_int("MQTT_KEEPALIVE_SECONDS", 30),
-        mqtt_event_merge_gap_seconds=_float(
-            "MQTT_EVENT_MERGE_GAP_SECONDS", 15.0
-        ),
         rv1106_session_timeout_seconds=_float(
             "RV1106_SESSION_TIMEOUT_SECONDS", 20.0
         ),
         rv1106_accept_probable=_bool("RV1106_ACCEPT_PROBABLE", True),
-        detector_comparison_enabled=_bool("DETECTOR_COMPARISON_ENABLED", False),
-        detector_comparison_days=_int("DETECTOR_COMPARISON_DAYS", 7),
-        detector_control_samples_per_day=_int(
-            "DETECTOR_CONTROL_SAMPLES_PER_DAY", 6
-        ),
-        detector_control_clip_seconds=_int("DETECTOR_CONTROL_CLIP_SECONDS", 20),
-        detector_comparison_dir=Path(
-            os.getenv("DETECTOR_COMPARISON_DIR", "").strip()
-            or str(data_dir / "detector_comparison")
-        ).expanduser(),
     )
 
 
@@ -395,6 +376,5 @@ def ensure_directories(settings: Settings) -> None:
         settings.low_buffer_dir,
         settings.high_buffer_dir,
         settings.person_filter_model_dir,
-        settings.detector_comparison_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)

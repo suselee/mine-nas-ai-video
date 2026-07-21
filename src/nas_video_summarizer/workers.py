@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,18 @@ from .mqtt import MQTTSubscriber, decode_json_payload
 
 class PersonFilterSkip(Exception):
     """Raised when person filter detects no person in any sampled frame."""
+
+
+class BoardEventPersistenceError(Exception):
+    """Leave a QoS-1 event unacknowledged so the broker will redeliver it."""
+
+
+# How often the board-event worker checks for stale sessions.
+_BOARD_SESSION_SCAN_SECONDS = 5.0
+# Allow the segment scanner/recorder time to index the source around an event.
+_BOARD_SAVE_WAIT_SECONDS = 120.0
+# Extraction failures are retried from the durable queue across worker loops.
+_BOARD_SESSION_MAX_PROCESS_ATTEMPTS = 3
 
 
 def _is_timeout_error(exc: Exception) -> bool:
@@ -299,9 +312,11 @@ class Supervisor:
         self._llama_circuit_open_until: datetime | None = None
         self._last_board_saved_at: str | None = None
         self._last_board_moment_id: int | None = None
-        # NAS analysis and RV1106 comparison run as separate tasks. Serialize
-        # cap checks with clip publication so both cannot observe count=23 and
-        # independently publish the 24th/25th moments.
+        # Board sessions and MQTT event deduplication live in SQLite so restarts
+        # cannot lose a trigger that has not yet produced a moment.
+        # NAS analysis and board-triggered saves run as separate tasks.
+        # Serialize cap checks with clip publication so both cannot observe
+        # count=23 and independently publish the 24th/25th moments.
         self._moment_save_lock = asyncio.Lock()
         self.state: dict[str, Any] = {
             "started_at": utc_now_iso(),
@@ -315,7 +330,6 @@ class Supervisor:
             "analyzer": {"status": "not-started"},
             "mqtt": {"status": "not-started"},
             "rv1106": {"status": "not-started"},
-            "comparison": {"status": "not-started"},
             "cleanup": {"status": "not-started"},
             "day_archive": {"status": "not-started"},
         }
@@ -329,11 +343,11 @@ class Supervisor:
         self.tasks.append(asyncio.create_task(self._cleanup_loop(), name="buffer-cleanup"))
         self.tasks.append(asyncio.create_task(self._analyzer_loop(), name="segment-analyzer"))
         self.tasks.append(asyncio.create_task(self._day_archive_loop(), name="day-archive"))
-        self.tasks.append(
-            asyncio.create_task(self._comparison_loop(), name="detector-comparison")
-        )
         if self.settings.mqtt_enabled:
             self.tasks.append(asyncio.create_task(self._mqtt_loop(), name="mqtt-subscriber"))
+            self.tasks.append(
+                asyncio.create_task(self._board_events_loop(), name="board-events")
+            )
         else:
             self.state["mqtt"] = {"status": "disabled", "reason": "MQTT_ENABLED=false"}
 
@@ -379,11 +393,6 @@ class Supervisor:
     def _set_mqtt_state(self, state: dict[str, Any]) -> None:
         self.state["mqtt"] = {**state, "updated_at": utc_now_iso()}
 
-    def _comparison_since_iso(self) -> str:
-        return (
-            _now() - timedelta(days=max(1, self.settings.detector_comparison_days))
-        ).isoformat(timespec="seconds")
-
     async def _mqtt_loop(self) -> None:
         subscriber = MQTTSubscriber(
             host=self.settings.mqtt_host,
@@ -412,6 +421,9 @@ class Supervisor:
                 self.state["rv1106"] = {
                     "status": "online",
                     **payload,
+                    "pending_sessions": self.database.count_pending_board_sessions(),
+                    "last_saved_at": self._last_board_saved_at,
+                    "last_moment_id": self._last_board_moment_id,
                     "updated_at": utc_now_iso(),
                 }
             except Exception as exc:
@@ -424,7 +436,6 @@ class Supervisor:
             timestamp = float(payload["ts"])
             score = max(0.0, min(1.0, float(payload["score"])))
             camera_id = str(payload.get("camera_id") or self.settings.camera_name)
-            sequence = str(payload.get("seq", ""))
             event_state = str(payload.get("event") or "hit").strip().lower()
             identity = str(payload.get("identity") or "confirmed").strip().lower()
             if identity == "probable" and not self.settings.rv1106_accept_probable:
@@ -435,33 +446,36 @@ class Supervisor:
                     "updated_at": utc_now_iso(),
                 }
                 return
-            session_id = str(payload.get("session_id") or "").strip()
+            session_key, event_key = self._board_event_keys(
+                camera_id, payload, timestamp, event_state
+            )
             try:
                 session_start = float(payload.get("session_start_ts", timestamp))
             except (TypeError, ValueError):
                 session_start = timestamp
-            event_time = datetime.fromtimestamp(session_start).astimezone()
-            event_end = datetime.fromtimestamp(timestamp).astimezone()
-            if event_end <= event_time:
-                event_end = event_time + timedelta(seconds=1)
-            session_token = session_id or f"{timestamp:.3f}"
-            event_key = (
-                f"rv1106:{camera_id}:{session_token}:"
-                f"{event_state}:{timestamp:.3f}:{sequence}:"
-                f"{json.dumps(payload.get('box'), separators=(',', ':'))}"
-            )
-            case, inserted = await asyncio.to_thread(
-                self.database.record_detector_event,
-                event_key=event_key,
-                source="rv1106_edge",
-                camera_name=camera_id,
-                started_at=event_time.isoformat(timespec="milliseconds"),
-                ended_at=event_end.isoformat(timespec="milliseconds"),
-                confidence=score,
-                payload=payload,
-                merge_gap_seconds=self.settings.mqtt_event_merge_gap_seconds,
-            )
+            try:
+                best_ts = float(payload.get("best_ts", timestamp))
+            except (TypeError, ValueError):
+                best_ts = timestamp
+            try:
+                session, inserted = await asyncio.to_thread(
+                    self.database.record_board_event,
+                    event_key=event_key,
+                    session_key=session_key,
+                    session_id=str(payload.get("session_id") or "").strip(),
+                    camera_id=camera_id,
+                    session_start=session_start,
+                    identity=identity,
+                    score=score,
+                    best_ts=best_ts,
+                    last_event_at=timestamp,
+                    payload=payload,
+                    event_state=event_state,
+                )
+            except Exception as exc:
+                raise BoardEventPersistenceError(str(exc)) from exc
             now = _now()
+            event_end = datetime.fromtimestamp(timestamp).astimezone()
             self.state["mqtt"] = {
                 "status": "connected",
                 "host": self.settings.mqtt_host,
@@ -470,28 +484,35 @@ class Supervisor:
                 "last_hit_at": event_end.isoformat(timespec="seconds"),
                 "last_event": event_state,
                 "last_identity": identity,
-                "last_case_id": int(case["id"]),
-                "event_lag_seconds": round(max(0.0, (now - event_end).total_seconds()), 3),
                 "duplicate": not inserted,
+                "event_lag_seconds": round(max(0.0, (now - event_end).total_seconds()), 3),
                 "updated_at": utc_now_iso(),
             }
-            if inserted:
+            if inserted and event_state == "start":
                 self._safe_add_event(
                     "edge-daughter-hit",
                     json.dumps(
                         {
-                            "case_id": int(case["id"]),
                             "camera_id": camera_id,
                             "score": score,
                             "ts": timestamp,
                             "seq": payload.get("seq"),
                             "event": event_state,
                             "identity": identity,
-                            "session_id": session_id,
+                            "session_id": session["session_id"],
                         },
                         ensure_ascii=False,
                     ),
                 )
+        except BoardEventPersistenceError as exc:
+            self._safe_add_event("mqtt-persistence-error", str(exc))
+            self.state["mqtt"] = {
+                **self.state.get("mqtt", {}),
+                "status": "persistence-error",
+                "message": str(exc),
+                "updated_at": utc_now_iso(),
+            }
+            raise
         except Exception as exc:
             self._safe_add_event("mqtt-message-error", str(exc))
             self.state["mqtt"] = {
@@ -501,273 +522,216 @@ class Supervisor:
                 "updated_at": utc_now_iso(),
             }
 
-    async def _comparison_loop(self) -> None:
-        if not self.settings.detector_comparison_enabled:
-            self.state["comparison"] = {
-                "status": "disabled",
-                "reason": "DETECTOR_COMPARISON_ENABLED=false",
-            }
-            return
+    @staticmethod
+    def _board_event_keys(
+        camera_id: str,
+        payload: dict[str, Any],
+        timestamp: float,
+        event_state: str,
+    ) -> tuple[str, str]:
+        """Return stable session/event keys for persistence and QoS-1 dedupe."""
+        session_id = str(payload.get("session_id") or "").strip()
+        sequence = payload.get("seq")
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        digest = hashlib.sha256(canonical).hexdigest()
+        event_token = str(sequence) if sequence is not None else digest
+        if session_id:
+            try:
+                session_start = float(payload.get("session_start_ts", timestamp))
+            except (TypeError, ValueError):
+                session_start = timestamp
+            # Track/session counters reset when the board process restarts, so
+            # session_id alone is not globally unique. The wall-clock start
+            # keeps a later boot's "1-1" session distinct from old history.
+            session_key = f"{camera_id}:session:{session_id}:{session_start:.3f}"
+        else:
+            # Legacy face-only messages are one-shot hits. Giving each unique
+            # message its own session prevents a completed legacy row from
+            # swallowing later, unrelated detections.
+            session_key = f"{camera_id}:legacy:{timestamp:.3f}:{event_token}"
+        return session_key, f"{session_key}:{event_state}:{event_token}"
+
+    async def _expire_stale_board_sessions(self) -> int:
+        cutoff = _now().timestamp() - max(
+            1.0, self.settings.rv1106_session_timeout_seconds
+        )
+        return await asyncio.to_thread(
+            self.database.finalize_stale_board_sessions, cutoff
+        )
+
+    async def _board_events_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                saved = await self._process_pending_board_cases()
-                controls = await self._ensure_yesterday_control_samples()
-                expired_controls = await self._cleanup_expired_control_samples()
-                metrics = await asyncio.to_thread(
-                    self.database.comparison_metrics,
-                    since_iso=self._comparison_since_iso(),
+                expired = await self._expire_stale_board_sessions()
+                if expired:
+                    self._safe_add_event(
+                        "edge-session-expired", f"finalized {expired} stale board session(s)"
+                    )
+                sessions = await asyncio.to_thread(
+                    self.database.pending_board_sessions, limit=20
                 )
-                pending_board = await asyncio.to_thread(
-                    self.database.count_pending_board_cases
-                )
-                self.state["comparison"] = {
-                    "status": "ok",
-                    "saved_board_cases": saved,
-                    "new_control_samples": controls,
-                    "expired_control_samples": expired_controls,
-                    "metrics": metrics,
-                    "pending_board_cases": pending_board,
-                    "last_board_saved_at": self._last_board_saved_at,
-                    "last_board_moment_id": self._last_board_moment_id,
-                    "updated_at": utc_now_iso(),
-                }
+                for session in sessions:
+                    try:
+                        await self._save_board_session(session)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        attempts = await asyncio.to_thread(
+                            self.database.record_board_session_error,
+                            str(session["key"]),
+                            str(exc),
+                        )
+                        self._safe_add_event(
+                            "board-event-error",
+                            f"{session['key']} attempt {attempts}: {exc}",
+                        )
+                        if attempts >= _BOARD_SESSION_MAX_PROCESS_ATTEMPTS:
+                            await asyncio.to_thread(
+                                self.database.mark_board_session_skipped,
+                                str(session["key"]),
+                                f"processing failed after {attempts} attempts: {exc}",
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.state["comparison"] = {
-                    "status": "error",
-                    "message": str(exc),
-                    "updated_at": utc_now_iso(),
-                }
-                self._safe_add_event("comparison-error", str(exc))
+                self._safe_add_event("board-event-error", str(exc))
             try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=5)
+                await asyncio.wait_for(
+                    self.stop_event.wait(), timeout=_BOARD_SESSION_SCAN_SECONDS
+                )
             except asyncio.TimeoutError:
                 pass
 
-    async def _process_pending_board_cases(self) -> int:
-        cases = await asyncio.to_thread(self.database.pending_board_cases, limit=20)
-        saved = 0
-        for case in cases:
-            event_state = str(case.get("board_event_state") or "hit").lower()
-            if event_state not in {"end", "hit"}:
-                last_event = _parse_iso(
-                    str(case.get("board_last_event_at") or case["updated_at"])
-                )
-                if (_now() - last_event).total_seconds() < max(
-                    1.0, self.settings.rv1106_session_timeout_seconds
-                ):
-                    continue
-            best_ts = case.get("board_best_ts")
-            if best_ts is None and case.get("board_payload"):
-                best_ts = case["board_payload"].get("best_ts")
-            try:
-                event_time = datetime.fromtimestamp(float(best_ts)).astimezone()
-            except (TypeError, ValueError):
-                event_time = _parse_iso(str(case["started_at"]))
-            wanted_end = event_time + timedelta(
-                seconds=self.settings.context_after_seconds
+    async def _save_board_session(self, session: dict[str, Any]) -> None:
+        session_key = str(session["key"])
+        existing = await asyncio.to_thread(
+            self.database.get_moment_by_trigger_key, session_key
+        )
+        if existing is not None:
+            moment_id = int(existing["id"])
+            await asyncio.to_thread(
+                self.database.mark_board_session_saved, session_key, moment_id
             )
-            segment = await asyncio.to_thread(
-                self.database.find_segment_at,
-                stream_role="low",
-                timestamp=event_time.isoformat(timespec="seconds"),
-            )
-            if not segment or not Path(segment["path"]).exists():
-                continue
+            self._last_board_saved_at = str(existing["created_at"])
+            self._last_board_moment_id = moment_id
+            self.state["rv1106"] = {
+                **self.state.get("rv1106", {}),
+                "last_saved_at": self._last_board_saved_at,
+                "last_moment_id": self._last_board_moment_id,
+                "pending_sessions": self.database.count_pending_board_sessions(),
+            }
+            return
+
+        identity = str(session["identity"]).lower()
+        score = float(session["score"])
+        event_time = datetime.fromtimestamp(float(session["best_ts"])).astimezone()
+        wanted_end = event_time + timedelta(seconds=self.settings.context_after_seconds)
+        segment = await asyncio.to_thread(
+            self.database.find_segment_at,
+            stream_role="low",
+            timestamp=event_time.isoformat(timespec="seconds"),
+        )
+        high_ready = False
+        if segment and Path(str(segment["path"])).exists():
             high_segments = await asyncio.to_thread(
                 self.database.find_segments_between,
                 stream_role="high",
                 started_before=wanted_end.isoformat(timespec="seconds"),
                 ended_after=event_time.isoformat(timespec="seconds"),
             )
-            if not high_segments or max(
-                _parse_iso(str(row["ended_at"])) for row in high_segments
-            ) < wanted_end:
-                continue
-            source_start = _parse_iso(str(segment["started_at"]))
-            start_offset = max(0, int((event_time - source_start).total_seconds()))
-            end_offset = start_offset + 1
-            score = float(case["board_score"] or 0)
-            identity = str(case.get("board_identity") or "confirmed").lower()
-            payload = case.get("board_payload") or {}
-            activity_score = max(
-                0.0, min(1.0, float(payload.get("activity_score") or 0.0))
-            )
-            selection_score = min(1.0, score * 0.75 + activity_score * 0.25)
-            confirmed = identity == "confirmed"
-            result = ClipCandidate(
-                keep=True,
-                title=(
-                    "Daughter confirmed by RV1106"
-                    if confirmed
-                    else "Probable daughter activity"
-                ),
-                summary=(
-                    "开发板通过人脸特征与人体轨迹融合确认女儿出现在画面中。"
-                    if confirmed
-                    else "开发板检测到持续稳定的儿童体型活动轨迹，作为高召回候选保存。"
-                ),
-                tags=["daughter", "rv1106", identity, "person_tracking"],
-                confidence=score,
-                start_offset_seconds=start_offset,
-                end_offset_seconds=end_offset,
-                raw={
-                    "comparison_case_id": int(case["id"]),
-                    "board": payload,
-                    "session_id": case.get("board_session_id"),
-                    "identity": identity,
-                    "activity_score": activity_score,
-                    "trigger_sources": [
-                        source
-                        for source, value in (
-                            ("rv1106_edge", case.get("board_score")),
-                            ("nas_yolo11n", case.get("yolo_score")),
-                        )
-                        if value is not None
-                    ],
-                },
-                local_child_confirmed=confirmed,
-                local_child_score=score,
-                analysis_backend="rv1106_edge",
-                category=f"rv1106_{identity}",
-                selection_score=selection_score,
-            )
-            outcome = await self._save_capped_moment(
-                segment, result, analyzer=None, detector=None
-            )
-            moment_id = outcome.moment_id
-            if outcome.skip is not None:
-                await asyncio.to_thread(
-                    self.database.mark_comparison_case_skipped,
-                    int(case["id"]),
-                    int(segment["id"]),
-                    outcome.skip.event_type,
-                )
-            if moment_id >= 0:
-                await asyncio.to_thread(
-                    self.database.attach_comparison_moment,
-                    int(case["id"]),
-                    moment_id,
-                    int(segment["id"]),
-                )
-                self._refresh_comparison_metadata(int(case["id"]), moment_id)
-                self._safe_add_event(
-                    "moment", f"saved edge-triggered moment {moment_id}"
-                )
-                self._last_board_saved_at = utc_now_iso()
-                self._last_board_moment_id = moment_id
-                saved += 1
-        return saved
+            available_high = [
+                row for row in high_segments if Path(str(row["path"])).exists()
+            ]
+            high_ready = bool(available_high) and max(
+                _parse_iso(str(row["ended_at"])) for row in available_high
+            ) >= wanted_end
 
-    def _refresh_comparison_metadata(self, case_id: int, moment_id: int) -> None:
-        case = self.database.get_comparison_case(case_id)
-        moment = self.database.get_moment(moment_id)
-        if not case or not moment:
-            return
-        path = Path(str(moment["metadata_path"]))
-        try:
-            metadata = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        metadata["detector_comparison"] = {
-            "case_id": case_id,
-            "match_status": case["match_status"],
-            "board_score": case.get("board_score"),
-            "yolo_score": case.get("yolo_score"),
-            "trigger_sources": [
-                source
-                for source, value in (
-                    ("rv1106_edge", case.get("board_score")),
-                    ("nas_yolo11n", case.get("yolo_score")),
-                )
-                if value is not None
-            ],
-        }
-        path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-
-    async def _ensure_yesterday_control_samples(self) -> int:
-        target = max(0, self.settings.detector_control_samples_per_day)
-        if target == 0 or not ffmpeg_available(self.settings):
-            return 0
-        now = _now()
-        day = (now - timedelta(days=1)).date()
-        day_start = datetime.combine(day, datetime.min.time(), tzinfo=now.tzinfo)
-        day_end = day_start + timedelta(days=1)
-        start_iso = day_start.isoformat(timespec="seconds")
-        end_iso = day_end.isoformat(timespec="seconds")
-        existing = await asyncio.to_thread(
-            self.database.count_control_cases_between, start_iso, end_iso
-        )
-        needed = max(0, target - existing)
-        if needed == 0:
-            return 0
-        segments = await asyncio.to_thread(
-            self.database.control_candidates_between,
-            start_iso=start_iso,
-            end_iso=end_iso,
-            limit=needed,
-        )
-        created = 0
-        duration = max(5, self.settings.detector_control_clip_seconds)
-        for segment in segments:
-            source_duration = max(1, int(float(segment["duration_seconds"])))
-            clip_duration = min(duration, source_duration)
-            available = max(0, source_duration - clip_duration)
-            start_offset = int(segment["id"]) % (available + 1) if available else 0
-            clip_start = _parse_iso(str(segment["started_at"])) + timedelta(
-                seconds=start_offset
+        wait_age = max(0.0, _now().timestamp() - float(session["last_event_at"]))
+        if not segment or not Path(str(segment["path"])).exists():
+            if wait_age < _BOARD_SAVE_WAIT_SECONDS:
+                return
+            reason = f"no low segment for board session {session_key}"
+            self._safe_add_event(
+                "board-session-dropped",
+                reason,
             )
-            clip_end = clip_start + timedelta(seconds=clip_duration)
-            case_id = await asyncio.to_thread(
-                self.database.create_control_case,
-                segment_id=int(segment["id"]),
-                camera_name=str(segment["camera_name"]),
-                started_at=clip_start.isoformat(timespec="seconds"),
-                ended_at=clip_end.isoformat(timespec="seconds"),
-            )
-            output_path = (
-                self.settings.detector_comparison_dir
-                / day.isoformat()
-                / f"control-{case_id}.mp4"
-            )
-            try:
-                await extract_clip(
-                    self.settings,
-                    [Path(str(segment["path"]))],
-                    output_path,
-                    start_offset_seconds=start_offset,
-                    duration_seconds=clip_duration,
-                )
-                await asyncio.to_thread(
-                    self.database.set_control_clip_path, case_id, output_path
-                )
-                created += 1
-            except Exception:
-                output_path.unlink(missing_ok=True)
-                await asyncio.to_thread(
-                    self.database.delete_comparison_case, case_id
-                )
-                raise
-        return created
-
-    async def _cleanup_expired_control_samples(self) -> int:
-        cutoff = self._comparison_since_iso()
-        cases = await asyncio.to_thread(
-            self.database.expired_control_cases, cutoff
-        )
-        removed = 0
-        for case in cases:
-            path_text = case.get("control_clip_path")
-            if path_text:
-                Path(str(path_text)).unlink(missing_ok=True)
             await asyncio.to_thread(
-                self.database.delete_comparison_case, int(case["id"])
+                self.database.mark_board_session_skipped, session_key, reason
             )
-            removed += 1
-        return removed
+            return
+        if not high_ready:
+            if wait_age < _BOARD_SAVE_WAIT_SECONDS:
+                return
+            reason = f"4K coverage incomplete for board session {session_key}"
+            self._safe_add_event(
+                "board-session-dropped",
+                reason,
+            )
+            await asyncio.to_thread(
+                self.database.mark_board_session_skipped, session_key, reason
+            )
+            return
+
+        source_start = _parse_iso(str(segment["started_at"]))
+        start_offset = max(0, int((event_time - source_start).total_seconds()))
+        payload = session.get("payload") or {}
+        activity_score = max(0.0, min(1.0, float(payload.get("activity_score") or 0.0)))
+        confirmed = identity == "confirmed"
+        result = ClipCandidate(
+            keep=True,
+            title=(
+                "Daughter confirmed by RV1106"
+                if confirmed
+                else "Probable daughter activity"
+            ),
+            summary=(
+                "开发板通过人脸特征与人体轨迹融合确认女儿出现在画面中。"
+                if confirmed
+                else "开发板检测到持续稳定的儿童体型活动轨迹，作为高召回候选保存。"
+            ),
+            tags=["daughter", "rv1106", identity, "person_tracking"],
+            confidence=score,
+            start_offset_seconds=start_offset,
+            end_offset_seconds=start_offset + 1,
+            raw={
+                "board": payload,
+                "session_id": session.get("session_id"),
+                "board_session_key": session_key,
+                "identity": identity,
+                "activity_score": activity_score,
+            },
+            local_child_confirmed=confirmed,
+            local_child_score=score,
+            analysis_backend="rv1106_edge",
+            category=f"rv1106_{identity}",
+            selection_score=min(1.0, score * 0.75 + activity_score * 0.25),
+        )
+        outcome = await self._save_capped_moment(
+            segment, result, analyzer=None, detector=None
+        )
+        if outcome.skip is not None:
+            await asyncio.to_thread(
+                self.database.mark_board_session_skipped,
+                session_key,
+                outcome.skip.event_type,
+            )
+        if outcome.moment_id >= 0:
+            await asyncio.to_thread(
+                self.database.mark_board_session_saved,
+                session_key,
+                outcome.moment_id,
+            )
+            self._last_board_saved_at = utc_now_iso()
+            self._last_board_moment_id = outcome.moment_id
+            self._safe_add_event(
+                "moment", f"saved edge-triggered moment {outcome.moment_id}"
+            )
+        self.state["rv1106"] = {
+            **self.state.get("rv1106", {}),
+            "last_saved_at": self._last_board_saved_at,
+            "last_moment_id": self._last_board_moment_id,
+            "pending_sessions": self.database.count_pending_board_sessions(),
+        }
 
     async def _recorder_loop(self, role: str, rtsp_url: str) -> None:
         while not self.stop_event.is_set():
@@ -1244,16 +1208,6 @@ class Supervisor:
                         else self.settings.moment_keep_threshold
                     )
                     should_save = result.should_save(keep_threshold)
-                    if (
-                        should_save
-                        and self.settings.detector_comparison_enabled
-                        and result.analysis_backend == "daughter_detector"
-                    ):
-                        moment_id = await self._handle_yolo_comparison_candidate(
-                            segment, result, detector
-                        )
-                        saved_any = saved_any or moment_id >= 0
-                        continue
                     if result.keep_consistency_repaired(
                         self.settings.moment_keep_threshold
                     ):
@@ -1348,64 +1302,6 @@ class Supervisor:
             finally:
                 if self.settings.analysis_cooldown_seconds > 0:
                     await asyncio.sleep(self.settings.analysis_cooldown_seconds)
-
-    async def _handle_yolo_comparison_candidate(
-        self,
-        segment: dict[str, Any],
-        result: ClipCandidate,
-        detector: DaughterDetector | None,
-    ) -> int:
-        source_start = _parse_iso(str(segment["started_at"]))
-        started = source_start + timedelta(seconds=result.start_offset_seconds)
-        ended = source_start + timedelta(seconds=result.end_offset_seconds)
-        event_key = (
-            f"nas-yolo:{segment['id']}:{result.start_offset_seconds}:"
-            f"{result.end_offset_seconds}:{result.category}"
-        )
-        payload = {
-            "segment_id": int(segment["id"]),
-            "category": result.category,
-            "selection_score": result.effective_selection_score,
-            "raw": result.raw,
-        }
-        case, _ = await asyncio.to_thread(
-            self.database.record_detector_event,
-            event_key=event_key,
-            source="nas_yolo11n",
-            camera_name=str(segment["camera_name"]),
-            started_at=started.isoformat(timespec="seconds"),
-            ended_at=ended.isoformat(timespec="seconds"),
-            confidence=result.confidence,
-            payload=payload,
-            merge_gap_seconds=self.settings.mqtt_event_merge_gap_seconds,
-        )
-        existing_moment = case.get("moment_id")
-        if existing_moment is not None:
-            self._refresh_comparison_metadata(int(case["id"]), int(existing_moment))
-            return int(existing_moment)
-        outcome = await self._save_capped_moment(
-            segment, result, analyzer=None, detector=detector
-        )
-        moment_id = outcome.moment_id
-        if outcome.skip is not None:
-            await asyncio.to_thread(
-                self.database.mark_comparison_case_skipped,
-                int(case["id"]),
-                int(segment["id"]),
-                outcome.skip.event_type,
-            )
-        if moment_id >= 0:
-            await asyncio.to_thread(
-                self.database.attach_comparison_moment,
-                int(case["id"]),
-                moment_id,
-                int(segment["id"]),
-            )
-            self._refresh_comparison_metadata(int(case["id"]), moment_id)
-            self._safe_add_event(
-                "moment", f"saved comparison moment {moment_id}: {result.title}"
-            )
-        return moment_id
 
     async def _analyze_segment(self, analyzer: LlamaAnalyzer, segment: dict[str, Any]) -> AnalysisResult:
         with tempfile.TemporaryDirectory(prefix="nas-video-frames-") as temp_dir:
@@ -1664,9 +1560,8 @@ class Supervisor:
                     detector, staged_clip_path, duration_seconds
                 )
             elif result.analysis_backend in {"rv1106_face", "rv1106_edge"}:
-                # The comparison must measure the board independently. Running
-                # the NAS detector here would turn a board-only hit into a NAS
-                # detector decision and bias the result.
+                # Board events carry their own face-identity evidence; running
+                # the NAS detector here would only duplicate the board's call.
                 verified_final = True
             else:
                 assert analyzer is not None
@@ -1709,6 +1604,9 @@ class Supervisor:
             "source_paths": [str(path) for path in source_paths],
             "model_raw": result.raw,
         }
+        trigger_key = str(result.raw.get("board_session_key") or "").strip() or None
+        if trigger_key:
+            metadata["trigger_key"] = trigger_key
         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
         moment_id = self.database.create_moment(
@@ -1727,6 +1625,7 @@ class Supervisor:
             selection_score=result.effective_selection_score,
             clip_started_at=display_clip_start.isoformat(timespec="seconds"),
             clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
+            trigger_key=trigger_key,
         )
         metadata["event_id"] = moment_id
         metadata["daily_summary_path"] = str(day_dir / "summary.md")
@@ -2065,10 +1964,6 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "mqtt_daughter_topic": settings.mqtt_daughter_topic,
             "mqtt_status_topic": settings.mqtt_status_topic,
             "rv1106_accept_probable": settings.rv1106_accept_probable,
-            "rv1106_session_timeout_seconds": settings.rv1106_session_timeout_seconds,
-            "detector_comparison_enabled": settings.detector_comparison_enabled,
-            "detector_comparison_days": settings.detector_comparison_days,
-            "detector_control_samples_per_day": settings.detector_control_samples_per_day,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
             "llama_analysis_temperature": settings.llama_analysis_temperature,

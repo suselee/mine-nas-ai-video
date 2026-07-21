@@ -98,6 +98,7 @@ def test_subscriber_connects_subscribes_and_acknowledges_qos1():
         states = []
         stop_event = asyncio.Event()
         puback_seen = asyncio.Event()
+        callback_completed = asyncio.Event()
 
         async def broker(reader, writer):
             first, _ = await MQTTSubscriber._read_packet(reader)
@@ -118,6 +119,7 @@ def test_subscriber_connects_subscribes_and_acknowledges_qos1():
             )
             await writer.drain()
             first, body = await MQTTSubscriber._read_packet(reader)
+            assert callback_completed.is_set()
             assert first == 0x40 and body == b"\x00\x2a"
             puback_seen.set()
             writer.close()
@@ -137,6 +139,7 @@ def test_subscriber_connects_subscribes_and_acknowledges_qos1():
 
         async def callback(topic, payload):
             received.append((topic, payload))
+            callback_completed.set()
             stop_event.set()
 
         await asyncio.wait_for(

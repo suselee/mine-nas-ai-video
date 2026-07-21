@@ -7,7 +7,6 @@ import mimetypes
 import signal
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,42 +40,6 @@ def _html_shell() -> str:
           </header>
 
           <section class="status-grid" id="status-grid"></section>
-
-          <section class="section-header">
-            <div>
-              <h2>Detector Comparison</h2>
-              <p>RV1106 face identity versus the preserved NAS YOLO11n detector.</p>
-            </div>
-          </section>
-          <section id="comparison-summary" class="comparison-summary"></section>
-          <section class="comparison-toolbar" aria-label="Comparison filters">
-            <select id="comparison-match-filter">
-              <option value="">All detector cases</option>
-              <option value="board_only">Board only</option>
-              <option value="yolo_only">YOLO only</option>
-              <option value="both">Both</option>
-              <option value="control">Controls</option>
-            </select>
-            <select id="comparison-review-filter">
-              <option value="">All review states</option>
-              <option value="unreviewed">Unreviewed</option>
-              <option value="present">Has daughter</option>
-              <option value="false_positive">False positive</option>
-              <option value="uncertain">Uncertain</option>
-            </select>
-            <select id="comparison-clip-filter">
-              <option value="">All clip states</option>
-              <option value="ready">Clip ready</option>
-              <option value="pending">Clip pending</option>
-              <option value="skipped">Clip skipped</option>
-            </select>
-            <select id="comparison-order-filter">
-              <option value="newest">Newest first</option>
-              <option value="random">Random sample</option>
-            </select>
-            <button id="board-review-preset" class="button secondary">Review board-only</button>
-          </section>
-          <section id="comparison-cases" class="moments comparison-cases"></section>
 
           <section class="section-header">
             <div>
@@ -171,18 +134,6 @@ def _moment_id_from_path(path: str, suffix: str = "") -> int | None:
     return int(tail)
 
 
-def _comparison_id_from_path(path: str, suffix: str = "") -> int | None:
-    prefix = "/api/comparison/"
-    if not path.startswith(prefix):
-        return None
-    tail = path.removeprefix(prefix)
-    if suffix:
-        if not tail.endswith(suffix):
-            return None
-        tail = tail[: -len(suffix)]
-    return int(tail) if tail.isdigit() else None
-
-
 def _moment_api_payload(database: Database, limit: int) -> list[dict[str, Any]]:
     moments = database.list_moments(limit=max(1, min(limit, 500)))
     for moment in moments:
@@ -208,11 +159,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_moment_download(moment_id, include_body=False)
             return
 
-        comparison_id = _comparison_id_from_path(path, "/download")
-        if comparison_id is not None:
-            self._send_comparison_download(comparison_id, include_body=False)
-            return
-
         self._send_error_json(HTTPStatus.NOT_FOUND, "not found", include_body=False)
 
     def do_GET(self) -> None:
@@ -233,76 +179,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             moments = _moment_api_payload(self.state.database, limit)
             self._send_json({"moments": moments})
             return
-        if path == "/api/comparison":
-            query = parse_qs(parsed.query)
-            limit = int(query.get("limit", ["100"])[0])
-            match_status = query.get("match_status", [None])[0] or None
-            review_label = query.get("review_label", [None])[0] or None
-            clip_state = query.get("clip_state", [None])[0] or None
-            order = query.get("order", ["newest"])[0]
-            since_iso = (
-                datetime.now().astimezone()
-                - timedelta(days=max(1, self.state.settings.detector_comparison_days))
-            ).isoformat(timespec="seconds")
-            try:
-                cases = self.state.database.list_comparison_cases(
-                    limit=max(1, min(limit, 1000)),
-                    since_iso=since_iso,
-                    match_status=match_status,
-                    review_label=review_label,
-                    clip_state=clip_state,
-                    order=order,
-                )
-            except ValueError as exc:
-                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
-                return
-            for case in cases:
-                if case.get("moment_id") or case.get("control_clip_path"):
-                    case["download_url"] = f"/api/comparison/{case['id']}/download"
-            self._send_json(
-                {
-                    "cases": cases,
-                    "metrics": self.state.database.comparison_metrics(
-                        since_iso=since_iso
-                    ),
-                }
-            )
-            return
 
         moment_id = _moment_id_from_path(path, "/download")
         if moment_id is not None:
             self._send_moment_download(moment_id)
             return
 
-        comparison_id = _comparison_id_from_path(path, "/download")
-        if comparison_id is not None:
-            self._send_comparison_download(comparison_id)
-            return
-
         self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        comparison_id = _comparison_id_from_path(path, "/review")
-        if comparison_id is not None:
-            try:
-                payload = _read_json(self)
-                label = str(payload.get("label", ""))
-                updated = self.state.database.set_comparison_review(
-                    comparison_id, label
-                )
-            except json.JSONDecodeError:
-                self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid JSON body")
-                return
-            except ValueError as exc:
-                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
-                return
-            if not updated:
-                self._send_error_json(HTTPStatus.NOT_FOUND, "comparison case not found")
-                return
-            self._send_json({"id": comparison_id, "review_label": label})
-            return
-
         moment_id = _moment_id_from_path(path, "/favorite")
         if moment_id is None:
             self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
@@ -398,34 +284,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         clip_path = Path(moment["clip_path"])
         if not clip_path.exists():
             self._send_error_json(HTTPStatus.NOT_FOUND, "clip file not found", include_body=include_body)
-            return
-        self._send_file(
-            clip_path,
-            "application/octet-stream",
-            include_body=include_body,
-            download_name=clip_path.name,
-        )
-
-    def _send_comparison_download(
-        self, comparison_id: int, *, include_body: bool = True
-    ) -> None:
-        case = self.state.database.get_comparison_case(comparison_id)
-        if not case:
-            self._send_error_json(
-                HTTPStatus.NOT_FOUND, "comparison case not found", include_body=include_body
-            )
-            return
-        clip_path: Path | None = None
-        if case.get("moment_id"):
-            moment = self.state.database.get_moment(int(case["moment_id"]))
-            if moment:
-                clip_path = Path(str(moment["clip_path"]))
-        elif case.get("control_clip_path"):
-            clip_path = Path(str(case["control_clip_path"]))
-        if clip_path is None or not clip_path.exists():
-            self._send_error_json(
-                HTTPStatus.NOT_FOUND, "comparison clip not ready", include_body=include_body
-            )
             return
         self._send_file(
             clip_path,

@@ -7,7 +7,8 @@
 namespace dw {
 
 TrackFusion::TrackFusion(const FusionConfig& config)
-    : config_(config), people_count_(0), session_sequence_(0), next_track_id_(0) {}
+    : config_(config), people_count_(0), confirmed_sessions_(0),
+      session_sequence_(0), next_track_id_(0) {}
 
 float TrackFusion::iou(const IvaObject& a, const IvaObject& b) {
     float x1 = std::max(a.x1, b.x1);
@@ -67,6 +68,7 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
             track.last_face_check = -1e9;
             track.last_confirmed = -1e9;
             track.last_publish = -1e9;
+            track.first_face_hit = -1e9;
             track.best_timestamp = now;
             track.person_score = person.score;
             track.previous_cx = (person.x1 + person.x2) * 0.5f;
@@ -117,27 +119,23 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
         update_identity(it->second, now);
 }
 
-bool TrackFusion::has_due_face_candidate(double now) const {
+std::vector<TrackSnapshot> TrackFusion::snapshot(double now) const {
+    std::vector<TrackSnapshot> out;
     for (std::map<uint32_t, Track>::const_iterator it = tracks_.begin();
          it != tracks_.end(); ++it) {
         const Track& track = it->second;
-        if (track.child_like && !track.ambiguous &&
-            now - track.last_seen < config_.track_lost_seconds &&
-            now - track.last_face_check >= config_.face_check_interval_seconds)
-            return true;
+        if (now - track.last_seen >= config_.track_lost_seconds) continue;
+        TrackSnapshot snap;
+        snap.id = track.id;
+        snap.box = track.box;
+        snap.last_seen = track.last_seen;
+        snap.last_face_check = track.last_face_check;
+        snap.child_like = track.child_like;
+        snap.ambiguous = track.ambiguous;
+        snap.identity = track.identity;
+        out.push_back(snap);
     }
-    return false;
-}
-
-void TrackFusion::mark_due_face_candidates_checked(double now) {
-    for (std::map<uint32_t, Track>::iterator it = tracks_.begin();
-         it != tracks_.end(); ++it) {
-        Track& track = it->second;
-        if (track.child_like && !track.ambiguous &&
-            now - track.last_seen < config_.track_lost_seconds &&
-            now - track.last_face_check >= config_.face_check_interval_seconds)
-            track.last_face_check = now;
-    }
+    return out;
 }
 
 uint32_t TrackFusion::track_for_face(float cx, float cy) const {
@@ -145,7 +143,9 @@ uint32_t TrackFusion::track_for_face(float cx, float cy) const {
     float best_area = 1e9f;
     for (std::map<uint32_t, Track>::const_iterator it = tracks_.begin(); it != tracks_.end(); ++it) {
         const Track& track = it->second;
-        float upper_bottom = track.box.y1 + (track.box.y2 - track.box.y1) * 0.68f;
+        // Faces live in the upper part of a person box; the relaxed 0.75
+        // factor also covers a child held at chest height in a merged box.
+        float upper_bottom = track.box.y1 + (track.box.y2 - track.box.y1) * 0.75f;
         if (cx >= track.box.x1 && cx <= track.box.x2 &&
             cy >= track.box.y1 && cy <= upper_bottom) {
             float area = (track.box.x2 - track.box.x1) * (track.box.y2 - track.box.y1);
@@ -160,7 +160,7 @@ uint32_t TrackFusion::track_for_face(float cx, float cy) const {
 
 bool TrackFusion::should_check_face(uint32_t track_id, double now) const {
     std::map<uint32_t, Track>::const_iterator it = tracks_.find(track_id);
-    if (it == tracks_.end() || it->second.ambiguous) return false;
+    if (it == tracks_.end()) return false;
     return now - it->second.last_face_check >= config_.face_check_interval_seconds;
 }
 
@@ -171,14 +171,15 @@ void TrackFusion::mark_face_checked(uint32_t track_id, double now) {
 
 void TrackFusion::apply_face_score(uint32_t track_id, float similarity, double now) {
     std::map<uint32_t, Track>::iterator it = tracks_.find(track_id);
-    if (it == tracks_.end() || it->second.ambiguous) return;
+    if (it == tracks_.end()) return;
     Track& track = it->second;
     track.face_score = std::max(track.face_score, similarity);
     if (similarity >= config_.face_high_threshold) {
         track.face_hits = 2;
         track.first_face_hit = now;
     } else if (similarity >= config_.face_threshold) {
-        if (track.face_hits == 0 || now - track.first_face_hit > 3.0) {
+        if (track.face_hits == 0 ||
+            now - track.first_face_hit > config_.face_hit_window_seconds) {
             track.face_hits = 1;
             track.first_face_hit = now;
         } else {
@@ -186,6 +187,7 @@ void TrackFusion::apply_face_score(uint32_t track_id, float similarity, double n
         }
     }
     if (track.face_hits >= 2) {
+        if (track.identity != IDENTITY_CONFIRMED) confirmed_sessions_++;
         track.last_confirmed = now;
         track.identity = IDENTITY_CONFIRMED;
         track.needs_revalidation = false;
@@ -194,10 +196,10 @@ void TrackFusion::apply_face_score(uint32_t track_id, float similarity, double n
 }
 
 void TrackFusion::update_identity(Track& track, double now) {
-    if (now - track.first_face_hit > 3.0 &&
+    if (now - track.first_face_hit > config_.face_hit_window_seconds &&
         now - track.last_confirmed > config_.confirmed_ttl_seconds) {
         track.face_hits = 0;
-        track.first_face_hit = 0;
+        track.first_face_hit = -1e9;
     }
     if (!track.needs_revalidation &&
         now - track.last_confirmed <= config_.confirmed_ttl_seconds) {
