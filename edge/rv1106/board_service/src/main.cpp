@@ -151,7 +151,7 @@ int main(int argc, char* argv[]) {
     fusion_cfg.probable_min_observations = cfg.get_int("pipeline.probable_min_observations", 5);
     fusion_cfg.child_max_height_ratio = cfg.get_double("pipeline.child_max_height_ratio", 0.45);
     fusion_cfg.relative_child_height_ratio = cfg.get_double("pipeline.relative_child_height_ratio", 0.75);
-    fusion_cfg.face_check_interval_seconds = cfg.get_double("pipeline.face_check_interval_seconds", 2.0);
+    fusion_cfg.face_check_interval_seconds = cfg.get_double("pipeline.face_check_interval_seconds", 1.0);
     fusion_cfg.confirmed_ttl_seconds = cfg.get_double("pipeline.confirmed_ttl_seconds", 8.0);
     fusion_cfg.track_lost_seconds = cfg.get_double("pipeline.track_lost_seconds", 6.0);
     fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 5.0);
@@ -189,6 +189,16 @@ int main(int argc, char* argv[]) {
     long decoded_frames = 0;
     long scanned_frames = 0;
     long reconnects = 0;
+    unsigned long long rockiva_face_detections = 0;
+    unsigned long long face_scan_attempts = 0;
+    unsigned long long retinaface_detections = 0;
+    unsigned long long eligible_face_detections = 0;
+    unsigned long long face_track_matches = 0;
+    unsigned long long embedding_successes = 0;
+    unsigned long long similarity_samples = 0;
+    unsigned long long threshold_hits = 0;
+    unsigned long long high_threshold_hits = 0;
+    float max_face_similarity = -1.0f;
     int iva_failures = 0;
     double last_scan = -1e9;
     double last_face_fallback = -1e9;
@@ -262,32 +272,44 @@ int main(int argc, char* argv[]) {
                     iva_failures = 0;
                 }
                 fusion.observe(now, objects);
+                rockiva_face_detections += objects.faces.size();
 
-                uint32_t candidate_track = 0;
-                for (size_t i = 0; i < objects.faces.size(); ++i) {
-                    float cx = (objects.faces[i].x1 + objects.faces[i].x2) * 0.5f;
-                    float cy = (objects.faces[i].y1 + objects.faces[i].y2) * 0.5f;
-                    uint32_t track = fusion.track_for_face(cx, cy);
-                    if (track && fusion.should_check_face(track, now)) {
-                        candidate_track = track;
-                        break;
+                if (fusion.has_due_face_candidate(now)) {
+                    face_scan_attempts++;
+                    if (frame.to_rgb(rgb)) {
+                        std::vector<FaceBox> faces = face_detector.detect(
+                            rgb.data(), frame.width(), frame.height(), det_score);
+                        retinaface_detections += faces.size();
+                        for (size_t i = 0; i < faces.size(); ++i) {
+                            int face_w = (int)((faces[i].x2 - faces[i].x1) * frame.width());
+                            int face_h = (int)((faces[i].y2 - faces[i].y1) * frame.height());
+                            if (face_w < min_face || face_h < min_face) continue;
+                            eligible_face_detections++;
+                            uint32_t track = fusion.track_for_face(
+                                (faces[i].x1 + faces[i].x2) * 0.5f,
+                                (faces[i].y1 + faces[i].y2) * 0.5f);
+                            if (!track || !fusion.should_check_face(track, now)) continue;
+                            face_track_matches++;
+                            fusion.mark_face_checked(track, now);
+                            if (!recognizer.extract(rgb.data(), frame.width(), frame.height(), faces[i], embedding)) {
+                                printf("[FACE] track=%u det=%.3f size=%dx%d result=embedding-failed\n",
+                                       track, faces[i].score, face_w, face_h);
+                                continue;
+                            }
+                            embedding_successes++;
+                            float similarity = db.best_similarity(embedding);
+                            similarity_samples++;
+                            max_face_similarity = std::max(max_face_similarity, similarity);
+                            if (similarity >= threshold) threshold_hits++;
+                            if (similarity >= high_threshold) high_threshold_hits++;
+                            printf("[FACE] track=%u det=%.3f size=%dx%d similarity=%.4f result=%s\n",
+                                   track, faces[i].score, face_w, face_h, similarity,
+                                   similarity >= high_threshold ? "high-hit" :
+                                   (similarity >= threshold ? "hit" : "below-threshold"));
+                            fusion.apply_face_score(track, similarity, now);
+                        }
                     }
-                }
-                if (candidate_track && frame.to_rgb(rgb)) {
-                    fusion.mark_face_checked(candidate_track, now);
-                    std::vector<FaceBox> faces = face_detector.detect(
-                        rgb.data(), frame.width(), frame.height(), det_score);
-                    for (size_t i = 0; i < faces.size(); ++i) {
-                        int face_w = (int)((faces[i].x2 - faces[i].x1) * frame.width());
-                        int face_h = (int)((faces[i].y2 - faces[i].y1) * frame.height());
-                        if (face_w < min_face || face_h < min_face) continue;
-                        if (!recognizer.extract(rgb.data(), frame.width(), frame.height(), faces[i], embedding)) continue;
-                        float similarity = db.best_similarity(embedding);
-                        uint32_t track = fusion.track_for_face(
-                            (faces[i].x1 + faces[i].x2) * 0.5f,
-                            (faces[i].y1 + faces[i].y2) * 0.5f);
-                        if (track) fusion.apply_face_score(track, similarity, now);
-                    }
+                    fusion.mark_due_face_candidates_checked(now);
                 }
 
                 std::vector<FusionEvent> events = fusion.collect_events(now);
@@ -329,21 +351,32 @@ int main(int argc, char* argv[]) {
                 SystemStats stats = monitor.sample();
                 double p95 = SystemMonitor::percentile95(detector_latencies);
                 int level = guard.update(stats, p95);
-                char status[1024];
+                char status[2048];
                 snprintf(status, sizeof(status),
                          "{\"ts\":%.3f,\"camera_id\":\"%s\",\"pipeline\":\"%s\","
                          "\"guard_level\":%d,\"cpu_percent\":%.1f,"
                          "\"available_memory_mb\":%.1f,\"temperature_c\":%.1f,"
                          "\"detector_p95_ms\":%.1f,\"person_scan_fps\":%.2f,"
                          "\"active_tracks\":%d,\"confirmed_tracks\":%d,"
-                         "\"probable_tracks\":%d,\"decoded_frames\":%ld,"
+                         "\"probable_tracks\":%d,"
+                         "\"rockiva_face_detections\":%llu,\"face_scan_attempts\":%llu,"
+                         "\"retinaface_detections\":%llu,\"eligible_face_detections\":%llu,"
+                         "\"face_track_matches\":%llu,\"embedding_successes\":%llu,"
+                         "\"similarity_samples\":%llu,\"max_face_similarity\":%.4f,"
+                         "\"face_threshold_hits\":%llu,\"face_high_threshold_hits\":%llu,"
+                         "\"decoded_frames\":%ld,"
                          "\"scanned_frames\":%ld,\"rtsp_reconnects\":%ld}",
                          now, camera_id.c_str(), fusion_enabled ? "rockiva_fusion_v1" : "face_only",
                          level, stats.cpu_percent, stats.available_memory_kb / 1024.0,
                          stats.temperature_c, p95,
                          level == 0 ? person_fps : (level == 1 ? 0.5 : 1.0),
                          fusion.active_tracks(), fusion.confirmed_tracks(),
-                         fusion.probable_tracks(), decoded_frames, scanned_frames, reconnects);
+                         fusion.probable_tracks(), rockiva_face_detections,
+                         face_scan_attempts, retinaface_detections,
+                         eligible_face_detections, face_track_matches,
+                         embedding_successes, similarity_samples,
+                         max_face_similarity, threshold_hits, high_threshold_hits,
+                         decoded_frames, scanned_frames, reconnects);
                 if (!status_topic.empty()) mqtt.publish(status_topic, status, 0);
                 printf("[HEALTH] cpu=%.1f%% mem=%.1fMB temp=%.1fC p95=%.1fms guard=%d\n",
                        stats.cpu_percent, stats.available_memory_kb / 1024.0,

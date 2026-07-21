@@ -322,6 +322,88 @@ def test_skipped_board_case_is_not_returned_as_pending(tmp_path):
     assert stored["source_low_segment_id"] == segment_id
 
 
+def test_comparison_case_filters_clip_and_review_state(tmp_path):
+    database = Database(tmp_path / "comparison-filters.sqlite3")
+    database.migrate()
+    segment_path = tmp_path / "low.mp4"
+    segment_path.write_bytes(b"low")
+    segment_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="low",
+        path=segment_path,
+        started_at="2026-07-19T09:00:00+08:00",
+        ended_at="2026-07-19T09:02:00+08:00",
+        duration_seconds=120,
+        size_bytes=3,
+    )
+
+    ready, _ = database.record_detector_event(
+        event_key="board:ready",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at="2026-07-19T09:00:10+08:00",
+        ended_at="2026-07-19T09:00:11+08:00",
+        confidence=0.8,
+        payload={"identity": "confirmed", "face_score": 0.6},
+        merge_gap_seconds=1,
+    )
+    clip = tmp_path / "ready.mp4"
+    metadata = tmp_path / "ready.json"
+    clip.write_bytes(b"clip")
+    metadata.write_text("{}")
+    moment_id = database.create_moment(
+        camera_name="home-camera",
+        title="ready",
+        summary="",
+        tags=[],
+        confidence=0.8,
+        source_low_segment_id=segment_id,
+        source_started_at="2026-07-19T09:00:00+08:00",
+        source_ended_at="2026-07-19T09:02:00+08:00",
+        clip_path=clip,
+        metadata_path=metadata,
+    )
+    database.attach_comparison_moment(int(ready["id"]), moment_id, segment_id)
+
+    skipped, _ = database.record_detector_event(
+        event_key="board:skipped",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at="2026-07-19T10:00:10+08:00",
+        ended_at="2026-07-19T10:00:11+08:00",
+        confidence=0.7,
+        payload={"identity": "probable"},
+        merge_gap_seconds=1,
+    )
+    database.mark_comparison_case_skipped(
+        int(skipped["id"]), segment_id, "daily-cap"
+    )
+
+    pending, _ = database.record_detector_event(
+        event_key="board:pending-filter",
+        source="rv1106_edge",
+        camera_name="home-camera",
+        started_at="2026-07-19T11:00:10+08:00",
+        ended_at="2026-07-19T11:00:11+08:00",
+        confidence=0.6,
+        payload={"identity": "probable"},
+        merge_gap_seconds=1,
+    )
+    database.set_comparison_review(int(pending["id"]), "uncertain")
+
+    assert [row["id"] for row in database.list_comparison_cases(clip_state="ready")] == [
+        ready["id"]
+    ]
+    assert [row["id"] for row in database.list_comparison_cases(clip_state="skipped")] == [
+        skipped["id"]
+    ]
+    pending_rows = database.list_comparison_cases(
+        match_status="board_only", review_label="uncertain", clip_state="pending"
+    )
+    assert [row["id"] for row in pending_rows] == [pending["id"]]
+    assert pending_rows[0]["clip_state"] == "pending"
+
+
 def test_comparison_review_metrics(tmp_path):
     database = Database(tmp_path / "metrics.sqlite3")
     database.migrate()

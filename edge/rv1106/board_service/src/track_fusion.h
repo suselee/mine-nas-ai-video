@@ -49,6 +49,8 @@ public:
     explicit TrackFusion(const FusionConfig& config);
 
     void observe(double now, const IvaResult& detections);
+    bool has_due_face_candidate(double now) const;
+    void mark_due_face_candidates_checked(double now);
     uint32_t track_for_face(float cx, float cy) const;
     bool should_check_face(uint32_t track_id, double now) const;
     void mark_face_checked(uint32_t track_id, double now);

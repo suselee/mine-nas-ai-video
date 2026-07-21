@@ -643,28 +643,65 @@ class Database:
             )
 
     def list_comparison_cases(
-        self, *, limit: int = 200, since_iso: str | None = None
+        self,
+        *,
+        limit: int = 200,
+        since_iso: str | None = None,
+        match_status: str | None = None,
+        review_label: str | None = None,
+        clip_state: str | None = None,
+        order: str = "newest",
     ) -> list[dict[str, Any]]:
+        if match_status not in {None, "board_only", "yolo_only", "both", "control"}:
+            raise ValueError("invalid comparison match_status")
+        if review_label not in {
+            None,
+            "unreviewed",
+            "present",
+            "false_positive",
+            "uncertain",
+        }:
+            raise ValueError("invalid comparison review_label")
+        if clip_state not in {None, "ready", "pending", "skipped"}:
+            raise ValueError("invalid comparison clip_state")
+        if order not in {"newest", "random"}:
+            raise ValueError("invalid comparison order")
+
+        conditions: list[str] = []
+        values: list[Any] = []
+        if since_iso:
+            conditions.append("started_at >= ?")
+            values.append(since_iso)
+        if match_status:
+            conditions.append("match_status = ?")
+            values.append(match_status)
+        if review_label:
+            conditions.append("review_label = ?")
+            values.append(review_label)
+        if clip_state == "ready":
+            conditions.append("(moment_id IS NOT NULL OR control_clip_path IS NOT NULL)")
+        elif clip_state == "skipped":
+            conditions.append(
+                "moment_id IS NULL AND control_clip_path IS NULL AND save_status IS NOT NULL"
+            )
+        elif clip_state == "pending":
+            conditions.append(
+                "moment_id IS NULL AND control_clip_path IS NULL AND save_status IS NULL"
+            )
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        ordering = "RANDOM()" if order == "random" else "started_at DESC, id DESC"
+        values.append(max(1, limit))
         with self.connect() as conn:
-            if since_iso:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM comparison_cases
-                    WHERE started_at >= ?
-                    ORDER BY started_at DESC, id DESC
-                    LIMIT ?
-                    """,
-                    (since_iso, max(1, limit)),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM comparison_cases
-                    ORDER BY started_at DESC, id DESC
-                    LIMIT ?
-                    """,
-                    (max(1, limit),),
-                ).fetchall()
+            rows = conn.execute(
+                f"""
+                SELECT * FROM comparison_cases
+                {where}
+                ORDER BY {ordering}
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
         return [self._decode_comparison_case(row_to_dict(row)) for row in rows]
 
     @staticmethod
@@ -676,6 +713,12 @@ class Database:
             except json.JSONDecodeError:
                 case[key.removesuffix("_json")] = None
         case["control_sample"] = bool(case.get("control_sample"))
+        if case.get("moment_id") or case.get("control_clip_path"):
+            case["clip_state"] = "ready"
+        elif case.get("save_status"):
+            case["clip_state"] = "skipped"
+        else:
+            case["clip_state"] = "pending"
         return case
 
     def set_comparison_review(self, case_id: int, label: str) -> bool:

@@ -33,6 +33,10 @@ int main() {
     TrackFusion fusion(config);
 
     fusion.observe(0, one_person(7, 0.1f, 0.35f));
+    assert(fusion.has_due_face_candidate(0));
+    fusion.mark_due_face_candidates_checked(0);
+    assert(!fusion.has_due_face_candidate(1));
+    assert(fusion.has_due_face_candidate(2));
     fusion.observe(1, one_person(17, 0.11f, 0.35f));
     fusion.observe(2, one_person(27, 0.12f, 0.35f));
     fusion.observe(4, one_person(37, 0.13f, 0.35f));
@@ -45,6 +49,20 @@ int main() {
     events = fusion.collect_events(5);
     assert(events.size() == 1 && events[0].event == "update");
     assert(events[0].identity == "confirmed");
+
+    TrackFusion repeated(config);
+    repeated.observe(0, one_person(1, 0.1f, 0.35f));
+    repeated.apply_face_score(1, 0.40f, 1);
+    assert(repeated.collect_events(1).empty());
+    repeated.apply_face_score(1, 0.40f, 2);
+    events = repeated.collect_events(2);
+    assert(events.size() == 1 && events[0].identity == "confirmed");
+
+    TrackFusion expired(config);
+    expired.observe(0, one_person(1, 0.1f, 0.35f));
+    expired.apply_face_score(1, 0.40f, 1);
+    expired.apply_face_score(1, 0.40f, 5);
+    assert(expired.collect_events(5).empty());
 
     fusion.observe(6, IvaResult());
     events = fusion.collect_events(9);

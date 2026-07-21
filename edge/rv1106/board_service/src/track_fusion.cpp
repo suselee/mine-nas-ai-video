@@ -117,6 +117,29 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
         update_identity(it->second, now);
 }
 
+bool TrackFusion::has_due_face_candidate(double now) const {
+    for (std::map<uint32_t, Track>::const_iterator it = tracks_.begin();
+         it != tracks_.end(); ++it) {
+        const Track& track = it->second;
+        if (track.child_like && !track.ambiguous &&
+            now - track.last_seen < config_.track_lost_seconds &&
+            now - track.last_face_check >= config_.face_check_interval_seconds)
+            return true;
+    }
+    return false;
+}
+
+void TrackFusion::mark_due_face_candidates_checked(double now) {
+    for (std::map<uint32_t, Track>::iterator it = tracks_.begin();
+         it != tracks_.end(); ++it) {
+        Track& track = it->second;
+        if (track.child_like && !track.ambiguous &&
+            now - track.last_seen < config_.track_lost_seconds &&
+            now - track.last_face_check >= config_.face_check_interval_seconds)
+            track.last_face_check = now;
+    }
+}
+
 uint32_t TrackFusion::track_for_face(float cx, float cy) const {
     uint32_t best = 0;
     float best_area = 1e9f;

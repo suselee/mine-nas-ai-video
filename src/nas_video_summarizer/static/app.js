@@ -3,6 +3,11 @@ const momentsContainer = document.querySelector("#moments");
 const comparisonSummary = document.querySelector("#comparison-summary");
 const comparisonCases = document.querySelector("#comparison-cases");
 const refreshButton = document.querySelector("#refresh-button");
+const comparisonMatchFilter = document.querySelector("#comparison-match-filter");
+const comparisonReviewFilter = document.querySelector("#comparison-review-filter");
+const comparisonClipFilter = document.querySelector("#comparison-clip-filter");
+const comparisonOrderFilter = document.querySelector("#comparison-order-filter");
+const boardReviewPreset = document.querySelector("#board-review-preset");
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -118,7 +123,13 @@ function renderHealth(health) {
               rv1106.temperature_c || 0,
             ).toFixed(1)}°C · p95 ${Number(rv1106.detector_p95_ms || 0).toFixed(1)}ms · ${
               rv1106.confirmed_tracks || 0
-            } confirmed / ${rv1106.probable_tracks || 0} probable`
+            } confirmed / ${rv1106.probable_tracks || 0} probable · Face scans ${
+              rv1106.face_scan_attempts || 0
+            } · matches ${rv1106.face_track_matches || 0} · max similarity ${
+              Number(rv1106.max_face_similarity) >= 0
+                ? Number(rv1106.max_face_similarity).toFixed(3)
+                : "—"
+            }`
           : "Waiting for board heartbeat",
     },
     {
@@ -165,25 +176,42 @@ function renderComparison(payload) {
   comparisonCases.innerHTML = cases
     .map((item) => {
       const source = item.control_sample ? "control" : item.match_status;
-      const download = item.download_url
-        ? `<a class="button secondary" href="${item.download_url}" download>Download clip</a>`
-        : `<span class="clip-pending">Clip pending</span>`;
+      let clipAction = `<span class="clip-pending">Clip pending</span>`;
+      if (item.download_url) {
+        clipAction = `<a class="button secondary" href="${item.download_url}" download>Download clip</a>`;
+      } else if (item.clip_state === "skipped") {
+        clipAction = `<span class="clip-pending">Skipped: ${escapeHtml(item.save_status || "not saved")}</span>`;
+      }
+      const faceScore = item.board_payload?.face_score;
+      const pipeline = item.board_payload?.pipeline;
+      const reviewControls = item.download_url
+        ? `<button class="button secondary" data-review="present">Has daughter</button>
+           <button class="button danger" data-review="false_positive">False positive</button>
+           <button class="button secondary" data-review="uncertain">Uncertain</button>`
+        : "";
       return `
         <article class="moment-card comparison-card" data-id="${item.id}">
           <div class="moment-body">
             <div class="moment-title-row"><h3>${escapeHtml(source)}</h3><span class="confidence">${escapeHtml(item.review_label)}</span></div>
             <p>${escapeHtml(formatDate(item.started_at))}</p>
-            <div class="moment-meta"><span>Board ${item.board_score == null ? "—" : Number(item.board_score).toFixed(3)}</span><span>${escapeHtml(item.board_identity || "legacy")}</span><span>${escapeHtml(item.board_event_state || "hit")}</span><span>YOLO ${item.yolo_score == null ? "—" : Number(item.yolo_score).toFixed(3)}</span></div>
+            <div class="moment-meta"><span>Board ${item.board_score == null ? "—" : Number(item.board_score).toFixed(3)}</span><span>${escapeHtml(item.board_identity || "legacy")}</span><span>${escapeHtml(item.board_event_state || "hit")}</span><span>Face ${faceScore == null ? "—" : Number(faceScore).toFixed(3)}</span><span>${escapeHtml(pipeline || "legacy")}</span><span>YOLO ${item.yolo_score == null ? "—" : Number(item.yolo_score).toFixed(3)}</span></div>
             <div class="actions review-actions">
-              ${download}
-              <button class="button secondary" data-review="present">Has daughter</button>
-              <button class="button danger" data-review="false_positive">False positive</button>
-              <button class="button secondary" data-review="uncertain">Uncertain</button>
+              ${clipAction}
+              ${reviewControls}
             </div>
           </div>
         </article>`;
     })
     .join("");
+}
+
+function comparisonUrl() {
+  const query = new URLSearchParams({ limit: "100" });
+  if (comparisonMatchFilter.value) query.set("match_status", comparisonMatchFilter.value);
+  if (comparisonReviewFilter.value) query.set("review_label", comparisonReviewFilter.value);
+  if (comparisonClipFilter.value) query.set("clip_state", comparisonClipFilter.value);
+  query.set("order", comparisonOrderFilter.value || "newest");
+  return `/api/comparison?${query.toString()}`;
 }
 
 function renderMoments(moments) {
@@ -236,7 +264,7 @@ async function loadAll() {
     const [health, moments, comparison] = await Promise.all([
       fetchJson("/api/health"),
       fetchJson("/api/moments"),
-      fetchJson("/api/comparison"),
+      fetchJson(comparisonUrl()),
     ]);
     renderHealth(health);
     renderMoments(moments.moments || []);
@@ -282,6 +310,21 @@ comparisonCases.addEventListener("click", async (event) => {
 });
 
 refreshButton.addEventListener("click", loadAll);
+for (const filter of [
+  comparisonMatchFilter,
+  comparisonReviewFilter,
+  comparisonClipFilter,
+  comparisonOrderFilter,
+]) {
+  filter.addEventListener("change", () => loadAll());
+}
+boardReviewPreset.addEventListener("click", () => {
+  comparisonMatchFilter.value = "board_only";
+  comparisonReviewFilter.value = "unreviewed";
+  comparisonClipFilter.value = "ready";
+  comparisonOrderFilter.value = "random";
+  loadAll();
+});
 loadAll().catch((error) => {
   statusGrid.innerHTML = `<article class="status-card error"><strong>Load failed</strong><small>${escapeHtml(
     error.message,

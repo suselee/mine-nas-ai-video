@@ -49,6 +49,33 @@ def _html_shell() -> str:
             </div>
           </section>
           <section id="comparison-summary" class="comparison-summary"></section>
+          <section class="comparison-toolbar" aria-label="Comparison filters">
+            <select id="comparison-match-filter">
+              <option value="">All detector cases</option>
+              <option value="board_only">Board only</option>
+              <option value="yolo_only">YOLO only</option>
+              <option value="both">Both</option>
+              <option value="control">Controls</option>
+            </select>
+            <select id="comparison-review-filter">
+              <option value="">All review states</option>
+              <option value="unreviewed">Unreviewed</option>
+              <option value="present">Has daughter</option>
+              <option value="false_positive">False positive</option>
+              <option value="uncertain">Uncertain</option>
+            </select>
+            <select id="comparison-clip-filter">
+              <option value="">All clip states</option>
+              <option value="ready">Clip ready</option>
+              <option value="pending">Clip pending</option>
+              <option value="skipped">Clip skipped</option>
+            </select>
+            <select id="comparison-order-filter">
+              <option value="newest">Newest first</option>
+              <option value="random">Random sample</option>
+            </select>
+            <button id="board-review-preset" class="button secondary">Review board-only</button>
+          </section>
           <section id="comparison-cases" class="moments comparison-cases"></section>
 
           <section class="section-header">
@@ -209,13 +236,26 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/comparison":
             query = parse_qs(parsed.query)
             limit = int(query.get("limit", ["100"])[0])
+            match_status = query.get("match_status", [None])[0] or None
+            review_label = query.get("review_label", [None])[0] or None
+            clip_state = query.get("clip_state", [None])[0] or None
+            order = query.get("order", ["newest"])[0]
             since_iso = (
                 datetime.now().astimezone()
                 - timedelta(days=max(1, self.state.settings.detector_comparison_days))
             ).isoformat(timespec="seconds")
-            cases = self.state.database.list_comparison_cases(
-                limit=max(1, min(limit, 1000)), since_iso=since_iso
-            )
+            try:
+                cases = self.state.database.list_comparison_cases(
+                    limit=max(1, min(limit, 1000)),
+                    since_iso=since_iso,
+                    match_status=match_status,
+                    review_label=review_label,
+                    clip_state=clip_state,
+                    order=order,
+                )
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                return
             for case in cases:
                 if case.get("moment_id") or case.get("control_clip_path"):
                     case["download_url"] = f"/api/comparison/{case['id']}/download"
