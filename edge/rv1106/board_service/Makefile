@@ -42,16 +42,17 @@ COMMON_OBJ = $(SRC)/rknn_engine.o $(SRC)/face_detect.o $(SRC)/face_recog.o \
 
 MAIN_OBJ   = $(SRC)/main.o $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mqtt_publisher.o \
              $(SRC)/mpp_decoder.o $(SRC)/rockiva_detector.o $(SRC)/track_fusion.o \
-             $(SRC)/system_monitor.o
+             $(SRC)/system_monitor.o $(SRC)/schedule.o
 ENROLL_OBJ = $(SRC)/enroll.o
 DECTEST_OBJ = $(SRC)/decode_test.o $(SRC)/mpp_decoder.o $(SRC)/stb_impl.o
 PROBE_OBJ = $(SRC)/rockiva_probe.o $(SRC)/rockiva_detector.o $(SRC)/system_monitor.o \
             $(SRC)/config.o $(SRC)/h264_source.o $(SRC)/mpp_decoder.o
 FUSION_TEST_OBJ = $(SRC)/track_fusion_test.o $(SRC)/track_fusion.o
+SCHEDULE_TEST_OBJ = $(SRC)/schedule_test.o $(SRC)/schedule.o
 
 .PHONY: all clean install
 
-all: daughter_watch enroll decode_test rockiva_probe track_fusion_test
+all: daughter_watch enroll decode_test rockiva_probe track_fusion_test schedule_test
 
 daughter_watch: $(COMMON_OBJ) $(MAIN_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(RKNN_LDFLAGS) $(ROCKIT_LDFLAGS) $(ROCKIVA_LDFLAGS) $(COMMON_LDFLAGS)
@@ -70,12 +71,15 @@ rockiva_probe: $(PROBE_OBJ)
 track_fusion_test: $(FUSION_TEST_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(COMMON_LDFLAGS)
 
+schedule_test: $(SCHEDULE_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(COMMON_LDFLAGS)
+
 $(SRC)/%.o: $(SRC)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 install: all
 	@mkdir -p $(INSTALL_DIR)
-	cp daughter_watch enroll decode_test rockiva_probe track_fusion_test $(INSTALL_DIR)/
+	cp daughter_watch enroll decode_test rockiva_probe track_fusion_test schedule_test $(INSTALL_DIR)/
 	cp $(RKNN_API_LIB)/librknnmrt.so $(INSTALL_DIR)/
 	cp $(ROCKIT_LIB)/librockit_full.so $(INSTALL_DIR)/
 	cp $(ROCKIVA_LIB)/librockiva.so $(INSTALL_DIR)/
@@ -98,5 +102,5 @@ install: all
 	@echo "先验证硬解:  ./decode_test test.h264 out.jpg"
 
 clean:
-	rm -f $(SRC)/*.o daughter_watch enroll decode_test rockiva_probe track_fusion_test
+	rm -f $(SRC)/*.o daughter_watch enroll decode_test rockiva_probe track_fusion_test schedule_test
 	rm -rf $(INSTALL_DIR)

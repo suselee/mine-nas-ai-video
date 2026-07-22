@@ -88,6 +88,46 @@ def test_relative_body_size_fallback_rejects_similar_adults():
     assert detector._relative_child_box([first, second]) is None
 
 
+def test_board_probable_requires_independent_face_age_evidence(monkeypatch, tmp_path):
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(3)]
+    observations = iter(
+        [
+            DaughterObservation(0, 0.7, [[0.1, 0.1, 0.2, 0.3]], 2, "relative_body_size"),
+            DaughterObservation(1, 0.8, [[0.1, 0.1, 0.2, 0.3]], 2, "face_age"),
+            DaughterObservation(2, 0.8, [[0.1, 0.1, 0.2, 0.3]], 2, "face_age"),
+        ]
+    )
+    monkeypatch.setattr(detector, "detect_path", lambda frame: next(observations))
+
+    result = detector.verify_board_probable_paths(paths, required_frames=2)
+
+    assert result.accepted is True
+    assert result.positive_frames == 3
+    assert "face_age" in result.evidence
+
+
+def test_board_probable_rejects_duplicate_body_size_evidence(monkeypatch, tmp_path):
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(2)]
+    monkeypatch.setattr(
+        detector,
+        "detect_path",
+        lambda frame: DaughterObservation(
+            frame.offset_seconds,
+            0.7,
+            [[0.1, 0.1, 0.2, 0.3]],
+            2,
+            "relative_body_size",
+        ),
+    )
+
+    result = detector.verify_board_probable_paths(paths, required_frames=2)
+
+    assert result.accepted is False
+    assert result.reason == "no independent child face-age evidence"
+
+
 def test_archive_contract_contains_manifest_and_ready(tmp_path):
     settings = replace(load_settings("/nonexistent.env"), output_dir=tmp_path / "out")
     database = Database(tmp_path / "app.sqlite3")

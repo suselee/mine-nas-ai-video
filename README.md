@@ -2,10 +2,10 @@
 
 Local FreeBSD-jail service for saving meaningful moments from a home RTSP camera.
 
-The service records a low-resolution RTSP stream for analysis and a 4K RTSP
-stream as the quality source. It can either ask a local llama.cpp vision model
-or use a CPU-only daughter detector, then writes selected clips and metadata
-into a Nextcloud-visible folder.
+The service can record low-resolution and 4K RTSP streams for NAS-side analysis,
+or run in the recommended RV1106 board-primary mode where the NAS records only
+the 4K quality source. Selected clips and metadata are written into a
+Nextcloud-visible folder.
 
 For slow local vision models such as Qwen3-VL-2B in llama.cpp, the default analyzer sends one low-resolution contact sheet per segment instead of many separate images. This keeps model calls bounded while still showing several moments in chronological order.
 
@@ -30,7 +30,8 @@ Runtime settings live in `.env`.
 
 Important values:
 
-- `RTSP_LOW_URL`: the camera's small stream, for frame sampling and model analysis.
+- `RTSP_LOW_URL`: the camera's small stream for NAS-side analysis; leave blank
+  in board-primary high-only mode.
 - `RTSP_HIGH_URL`: the camera's 4K stream, for saved clips.
 - `RTSP_USERNAME` / `RTSP_PASSWORD`: optional shared credentials for both RTSP streams.
 - `NEXTCLOUD_OUTPUT_DIR`: a folder mounted into this jail and exposed to Nextcloud.
@@ -38,6 +39,9 @@ Important values:
 - `DAUGHTER_DETECTOR_MODE`: `heuristic` initially, or `onnx` for a trained one-class daughter model.
 - `MQTT_ENABLED`: subscribe to RV1106 daughter identity hits; requires a separate MQTT broker.
 - `RV1106_SESSION_TIMEOUT_SECONDS`: finalize an edge session when its `end` packet is lost.
+- `RV1106_PROBABLE_POLICY`: `verify`, `reject`, or `accept` for board events
+  without face confirmation.
+- `RV1106_SAVE_WAIT_SECONDS`: maximum wait for complete 4K source coverage.
 - `LLAMA_BASE_URL`: your llama.cpp jail's OpenAI-compatible base URL, usually ending in `/v1`.
 - `LLAMA_MODEL`: the multimodal model name served by llama.cpp.
 - `RETENTION_HOURS`: how long raw rolling-buffer segments remain on disk.
@@ -51,7 +55,9 @@ Important values:
 
 ## Camera Stream Advice
 
-Keep the camera's low stream at `640x360` for the first jail test. It matches the 16:9 shape of the 4K stream and preserves enough context for family moments.
+For NAS-side VLM/detector analysis, keep the camera's low stream at `640x360`
+for the first jail test. In board-primary mode the board consumes that stream
+and the NAS may leave `RTSP_LOW_URL` blank.
 
 For cameras that require authentication, prefer this form:
 

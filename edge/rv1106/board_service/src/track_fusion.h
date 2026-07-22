@@ -71,6 +71,9 @@ public:
     // score is applied even while the track overlaps another person.
     void apply_face_score(uint32_t track_id, float similarity, double now);
     std::vector<FusionEvent> collect_events(double now);
+    // End all published sessions and clear live tracks when the active camera
+    // window closes. Cumulative confirmation/session counters are preserved.
+    std::vector<FusionEvent> finish_sessions(double now);
     int active_tracks() const;
     int confirmed_tracks() const;
     int probable_tracks() const;

@@ -24,13 +24,20 @@ Use the same username and password in the RV1106 `[mqtt]` section and the NAS
 
 ## NAS configuration
 
-For edge-only analysis, keep analysis enabled so indexed low-stream segments
-are finalized without running a NAS vision model:
+For the recommended board-primary deployment, the NAS records only the 4K
+rolling buffer. Continuous NAS analysis and the NAS low-stream recorder are
+disabled; probable events still receive an event-level verification before
+publication:
 
 ```env
-ANALYSIS_ENABLED=true
-ANALYSIS_BACKEND=rv1106
+RTSP_LOW_URL=
+RTSP_HIGH_URL=rtsp://camera-ip/4k-stream
+ANALYSIS_ENABLED=false
+ANALYSIS_BACKEND=daughter_detector
+ANALYSIS_STREAM_ROLE=high
 PERSON_FILTER_ENABLED=false
+RECORD_WINDOW_START=06:58
+RECORD_WINDOW_END=21:02
 
 MQTT_ENABLED=true
 MQTT_HOST=192.168.123.201
@@ -41,12 +48,15 @@ MQTT_DAUGHTER_TOPIC=homecam/daughter/hit
 MQTT_STATUS_TOPIC=homecam/daughter/status
 MQTT_CLIENT_ID=nas-video-home-camera
 RV1106_SESSION_TIMEOUT_SECONDS=20
-RV1106_ACCEPT_PROBABLE=true
+RV1106_SAVE_WAIT_SECONDS=180
+RV1106_PROBABLE_POLICY=verify
 ```
 
-`RV1106_ACCEPT_PROBABLE=false` saves only face-confirmed sessions. With the
-default `true`, persistent child-sized tracks are also kept as
-`rv1106_probable` moments for higher recall.
+`RV1106_PROBABLE_POLICY=verify` trusts face-confirmed sessions and samples five
+frames from a staged 4K clip for probable sessions. Body-size evidence alone
+cannot pass this check. Use `reject` after the board is mature enough to save
+confirmed sessions only, or `accept` temporarily for maximum recall. The old
+`RV1106_ACCEPT_PROBABLE` boolean remains compatible when the policy is absent.
 
 Run `uv run nas-video-check`, restart the service, then inspect `/api/health`.
 `workers.mqtt.status=connected` confirms the subscription. The RV1106 status
@@ -67,10 +77,25 @@ SQLite before clip processing:
 - Legacy one-shot `event=hit` payloads remain supported and are finalized
   immediately.
 
-The worker waits for matching low-stream indexing and complete 4K coverage,
-then extracts around the board's `best_ts`. Session payload, identity,
+The worker waits for complete 4K coverage around the board's `best_ts`; no NAS
+low segment is required. Session payload, identity,
 similarity/activity scores, and the persistent trigger key are written to the
 moment metadata.
+
+## Board active window
+
+The board keeps MQTT online but closes RTSP, the decoder, and inference outside
+its local active window:
+
+```ini
+[schedule]
+enabled = true
+start = 07:00
+end = 21:00
+utc_offset_minutes = 480
+```
+
+Sleeping heartbeats use `pipeline=sleeping` and `schedule_active=false`.
 
 The retired RV1106-versus-YOLO comparison UI is no longer active. Existing
 `detector_events` and `comparison_cases` tables are preserved during migration

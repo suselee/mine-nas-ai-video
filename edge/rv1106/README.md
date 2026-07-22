@@ -12,6 +12,11 @@ H.264 low stream -> RockIt software VDEC -> YUV420 DMA buffer
   -> confirmed/probable session events over MQTT
 ```
 
+By default the board connects to RTSP only from 07:00 to 21:00 at UTC+8.
+Outside that window it keeps the process and MQTT heartbeat alive with
+`pipeline=sleeping`, while RTSP, decoding, and inference are stopped. Configure
+the window in the `[schedule]` section of `config.ini`.
+
 Build with `make -C edge/rv1106/board_service`. `LUCKFOX_SDK_DIR`,
 `RKNN_SDK_DIR`, and `TOOLCHAIN_DIR` can be overridden on the make command line.
 Run `rockiva_probe config.ini 30` on the board before installing a new binary.
@@ -31,6 +36,7 @@ Copy that directory to the board and run:
 ```
 
 The installer stops the old service, snapshots the current binary/config/
-database, runs the live RTSP RockIVA probe, and only replaces the production
-binary if the probe succeeds. It installs the persistent rollback command as
+database, runs the schedule and track-fusion tests plus the live RTSP RockIVA
+probe, and only replaces the production binary if those checks succeed. It
+installs the persistent rollback command as
 `/root/daughter_watch/rollback_on_board.sh`.

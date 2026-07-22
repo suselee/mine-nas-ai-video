@@ -73,6 +73,8 @@ class Database:
                     tags_json TEXT NOT NULL,
                     confidence REAL NOT NULL DEFAULT 0,
                     source_low_segment_id INTEGER,
+                    source_segment_id INTEGER,
+                    source_stream_role TEXT,
                     source_started_at TEXT NOT NULL,
                     source_ended_at TEXT NOT NULL,
                     clip_path TEXT NOT NULL UNIQUE,
@@ -85,7 +87,8 @@ class Database:
                     trigger_key TEXT,
                     favorited INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY(source_low_segment_id) REFERENCES segments(id)
+                    FOREIGN KEY(source_low_segment_id) REFERENCES segments(id),
+                    FOREIGN KEY(source_segment_id) REFERENCES segments(id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_moments_created_at
@@ -142,6 +145,8 @@ class Database:
                 ("clip_started_at", "TEXT"),
                 ("clip_ended_at", "TEXT"),
                 ("trigger_key", "TEXT"),
+                ("source_segment_id", "INTEGER"),
+                ("source_stream_role", "TEXT"),
             )
             for name, declaration in additions:
                 if name not in columns:
@@ -157,6 +162,14 @@ class Database:
             conn.execute(
                 "UPDATE moments SET clip_ended_at=source_ended_at "
                 "WHERE clip_ended_at IS NULL"
+            )
+            conn.execute(
+                "UPDATE moments SET source_segment_id=source_low_segment_id "
+                "WHERE source_segment_id IS NULL AND source_low_segment_id IS NOT NULL"
+            )
+            conn.execute(
+                "UPDATE moments SET source_stream_role='low' "
+                "WHERE source_stream_role IS NULL AND source_low_segment_id IS NOT NULL"
             )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_moments_trigger_key "
@@ -586,18 +599,29 @@ class Database:
         clip_started_at: str | None = None,
         clip_ended_at: str | None = None,
         trigger_key: str | None = None,
+        source_segment_id: int | None = None,
+        source_stream_role: str | None = None,
     ) -> int:
+        resolved_source_segment_id = (
+            source_low_segment_id
+            if source_segment_id is None
+            else source_segment_id
+        )
+        resolved_source_stream_role = source_stream_role or (
+            "low" if source_low_segment_id is not None else None
+        )
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO moments(
                     camera_name, title, summary, tags_json, confidence,
-                    source_low_segment_id, source_started_at, source_ended_at,
+                    source_low_segment_id, source_segment_id, source_stream_role,
+                    source_started_at, source_ended_at,
                     clip_path, metadata_path, analysis_backend, category,
                     selection_score, clip_started_at, clip_ended_at, trigger_key,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     camera_name,
@@ -606,6 +630,8 @@ class Database:
                     json.dumps(tags, ensure_ascii=True),
                     confidence,
                     source_low_segment_id,
+                    resolved_source_segment_id,
+                    resolved_source_stream_role,
                     source_started_at,
                     source_ended_at,
                     str(clip_path),

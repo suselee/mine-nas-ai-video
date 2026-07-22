@@ -288,6 +288,19 @@ std::vector<FusionEvent> TrackFusion::collect_events(double now) {
     return events;
 }
 
+std::vector<FusionEvent> TrackFusion::finish_sessions(double now) {
+    std::vector<FusionEvent> events;
+    for (std::map<uint32_t, Track>::iterator it = tracks_.begin();
+         it != tracks_.end(); ++it) {
+        Track& track = it->second;
+        if (track.session_active)
+            events.push_back(make_event(track, "end", now));
+    }
+    tracks_.clear();
+    people_count_ = 0;
+    return events;
+}
+
 int TrackFusion::active_tracks() const { return (int)tracks_.size(); }
 
 int TrackFusion::confirmed_tracks() const {

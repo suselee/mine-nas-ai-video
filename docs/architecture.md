@@ -8,6 +8,13 @@
 > [daughter-detector.md](daughter-detector.md) for the detector and desktop
 > handoff contract.
 
+> The recommended RV1106 production path is now board-primary and high-only on
+> the NAS: the board analyzes the low stream during its active window, the NAS
+> records only 4K, and MQTT `best_ts` is resolved directly against high-stream
+> segments. Confirmed events publish directly; probable events optionally run
+> a strict five-frame NAS verification. `ANALYSIS_ENABLED=false` disables the
+> continuous analyzer without disabling MQTT event processing.
+
 下面这张图对应当前 `main` 分支的实现。箭头表示数据流，虚线表示控制、状态或查询。
 
 ```mermaid

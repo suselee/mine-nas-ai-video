@@ -143,7 +143,60 @@ def test_migrate_adds_detector_columns_to_existing_moments_table(tmp_path):
     with database.connect() as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(moments)")}
 
-    assert {"analysis_backend", "category", "selection_score", "clip_started_at"} <= columns
+    assert {
+        "analysis_backend",
+        "category",
+        "selection_score",
+        "clip_started_at",
+        "source_segment_id",
+        "source_stream_role",
+    } <= columns
+
+
+def test_migrate_backfills_generic_source_segment(tmp_path):
+    database = Database(tmp_path / "source.sqlite3")
+    database.migrate()
+    segment_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="low",
+        path=tmp_path / "low.mp4",
+        started_at="2026-07-17T09:00:00+08:00",
+        ended_at="2026-07-17T09:02:00+08:00",
+        duration_seconds=120,
+        size_bytes=1,
+    )
+    with database.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO moments(
+                camera_name, title, summary, tags_json, confidence,
+                source_low_segment_id, source_started_at, source_ended_at,
+                clip_path, metadata_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "home-camera",
+                "legacy",
+                "",
+                "[]",
+                0.5,
+                segment_id,
+                "2026-07-17T09:00:00+08:00",
+                "2026-07-17T09:02:00+08:00",
+                str(tmp_path / "clip.mp4"),
+                str(tmp_path / "clip.json"),
+                "2026-07-17T09:03:00+08:00",
+            ),
+        )
+        conn.execute(
+            "UPDATE moments SET source_segment_id=NULL, source_stream_role=NULL"
+        )
+
+    database.migrate()
+
+    moment = database.list_moments(limit=1)[0]
+    assert moment["source_segment_id"] == segment_id
+    assert moment["source_stream_role"] == "low"
 
 
 def test_migrate_converts_legacy_utc_created_at_to_local_iso(tmp_path):

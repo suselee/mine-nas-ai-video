@@ -84,7 +84,27 @@ def test_new_window_and_quota_defaults(monkeypatch):
     assert settings.mqtt_daughter_topic == "homecam/daughter/hit"
     assert settings.mqtt_status_topic == "homecam/daughter/status"
     assert settings.rv1106_session_timeout_seconds == 20.0
+    assert settings.rv1106_save_wait_seconds == 180.0
+    assert settings.rv1106_probable_policy == "accept"
     assert settings.rv1106_accept_probable is True
+
+
+def test_new_probable_policy_overrides_legacy_boolean(tmp_path, monkeypatch):
+    monkeypatch.setenv("RV1106_ACCEPT_PROBABLE", "false")
+    monkeypatch.setenv("RV1106_PROBABLE_POLICY", "verify")
+
+    settings = load_settings(tmp_path / "missing.env")
+
+    assert settings.rv1106_probable_policy == "verify"
+    assert settings.rv1106_accept_probable is True
+
+
+def test_invalid_probable_policy_is_rejected(tmp_path, monkeypatch):
+    import pytest
+
+    monkeypatch.setenv("RV1106_PROBABLE_POLICY", "maybe")
+    with pytest.raises(ValueError, match="RV1106_PROBABLE_POLICY"):
+        load_settings(tmp_path / "missing.env")
 
 
 def test_env_overrides_window_and_quota():

@@ -19,6 +19,7 @@ from nas_video_summarizer.workers import (
     _in_time_window,
     _in_record_window,
     _moment_period,
+    _segments_cover_window,
     _stream_alignment_snapshot,
 )
 
@@ -104,6 +105,25 @@ def test_stream_alignment_requires_enough_pairs():
 
     assert result["status"] == "insufficient"
     assert result["paired_segments"] == 1
+
+
+def test_segments_cover_window_across_adjacent_high_segments():
+    segments = [
+        {
+            "started_at": "2026-07-15T08:00:00+08:00",
+            "ended_at": "2026-07-15T08:02:00+08:00",
+        },
+        {
+            "started_at": "2026-07-15T08:02:01+08:00",
+            "ended_at": "2026-07-15T08:04:00+08:00",
+        },
+    ]
+    assert _segments_cover_window(
+        segments,
+        datetime.fromisoformat("2026-07-15T08:01:55+08:00"),
+        datetime.fromisoformat("2026-07-15T08:02:10+08:00"),
+        gap_tolerance_seconds=2,
+    )
 
 
 def _dt(hour: int, minute: int) -> datetime:
@@ -959,6 +979,34 @@ def test_mqtt_status_heartbeat_updates_rv1106_health(tmp_path):
     assert supervisor.state["rv1106"]["pipeline"] == "rockiva_fusion_v1"
 
 
+def test_mqtt_reject_policy_ignores_probable_sessions(tmp_path):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        mqtt_enabled=True,
+        mqtt_daughter_topic="homecam/daughter/hit",
+        rv1106_probable_policy="reject",
+        rv1106_accept_probable=False,
+    )
+    database = Database(tmp_path / "mqtt-reject.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+    payload = json.dumps(
+        {
+            "ts": datetime.fromisoformat("2026-07-19T10:00:00+08:00").timestamp(),
+            "score": 0.7,
+            "camera_id": "home-camera",
+            "event": "start",
+            "session_id": "track-1",
+            "identity": "probable",
+        }
+    ).encode()
+
+    asyncio.run(supervisor._handle_mqtt_message("homecam/daughter/hit", payload))
+
+    assert database.count_pending_board_sessions() == 0
+    assert supervisor.state["mqtt"]["last_ignored_identity"] == "probable"
+
+
 def test_mqtt_fusion_session_persists_start_update_end(tmp_path, monkeypatch):
     settings = replace(
         load_settings("/nonexistent.env"),
@@ -1137,6 +1185,32 @@ def _index_low_high_segments(database, tmp_path):
     return low_id
 
 
+def _index_high_segments(database, tmp_path, *, split=False):
+    rows = [
+        ("high-1.mp4", "2026-07-19T10:00:00+08:00", "2026-07-19T10:02:00+08:00")
+    ]
+    if split:
+        rows.append(
+            ("high-2.mp4", "2026-07-19T10:02:00+08:00", "2026-07-19T10:04:00+08:00")
+        )
+    ids = []
+    for name, started_at, ended_at in rows:
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        ids.append(
+            database.upsert_segment(
+                camera_name="home-camera",
+                stream_role="high",
+                path=path,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_seconds=120,
+                size_bytes=path.stat().st_size,
+            )
+        )
+    return ids
+
+
 def test_board_session_obeys_daily_cap(tmp_path, monkeypatch):
     settings = replace(
         load_settings("/nonexistent.env"),
@@ -1221,6 +1295,102 @@ def test_board_session_saves_moment_from_buffered_segments(tmp_path, monkeypatch
     assert moments[0]["trigger_key"] == "s-1"
     assert supervisor._last_board_moment_id == moments[0]["id"]
     assert supervisor._last_board_saved_at is not None
+
+
+def test_board_session_saves_from_high_only_across_segment_boundary(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "output",
+        context_before_seconds=5,
+        context_after_seconds=10,
+        analysis_stream_role="high",
+    )
+    database = Database(tmp_path / "board-high-only.sqlite3")
+    database.migrate()
+    high_ids = _index_high_segments(database, tmp_path, split=True)
+    supervisor = Supervisor(settings, database)
+    captured_paths = []
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        captured_paths.extend(paths)
+        output_path.write_bytes(b"high-only")
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    event_time = datetime.fromisoformat("2026-07-19T10:01:58+08:00")
+
+    asyncio.run(
+        supervisor._save_board_session(_board_session(event_time.timestamp()))
+    )
+
+    moments = database.list_moments()
+    assert len(moments) == 1
+    assert moments[0]["source_segment_id"] == high_ids[0]
+    assert moments[0]["source_low_segment_id"] is None
+    assert moments[0]["source_stream_role"] == "high"
+    assert [path.name for path in captured_paths] == ["high-1.mp4", "high-2.mp4"]
+    metadata = json.loads(Path(moments[0]["metadata_path"]).read_text())
+    assert metadata["source_stream_role"] == "high"
+    assert "source_low_segment" not in metadata
+
+
+def test_probable_board_clip_is_not_published_when_event_verification_fails(
+    tmp_path, monkeypatch
+):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "output",
+        context_after_seconds=10,
+        rv1106_probable_policy="verify",
+        rv1106_accept_probable=True,
+    )
+    database = Database(tmp_path / "board-probable.sqlite3")
+    database.migrate()
+    _index_high_segments(database, tmp_path)
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        output_path.write_bytes(b"probable")
+
+    async def reject_probable(detector, clip_path, duration_seconds):
+        supervisor._probable_rejected += 1
+        return False
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    monkeypatch.setattr(supervisor, "_verify_board_probable_clip", reject_probable)
+    event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
+
+    asyncio.run(
+        supervisor._save_board_session(
+            _board_session(event_time.timestamp(), identity="probable")
+        )
+    )
+
+    assert database.list_moments() == []
+    assert not list((tmp_path / "output").rglob("*.mp4"))
+    assert supervisor._probable_rejected == 1
+
+
+def test_high_only_alignment_is_not_applicable(tmp_path):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        rtsp_low_url="",
+        rtsp_high_url="rtsp://camera/high",
+    )
+    database = Database(tmp_path / "alignment.sqlite3")
+    database.migrate()
+    supervisor = Supervisor(settings, database)
+
+    supervisor._update_stream_alignment()
+
+    assert supervisor.state["stream_alignment"]["status"] == "not_applicable"
 
 
 def test_rv1106_backend_finalizes_segments_without_detector(tmp_path, monkeypatch):

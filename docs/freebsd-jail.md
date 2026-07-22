@@ -104,6 +104,24 @@ STREAM_ALIGNMENT_SAMPLE_COUNT=5
 CAMERA_TIME_OFFSET_SECONDS=-23
 ```
 
+For the board-primary RV1106 deployment, the NAS can run high-only. Keep a
+small recording margin around the board's 07:00-21:00 detection window:
+
+```text
+RTSP_LOW_URL=
+ANALYSIS_ENABLED=false
+ANALYSIS_BACKEND=daughter_detector
+ANALYSIS_STREAM_ROLE=high
+RECORD_WINDOW_START=06:58
+RECORD_WINDOW_END=21:02
+RV1106_PROBABLE_POLICY=verify
+RV1106_SAVE_WAIT_SECONDS=180
+```
+
+In this mode a blank low URL is expected: MQTT event processing remains active,
+confirmed events use the 4K buffer directly, and only probable events load the
+NAS detector for a five-frame verification.
+
 If the RTSP password contains special characters, quote it in `.env`, for example `RTSP_PASSWORD="your#complex&password"`.
 
 Run the preflight:

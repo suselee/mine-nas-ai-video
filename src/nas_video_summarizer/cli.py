@@ -89,7 +89,12 @@ def _person_filter_check(settings: Settings) -> Check:
 
 
 def _daughter_detector_check(settings: Settings) -> Check:
-    if settings.analysis_backend != "daughter_detector":
+    continuous_detector_active = (
+        settings.analysis_enabled
+        and settings.analysis_backend == "daughter_detector"
+    )
+    probable_verifier_active = settings.rv1106_probable_policy == "verify"
+    if not continuous_detector_active and not probable_verifier_active:
         return Check("daughter detector", True, "inactive", required=False)
     try:
         detail = DaughterDetector(settings).prepare()
@@ -130,6 +135,10 @@ def build_checks(settings: Settings) -> list[Check]:
             "low RTSP stream",
             bool(settings.rtsp_low_url),
             _redact_url(settings.rtsp_low_url_for_ffmpeg) or "RTSP_LOW_URL is empty",
+            required=(
+                settings.analysis_enabled
+                and settings.analysis_stream_role == "low"
+            ),
         ),
         Check(
             "4K RTSP stream",

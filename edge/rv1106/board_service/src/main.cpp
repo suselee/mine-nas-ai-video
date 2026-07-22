@@ -21,6 +21,7 @@
 #include "mpp_decoder.h"
 #include "mqtt_publisher.h"
 #include "rockiva_detector.h"
+#include "schedule.h"
 #include "system_monitor.h"
 #include "track_fusion.h"
 
@@ -166,6 +167,23 @@ static std::string event_payload(const FusionEvent& event, const std::string& ca
     return payload;
 }
 
+static void publish_fusion_events(
+        MqttPublisher& mqtt, const std::string& topic, int qos,
+        const std::string& camera, long& sequence,
+        const std::vector<FusionEvent>& events, int width, int height,
+        const char* pipeline) {
+    for (size_t i = 0; i < events.size(); ++i) {
+        sequence++;
+        std::string payload = event_payload(
+            events[i], camera, sequence, width, height, pipeline);
+        bool sent = mqtt.publish(topic, payload, qos);
+        printf("[EVENT] %s track=%u identity=%s score=%.3f MQTT=%s\n",
+               events[i].event.c_str(), events[i].track_id,
+               events[i].identity.c_str(), events[i].score,
+               sent ? "OK" : "FAIL");
+    }
+}
+
 static bool publish_legacy_face(MqttPublisher& mqtt, const std::string& topic, int qos,
                                 const std::string& camera, long sequence, double now,
                                 float score, const FaceBox& face, int width, int height) {
@@ -224,6 +242,17 @@ int main(int argc, char* argv[]) {
     int mqtt_qos = cfg.get_int("mqtt.qos", 1);
     std::string camera_id = cfg.get("meta.camera_id", "home-camera");
 
+    std::string schedule_start_text = cfg.get("schedule.start", "07:00");
+    std::string schedule_end_text = cfg.get("schedule.end", "21:00");
+    ActiveSchedule schedule;
+    schedule.enabled = cfg.get_bool("schedule.enabled", true);
+    schedule.utc_offset_minutes = cfg.get_int("schedule.utc_offset_minutes", 480);
+    if (!parse_hhmm(schedule_start_text, &schedule.start_minute) ||
+        !parse_hhmm(schedule_end_text, &schedule.end_minute)) {
+        printf("[ERR] schedule.start/end must use HH:MM\n");
+        return 1;
+    }
+
     if (rtsp_url.empty() || det_path.empty() || rec_path.empty() || db_path.empty()) {
         printf("[ERR] rtsp.url and all face model paths are required\n");
         return 1;
@@ -271,10 +300,7 @@ int main(int argc, char* argv[]) {
 
     H264Source src;
     MppDecoder decoder(rtsp_w, rtsp_h);
-    if (!src.open(rtsp_url) || !decoder.init()) {
-        printf("[ERR] RTSP or decoder initialization failed\n");
-        return 1;
-    }
+    bool stream_active = false;
 
     SystemMonitor monitor;
     monitor.sample();
@@ -310,25 +336,91 @@ int main(int argc, char* argv[]) {
     double last_scan = -1e9;
     double last_face_fallback = -1e9;
     double last_face_hit = -1e9;
-    double last_health = now_seconds();
+    double last_health = -1e9;
     int reconnect_wait = 2;
 
-    printf("[RUN] %s %dx%d H264; source 5fps, person scan %.2ffps\n",
-           fusion_enabled ? "rockiva_fusion_v1" : "face_only", rtsp_w, rtsp_h, person_fps);
+    printf("[RUN] %s %dx%d H264; source 5fps, person scan %.2ffps; schedule=%s %s-%s UTC%+dmin\n",
+           fusion_enabled ? "rockiva_fusion_v1" : "face_only", rtsp_w, rtsp_h,
+           person_fps, schedule.enabled ? "on" : "off",
+           schedule_start_text.c_str(), schedule_end_text.c_str(),
+           schedule.utc_offset_minutes);
 
     while (g_running) {
+        double loop_now = now_seconds();
+        bool schedule_active = schedule_active_at(loop_now, schedule);
+        if (!schedule_active) {
+            if (stream_active || fusion.active_tracks() > 0) {
+                std::vector<FusionEvent> ending = fusion.finish_sessions(loop_now);
+                publish_fusion_events(
+                    mqtt, hit_topic, mqtt_qos, camera_id, sequence, ending,
+                    rtsp_w, rtsp_h,
+                    fusion_enabled ? "rockiva_fusion_v1" : "face_only");
+                if (stream_active) {
+                    src.close();
+                    decoder.deinit();
+                }
+                stream_active = false;
+                reconnect_wait = 2;
+                last_health = -1e9;
+                printf("[SCHEDULE] active window ended; RTSP and decoder stopped\n");
+            }
+            if (loop_now - last_health >= 60.0) {
+                last_health = loop_now;
+                SystemStats stats = monitor.sample();
+                char status[1536];
+                snprintf(status, sizeof(status),
+                         "{\"ts\":%.3f,\"camera_id\":\"%s\",\"pipeline\":\"sleeping\","
+                         "\"schedule_active\":false,\"active_window_start\":\"%s\","
+                         "\"active_window_end\":\"%s\",\"utc_offset_minutes\":%d,"
+                         "\"guard_level\":0,\"cpu_percent\":%.1f,"
+                         "\"available_memory_mb\":%.1f,\"temperature_c\":%.1f,"
+                         "\"detector_p95_ms\":0.0,\"person_scan_fps\":0.0,"
+                         "\"active_tracks\":0,\"confirmed_tracks\":0,"
+                         "\"probable_tracks\":0,\"confirmed_sessions\":%d,"
+                         "\"decoded_frames\":%ld,\"scanned_frames\":%ld,"
+                         "\"rtsp_reconnects\":%ld}",
+                         loop_now, camera_id.c_str(), schedule_start_text.c_str(),
+                         schedule_end_text.c_str(), schedule.utc_offset_minutes,
+                         stats.cpu_percent, stats.available_memory_kb / 1024.0,
+                         stats.temperature_c, fusion.confirmed_sessions(),
+                         decoded_frames, scanned_frames, reconnects);
+                if (!status_topic.empty()) mqtt.publish(status_topic, status, 0);
+                printf("[HEALTH] sleeping cpu=%.1f%% mem=%.1fMB temp=%.1fC\n",
+                       stats.cpu_percent, stats.available_memory_kb / 1024.0,
+                       stats.temperature_c);
+            }
+            sleep(1);
+            continue;
+        }
+
+        if (!stream_active) {
+            if (!src.open(rtsp_url) || !decoder.init()) {
+                reconnects++;
+                src.close();
+                decoder.deinit();
+                printf("[WARN] RTSP or decoder initialization failed; retrying in %ds\n",
+                       reconnect_wait);
+                sleep(reconnect_wait);
+                reconnect_wait = std::min(30, reconnect_wait * 2);
+                continue;
+            }
+            stream_active = true;
+            reconnect_wait = 2;
+            last_scan = -1e9;
+            last_face_fallback = -1e9;
+            last_health = -1e9;
+            printf("[SCHEDULE] active window started; RTSP and decoder running\n");
+        }
+
         int n = src.read_chunk(chunk.data(), (int)chunk.size());
         if (n < 0) {
             if (!g_running) break;
             reconnects++;
             src.close();
             decoder.deinit();
+            stream_active = false;
             sleep(reconnect_wait);
-            if (!src.reopen() || !decoder.init()) {
-                reconnect_wait = std::min(30, reconnect_wait * 2);
-                continue;
-            }
-            reconnect_wait = 2;
+            reconnect_wait = std::min(30, reconnect_wait * 2);
             continue;
         }
         if (n > 0) {
@@ -465,17 +557,9 @@ int main(int argc, char* argv[]) {
                 }
 
                 std::vector<FusionEvent> events = fusion.collect_events(now);
-                for (size_t i = 0; i < events.size(); ++i) {
-                    sequence++;
-                    std::string payload = event_payload(events[i], camera_id, sequence,
-                                                        frame.width(), frame.height(),
-                                                        "rockiva_fusion_v1");
-                    bool sent = mqtt.publish(hit_topic, payload, mqtt_qos);
-                    printf("[EVENT] %s track=%u identity=%s score=%.3f MQTT=%s\n",
-                           events[i].event.c_str(), events[i].track_id,
-                           events[i].identity.c_str(), events[i].score,
-                           sent ? "OK" : "FAIL");
-                }
+                publish_fusion_events(
+                    mqtt, hit_topic, mqtt_qos, camera_id, sequence, events,
+                    frame.width(), frame.height(), "rockiva_fusion_v1");
             } else if (now - last_face_fallback >= 1.0 && frame.to_rgb(rgb)) {
                 last_face_fallback = now;
                 std::vector<FaceBox> faces = face_detector.detect(
@@ -506,6 +590,8 @@ int main(int argc, char* argv[]) {
                 char status[2048];
                 snprintf(status, sizeof(status),
                          "{\"ts\":%.3f,\"camera_id\":\"%s\",\"pipeline\":\"%s\","
+                         "\"schedule_active\":true,\"active_window_start\":\"%s\","
+                         "\"active_window_end\":\"%s\",\"utc_offset_minutes\":%d,"
                          "\"guard_level\":%d,\"cpu_percent\":%.1f,"
                          "\"available_memory_mb\":%.1f,\"temperature_c\":%.1f,"
                          "\"detector_p95_ms\":%.1f,\"person_scan_fps\":%.2f,"
@@ -520,6 +606,8 @@ int main(int argc, char* argv[]) {
                          "\"decoded_frames\":%ld,"
                          "\"scanned_frames\":%ld,\"rtsp_reconnects\":%ld}",
                           now, camera_id.c_str(), fusion_enabled ? "rockiva_fusion_v1" : "face_only",
+                          schedule_start_text.c_str(), schedule_end_text.c_str(),
+                          schedule.utc_offset_minutes,
                           level, stats.cpu_percent, stats.available_memory_kb / 1024.0,
                           stats.temperature_c, p95,
                           level == 0 ? person_fps : (level == 1 ? 0.5 : 1.0),
@@ -541,6 +629,11 @@ int main(int argc, char* argv[]) {
     }
 
     printf("[SHUTDOWN] cleaning up\n");
+    std::vector<FusionEvent> ending = fusion.finish_sessions(now_seconds());
+    publish_fusion_events(
+        mqtt, hit_topic, mqtt_qos, camera_id, sequence, ending,
+        rtsp_w, rtsp_h,
+        fusion_enabled ? "rockiva_fusion_v1" : "face_only");
     src.close();
     decoder.deinit();
     mqtt.disconnect();

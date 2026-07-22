@@ -51,14 +51,18 @@ function renderHealth(health) {
   const highRecorder = workers.recorders?.high || {};
   const mqtt = workers.mqtt || {};
   const rv1106 = workers.rv1106 || {};
+  const highOnly = health.configured.recording_mode === "high_only";
 
   const cards = [
     {
       label: "RTSP",
-      value: health.configured.low_rtsp && health.configured.high_rtsp ? "Configured" : "Waiting",
+      value:
+        health.configured.high_rtsp && (health.configured.low_rtsp || highOnly)
+          ? "Configured"
+          : "Waiting",
       meta: `Low: ${health.configured.low_rtsp ? "yes" : "no"} | 4K: ${
         health.configured.high_rtsp ? "yes" : "no"
-      }`,
+      } | ${health.configured.recording_mode || "unknown"}`,
     },
     {
       label: "Tools",
@@ -67,8 +71,12 @@ function renderHealth(health) {
     },
     {
       label: "Recorders",
-      value: `Low ${lowRecorder.status || "unknown"}`,
-      meta: `4K ${highRecorder.status || "unknown"}`,
+      value: highOnly
+        ? `4K ${highRecorder.status || "unknown"}`
+        : `Low ${lowRecorder.status || "unknown"}`,
+      meta: highOnly
+        ? "Low disabled as configured"
+        : `4K ${highRecorder.status || "unknown"}`,
     },
     {
       label: "Analyzer",
@@ -81,8 +89,10 @@ function renderHealth(health) {
     },
     {
       label: "Backlog",
-      value: `${health.segments.pending_low} segments`,
-      meta: `Latest low: ${formatDate(latestLow?.started_at)}`,
+      value: highOnly ? "Event-driven" : `${health.segments.pending_low} segments`,
+      meta: highOnly
+        ? `Latest 4K: ${formatDate(latestHigh?.started_at)}`
+        : `Latest low: ${formatDate(latestLow?.started_at)}`,
     },
     {
       label: "Storage",
@@ -111,7 +121,11 @@ function renderHealth(health) {
       value: rv1106.pipeline || rv1106.status || "unknown",
       meta:
         rv1106.status === "online"
-          ? `CPU ${Number(rv1106.cpu_percent || 0).toFixed(1)}% · ${Number(
+          ? rv1106.pipeline === "sleeping"
+            ? `Scheduled idle · ${rv1106.active_window_start || "07:00"}–${
+                rv1106.active_window_end || "21:00"
+              } · probable policy ${rv1106.probable_policy || "unknown"}`
+            : `CPU ${Number(rv1106.cpu_percent || 0).toFixed(1)}% · ${Number(
               rv1106.temperature_c || 0,
             ).toFixed(1)}°C · p95 ${Number(rv1106.detector_p95_ms || 0).toFixed(1)}ms · ${
               rv1106.confirmed_sessions ?? rv1106.confirmed_tracks ?? 0
@@ -123,6 +137,8 @@ function renderHealth(health) {
               Number(rv1106.max_face_similarity) >= 0
                 ? Number(rv1106.max_face_similarity).toFixed(3)
                 : "—"
+            } · probable verify ${rv1106.probable_verified || 0}/${
+              rv1106.probable_rejected || 0
             }`
           : "Waiting for board heartbeat",
     },

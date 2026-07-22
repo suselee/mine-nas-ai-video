@@ -121,6 +121,11 @@ int main() {
     // faces down to 75% of the person height (held child).
     assert(overlap.track_for_face(0.3f, 0.62f) == child_track);
 
+    events = overlap.finish_sessions(2);
+    assert(events.size() == 1 && events[0].event == "end");
+    assert(overlap.active_tracks() == 0);
+    assert(overlap.confirmed_sessions() == 1);
+
     fusion.observe(6, IvaResult());
     events = fusion.collect_events(9);
     assert(events.size() == 1 && events[0].event == "end");

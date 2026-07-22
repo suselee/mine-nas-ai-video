@@ -73,6 +73,19 @@ def _optional_path(name: str) -> Path | None:
     return Path(value).expanduser() if value else None
 
 
+def _rv1106_probable_policy() -> str:
+    value = os.getenv("RV1106_PROBABLE_POLICY", "").strip().lower()
+    if value:
+        if value not in {"verify", "reject", "accept"}:
+            raise ValueError(
+                "RV1106_PROBABLE_POLICY must be verify, reject, or accept"
+            )
+        return value
+    # Backward compatibility for deployments that have not adopted the new
+    # policy setting yet.
+    return "accept" if _bool("RV1106_ACCEPT_PROBABLE", True) else "reject"
+
+
 def _parse_env_value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -217,6 +230,8 @@ class Settings:
     mqtt_client_id: str
     mqtt_keepalive_seconds: int
     rv1106_session_timeout_seconds: float
+    rv1106_save_wait_seconds: float
+    rv1106_probable_policy: str
     rv1106_accept_probable: bool
 
     @property
@@ -239,6 +254,7 @@ class Settings:
 def load_settings(env_file: str | Path = ".env") -> Settings:
     load_env_file(env_file)
     data_dir = _path("DATA_DIR", "./var")
+    rv1106_probable_policy = _rv1106_probable_policy()
 
     return Settings(
         app_host=os.getenv("APP_HOST", "0.0.0.0"),
@@ -363,7 +379,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         rv1106_session_timeout_seconds=_float(
             "RV1106_SESSION_TIMEOUT_SECONDS", 20.0
         ),
-        rv1106_accept_probable=_bool("RV1106_ACCEPT_PROBABLE", True),
+        rv1106_save_wait_seconds=_float("RV1106_SAVE_WAIT_SECONDS", 180.0),
+        rv1106_probable_policy=rv1106_probable_policy,
+        rv1106_accept_probable=rv1106_probable_policy != "reject",
     )
 
 

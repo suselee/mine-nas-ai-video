@@ -24,6 +24,15 @@ class DaughterObservation:
         return self.confidence > 0 and bool(self.boxes)
 
 
+@dataclass(frozen=True)
+class ProbableVerification:
+    accepted: bool
+    positive_frames: int
+    required_frames: int
+    evidence: tuple[str, ...]
+    reason: str
+
+
 class DaughterDetector:
     """CPU-only daughter detector using OpenCV DNN.
 
@@ -333,3 +342,36 @@ class DaughterDetector:
             if observation.positive:
                 return True
         return False
+
+    def verify_board_probable_paths(
+        self, paths: list[Path], *, required_frames: int = 2
+    ) -> ProbableVerification:
+        """Strictly verify a body-track-only board event.
+
+        Relative body size is deliberately insufficient here: it is the same
+        evidence that produced the board's ``probable`` identity. The NAS must
+        add independent face/age evidence (heuristic mode), or repeated hits
+        from a dedicated daughter ONNX model.
+        """
+        self.reset_segment()
+        observations = [
+            self.detect_path(SampledFrame(path=path, offset_seconds=float(index)))
+            for index, path in enumerate(paths)
+        ]
+        positives = [item for item in observations if item.positive]
+        evidence = tuple(sorted({item.evidence for item in positives if item.evidence}))
+        required = max(1, required_frames)
+        if self.mode == "onnx":
+            accepted = sum(item.evidence == "daughter_onnx" for item in positives) >= required
+            reason = "repeated daughter ONNX evidence" if accepted else "insufficient daughter ONNX evidence"
+        else:
+            face_age_hits = sum(item.evidence == "face_age" for item in positives)
+            accepted = len(positives) >= required and face_age_hits >= 1
+            reason = "independent face-age evidence" if accepted else "no independent child face-age evidence"
+        return ProbableVerification(
+            accepted=accepted,
+            positive_frames=len(positives),
+            required_frames=required,
+            evidence=evidence,
+            reason=reason,
+        )

@@ -49,8 +49,6 @@ class BoardEventPersistenceError(Exception):
 
 # How often the board-event worker checks for stale sessions.
 _BOARD_SESSION_SCAN_SECONDS = 5.0
-# Allow the segment scanner/recorder time to index the source around an event.
-_BOARD_SAVE_WAIT_SECONDS = 120.0
 # Extraction failures are retried from the durable queue across worker loops.
 _BOARD_SESSION_MAX_PROCESS_ATTEMPTS = 3
 
@@ -160,6 +158,29 @@ def _parse_category_targets(value: str) -> dict[str, int]:
 
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _segments_cover_window(
+    segments: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    *,
+    gap_tolerance_seconds: float = 2.0,
+) -> bool:
+    """Return whether ordered segment metadata continuously covers a window."""
+    cursor = start
+    tolerance = timedelta(seconds=max(0.0, gap_tolerance_seconds))
+    for segment in sorted(segments, key=lambda row: _parse_iso(str(row["started_at"]))):
+        segment_start = _parse_iso(str(segment["started_at"]))
+        segment_end = _parse_iso(str(segment["ended_at"]))
+        if segment_end <= cursor:
+            continue
+        if segment_start > cursor + tolerance:
+            return False
+        cursor = max(cursor, segment_end)
+        if cursor >= end:
+            return True
+    return cursor >= end
 
 
 def _stream_alignment_snapshot(
@@ -312,6 +333,10 @@ class Supervisor:
         self._llama_circuit_open_until: datetime | None = None
         self._last_board_saved_at: str | None = None
         self._last_board_moment_id: int | None = None
+        self._board_probable_detector: DaughterDetector | None = None
+        self._probable_verified = 0
+        self._probable_rejected = 0
+        self._probable_verify_errors = 0
         # Board sessions and MQTT event deduplication live in SQLite so restarts
         # cannot lose a trigger that has not yet produced a moment.
         # NAS analysis and board-triggered saves run as separate tasks.
@@ -393,6 +418,14 @@ class Supervisor:
     def _set_mqtt_state(self, state: dict[str, Any]) -> None:
         self.state["mqtt"] = {**state, "updated_at": utc_now_iso()}
 
+    def _rv1106_local_state(self) -> dict[str, Any]:
+        return {
+            "probable_policy": self.settings.rv1106_probable_policy,
+            "probable_verified": self._probable_verified,
+            "probable_rejected": self._probable_rejected,
+            "probable_verify_errors": self._probable_verify_errors,
+        }
+
     async def _mqtt_loop(self) -> None:
         subscriber = MQTTSubscriber(
             host=self.settings.mqtt_host,
@@ -421,6 +454,7 @@ class Supervisor:
                 self.state["rv1106"] = {
                     "status": "online",
                     **payload,
+                    **self._rv1106_local_state(),
                     "pending_sessions": self.database.count_pending_board_sessions(),
                     "last_saved_at": self._last_board_saved_at,
                     "last_moment_id": self._last_board_moment_id,
@@ -438,7 +472,7 @@ class Supervisor:
             camera_id = str(payload.get("camera_id") or self.settings.camera_name)
             event_state = str(payload.get("event") or "hit").strip().lower()
             identity = str(payload.get("identity") or "confirmed").strip().lower()
-            if identity == "probable" and not self.settings.rv1106_accept_probable:
+            if identity == "probable" and self.settings.rv1106_probable_policy == "reject":
                 self.state["mqtt"] = {
                     **self.state.get("mqtt", {}),
                     "status": "connected",
@@ -616,6 +650,7 @@ class Supervisor:
             self._last_board_moment_id = moment_id
             self.state["rv1106"] = {
                 **self.state.get("rv1106", {}),
+                **self._rv1106_local_state(),
                 "last_saved_at": self._last_board_saved_at,
                 "last_moment_id": self._last_board_moment_id,
                 "pending_sessions": self.database.count_pending_board_sessions(),
@@ -625,10 +660,11 @@ class Supervisor:
         identity = str(session["identity"]).lower()
         score = float(session["score"])
         event_time = datetime.fromtimestamp(float(session["best_ts"])).astimezone()
+        wanted_start = event_time - timedelta(seconds=self.settings.context_before_seconds)
         wanted_end = event_time + timedelta(seconds=self.settings.context_after_seconds)
         segment = await asyncio.to_thread(
             self.database.find_segment_at,
-            stream_role="low",
+            stream_role="high",
             timestamp=event_time.isoformat(timespec="seconds"),
         )
         high_ready = False
@@ -637,20 +673,24 @@ class Supervisor:
                 self.database.find_segments_between,
                 stream_role="high",
                 started_before=wanted_end.isoformat(timespec="seconds"),
-                ended_after=event_time.isoformat(timespec="seconds"),
+                ended_after=wanted_start.isoformat(timespec="seconds"),
             )
             available_high = [
                 row for row in high_segments if Path(str(row["path"])).exists()
             ]
-            high_ready = bool(available_high) and max(
-                _parse_iso(str(row["ended_at"])) for row in available_high
-            ) >= wanted_end
+            high_ready = bool(available_high) and _segments_cover_window(
+                available_high,
+                wanted_start,
+                wanted_end,
+                gap_tolerance_seconds=self.settings.stream_alignment_tolerance_seconds,
+            )
 
         wait_age = max(0.0, _now().timestamp() - float(session["last_event_at"]))
+        save_wait_seconds = max(1.0, self.settings.rv1106_save_wait_seconds)
         if not segment or not Path(str(segment["path"])).exists():
-            if wait_age < _BOARD_SAVE_WAIT_SECONDS:
+            if wait_age < save_wait_seconds:
                 return
-            reason = f"no low segment for board session {session_key}"
+            reason = f"no 4K segment for board session {session_key}"
             self._safe_add_event(
                 "board-session-dropped",
                 reason,
@@ -660,7 +700,7 @@ class Supervisor:
             )
             return
         if not high_ready:
-            if wait_age < _BOARD_SAVE_WAIT_SECONDS:
+            if wait_age < save_wait_seconds:
                 return
             reason = f"4K coverage incomplete for board session {session_key}"
             self._safe_add_event(
@@ -706,8 +746,11 @@ class Supervisor:
             category=f"rv1106_{identity}",
             selection_score=min(1.0, score * 0.75 + activity_score * 0.25),
         )
+        detector = None
+        if identity == "probable" and self.settings.rv1106_probable_policy == "verify":
+            detector = self._get_board_probable_detector()
         outcome = await self._save_capped_moment(
-            segment, result, analyzer=None, detector=None
+            segment, result, analyzer=None, detector=detector
         )
         if outcome.skip is not None:
             await asyncio.to_thread(
@@ -726,12 +769,33 @@ class Supervisor:
             self._safe_add_event(
                 "moment", f"saved edge-triggered moment {outcome.moment_id}"
             )
+        elif (
+            outcome.skip is None
+            and identity == "probable"
+            and self.settings.rv1106_probable_policy == "verify"
+        ):
+            reason = "probable event rejected by NAS event-level verification"
+            await asyncio.to_thread(
+                self.database.mark_board_session_skipped, session_key, reason
+            )
         self.state["rv1106"] = {
             **self.state.get("rv1106", {}),
+            **self._rv1106_local_state(),
             "last_saved_at": self._last_board_saved_at,
             "last_moment_id": self._last_board_moment_id,
             "pending_sessions": self.database.count_pending_board_sessions(),
         }
+
+    def _get_board_probable_detector(self) -> DaughterDetector:
+        if self._board_probable_detector is None:
+            self._board_probable_detector = DaughterDetector(
+                replace(
+                    self.settings,
+                    daughter_age_check_every=1,
+                    daughter_body_fallback_enabled=False,
+                )
+            )
+        return self._board_probable_detector
 
     async def _recorder_loop(self, role: str, rtsp_url: str) -> None:
         while not self.stop_event.is_set():
@@ -827,6 +891,14 @@ class Supervisor:
             await asyncio.sleep(10)
 
     def _update_stream_alignment(self) -> None:
+        if not self.settings.rtsp_low_url and self.settings.rtsp_high_url:
+            alignment = {
+                "status": "not_applicable",
+                "reason": "high-only recording mode",
+                "updated_at": utc_now_iso(),
+            }
+            self.state["stream_alignment"] = alignment
+            return
         sample_count = max(1, self.settings.stream_alignment_sample_count)
         fetch_limit = max(sample_count * 2, sample_count)
         alignment = _stream_alignment_snapshot(
@@ -1480,30 +1552,26 @@ class Supervisor:
         max_end = wanted_start + timedelta(seconds=self.settings.max_moment_seconds)
         wanted_end = min(wanted_end, max_end)
 
-        if self.settings.analysis_stream_role == "high":
-            # Analyzing the high stream directly: the segment itself is
-            # the 4K source - no need to cross-reference another stream.
+        segment_role = str(
+            segment.get("stream_role") or self.settings.analysis_stream_role
+        )
+        high_segments = self.database.find_segments_between(
+            stream_role="high",
+            started_before=wanted_end.isoformat(timespec="seconds"),
+            ended_after=wanted_start.isoformat(timespec="seconds"),
+        )
+        source_rows = sorted(
+            (row for row in high_segments if Path(row["path"]).exists()),
+            key=lambda row: _parse_iso(row["started_at"]),
+        )
+        if source_rows:
+            source_paths = [Path(row["path"]) for row in source_rows]
+            first_started = _parse_iso(source_rows[0]["started_at"])
+            last_ended = _parse_iso(source_rows[-1]["ended_at"])
+        else:
             source_paths = [Path(segment["path"])]
             first_started = source_started
             last_ended = source_ended
-        else:
-            high_segments = self.database.find_segments_between(
-                stream_role="high",
-                started_before=wanted_end.isoformat(timespec="seconds"),
-                ended_after=wanted_start.isoformat(timespec="seconds"),
-            )
-            source_rows = sorted(
-                (row for row in high_segments if Path(row["path"]).exists()),
-                key=lambda row: _parse_iso(row["started_at"]),
-            )
-            if source_rows:
-                source_paths = [Path(row["path"]) for row in source_rows]
-                first_started = _parse_iso(source_rows[0]["started_at"])
-                last_ended = _parse_iso(source_rows[-1]["ended_at"])
-            else:
-                source_paths = [Path(segment["path"])]
-                first_started = source_started
-                last_ended = source_ended
 
         clip_start = max(wanted_start, first_started)
         clip_end = min(wanted_end, last_ended)
@@ -1560,9 +1628,17 @@ class Supervisor:
                     detector, staged_clip_path, duration_seconds
                 )
             elif result.analysis_backend in {"rv1106_face", "rv1106_edge"}:
-                # Board events carry their own face-identity evidence; running
-                # the NAS detector here would only duplicate the board's call.
-                verified_final = True
+                identity = str(result.raw.get("identity") or "confirmed").lower()
+                if identity == "probable" and self.settings.rv1106_probable_policy == "verify":
+                    assert detector is not None
+                    verified_final = await self._verify_board_probable_clip(
+                        detector, staged_clip_path, duration_seconds
+                    )
+                else:
+                    verified_final = (
+                        self.settings.rv1106_probable_policy != "reject"
+                        or identity != "probable"
+                    )
             else:
                 assert analyzer is not None
                 verified_final = await self._verify_saved_clip(
@@ -1578,7 +1654,7 @@ class Supervisor:
             os.replace(staged_clip_path, clip_path)
 
         metadata = {
-            "schema_version": 2,
+            "schema_version": 3,
             "owner": "nas",
             "camera_name": segment["camera_name"],
             "analysis_backend": result.analysis_backend,
@@ -1593,7 +1669,8 @@ class Supervisor:
             ),
             "local_child_confirmed": result.local_child_confirmed,
             "local_child_score": result.local_child_score,
-            "source_low_segment": segment["path"],
+            "source_segment": segment["path"],
+            "source_stream_role": segment_role,
             "source_started_at": display_source_started.isoformat(timespec="seconds"),
             "source_ended_at": display_source_ended.isoformat(timespec="seconds"),
             "wanted_start": (wanted_start + display_offset).isoformat(timespec="seconds"),
@@ -1604,6 +1681,8 @@ class Supervisor:
             "source_paths": [str(path) for path in source_paths],
             "model_raw": result.raw,
         }
+        if segment_role == "low":
+            metadata["source_low_segment"] = segment["path"]
         trigger_key = str(result.raw.get("board_session_key") or "").strip() or None
         if trigger_key:
             metadata["trigger_key"] = trigger_key
@@ -1615,7 +1694,9 @@ class Supervisor:
             summary=result.summary,
             tags=result.tags,
             confidence=result.confidence,
-            source_low_segment_id=int(segment["id"]),
+            source_low_segment_id=(
+                int(segment["id"]) if segment_role == "low" else None
+            ),
             source_started_at=display_source_started.isoformat(timespec="seconds"),
             source_ended_at=display_source_ended.isoformat(timespec="seconds"),
             clip_path=clip_path,
@@ -1626,6 +1707,8 @@ class Supervisor:
             clip_started_at=display_clip_start.isoformat(timespec="seconds"),
             clip_ended_at=display_clip_end.isoformat(timespec="seconds"),
             trigger_key=trigger_key,
+            source_segment_id=int(segment["id"]),
+            source_stream_role=segment_role,
         )
         metadata["event_id"] = moment_id
         metadata["daily_summary_path"] = str(day_dir / "summary.md")
@@ -1636,6 +1719,56 @@ class Supervisor:
             self.settings, self.database, display_clip_start.strftime("%Y-%m-%d")
         )
         return moment_id
+
+    async def _verify_board_probable_clip(
+        self, detector: DaughterDetector, clip_path: Path, duration_seconds: float
+    ) -> bool:
+        offsets = [
+            max(0.0, min(duration_seconds - 0.1, duration_seconds * fraction))
+            for fraction in (0.1, 0.3, 0.5, 0.7, 0.9)
+        ]
+        try:
+            with tempfile.TemporaryDirectory(prefix="nas-video-board-verify-") as temp_dir:
+                frames = await self._extract_verification_frames(
+                    replace(
+                        self.settings,
+                        analysis_frame_width=self.settings.daughter_detector_input_size,
+                    ),
+                    clip_path,
+                    offsets,
+                    temp_dir,
+                    prefix="board-daughter",
+                )
+                if len(frames) != len(offsets):
+                    raise RuntimeError(
+                        f"expected {len(offsets)} verification frames, got {len(frames)}"
+                    )
+                verification = await asyncio.to_thread(
+                    detector.verify_board_probable_paths,
+                    [frame.path for frame in frames],
+                    required_frames=2,
+                )
+            details = json.dumps(
+                {
+                    "accepted": verification.accepted,
+                    "positive_frames": verification.positive_frames,
+                    "required_frames": verification.required_frames,
+                    "evidence": verification.evidence,
+                    "reason": verification.reason,
+                },
+                ensure_ascii=False,
+            )
+            if verification.accepted:
+                self._probable_verified += 1
+                self.database.add_event("rv1106-probable-verified", details)
+            else:
+                self._probable_rejected += 1
+                self.database.add_event("rv1106-probable-rejected", details)
+            return verification.accepted
+        except Exception as exc:
+            self._probable_verify_errors += 1
+            self.database.add_event("rv1106-probable-verify-error", str(exc))
+            return False
 
     async def _verify_detector_saved_clip(
         self, detector: DaughterDetector, clip_path: Path, duration_seconds: float
@@ -1935,16 +2068,27 @@ class Supervisor:
 
 def health_snapshot(settings: Settings, database: Database, supervisor: Supervisor | None) -> dict[str, Any]:
     disk = shutil.disk_usage(settings.data_dir)
+    recording_mode = (
+        "dual"
+        if settings.rtsp_low_url and settings.rtsp_high_url
+        else "high_only"
+        if settings.rtsp_high_url
+        else "low_only"
+        if settings.rtsp_low_url
+        else "disabled"
+    )
     return {
         "configured": {
             "low_rtsp": bool(settings.rtsp_low_url),
             "high_rtsp": bool(settings.rtsp_high_url),
+            "recording_mode": recording_mode,
             "rtsp_credentials": bool(settings.rtsp_username or settings.rtsp_password),
             "camera_time_offset_seconds": settings.camera_time_offset_seconds,
             "segment_at_clocktime": settings.segment_at_clocktime,
             "stream_alignment_tolerance_seconds": settings.stream_alignment_tolerance_seconds,
             "stream_alignment_sample_count": settings.stream_alignment_sample_count,
             "analysis_backend": settings.analysis_backend,
+            "analysis_enabled": settings.analysis_enabled,
             "daughter_detector_mode": settings.daughter_detector_mode,
             "daughter_detector_model_path": str(settings.daughter_detector_model_path or ""),
             "daughter_detector_input_size": settings.daughter_detector_input_size,
@@ -1964,6 +2108,8 @@ def health_snapshot(settings: Settings, database: Database, supervisor: Supervis
             "mqtt_daughter_topic": settings.mqtt_daughter_topic,
             "mqtt_status_topic": settings.mqtt_status_topic,
             "rv1106_accept_probable": settings.rv1106_accept_probable,
+            "rv1106_probable_policy": settings.rv1106_probable_policy,
+            "rv1106_save_wait_seconds": settings.rv1106_save_wait_seconds,
             "llama_base_url": settings.llama_base_url,
             "model": settings.llama_model,
             "llama_analysis_temperature": settings.llama_analysis_temperature,
