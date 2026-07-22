@@ -278,15 +278,15 @@ int main(int argc, char* argv[]) {
         printf("[WARN] RockIVA unavailable (error=%d); starting face-only fallback\n", iva.last_error());
 
     FusionConfig fusion_cfg;
-    fusion_cfg.probable_min_seconds = cfg.get_double("pipeline.probable_min_seconds", 6.0);
-    fusion_cfg.probable_min_observations = cfg.get_int("pipeline.probable_min_observations", 5);
-    fusion_cfg.child_max_height_ratio = cfg.get_double("pipeline.child_max_height_ratio", 0.45);
-    fusion_cfg.relative_child_height_ratio = cfg.get_double("pipeline.relative_child_height_ratio", 0.75);
+    fusion_cfg.probable_min_seconds = cfg.get_double("pipeline.probable_min_seconds", 10.0);
+    fusion_cfg.probable_min_observations = cfg.get_int("pipeline.probable_min_observations", 8);
+    fusion_cfg.child_max_height_ratio = cfg.get_double("pipeline.child_max_height_ratio", 0.40);
+    fusion_cfg.relative_child_height_ratio = cfg.get_double("pipeline.relative_child_height_ratio", 0.65);
     fusion_cfg.face_check_interval_seconds = cfg.get_double("pipeline.face_check_interval_seconds", 1.0);
     fusion_cfg.face_hit_window_seconds = cfg.get_double("pipeline.face_hit_window_seconds", 6.0);
     fusion_cfg.confirmed_ttl_seconds = cfg.get_double("pipeline.confirmed_ttl_seconds", 8.0);
     fusion_cfg.track_lost_seconds = cfg.get_double("pipeline.track_lost_seconds", 6.0);
-    fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 5.0);
+    fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 15.0);
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;
     TrackFusion fusion(fusion_cfg);
