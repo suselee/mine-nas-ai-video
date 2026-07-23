@@ -10,6 +10,7 @@ from nas_video_summarizer.ffmpeg_tools import (
     _motion_aware_offsets,
     build_recorder_command,
     contact_sheet_layout,
+    extract_cropped_frame,
     filter_frames_by_person_detection,
     filter_out_blank_frames,
     sample_offsets,
@@ -52,6 +53,35 @@ def test_recorder_wall_clock_alignment_can_be_disabled():
     command = build_recorder_command(settings, "low", "rtsp://camera/low")
 
     assert "-segment_atclocktime" not in command
+
+
+def test_extract_cropped_frame_builds_normalized_crop_filter(tmp_path, monkeypatch):
+    settings = load_settings("/nonexistent.env")
+    captured = []
+
+    async def fake_run(command, error_prefix):
+        captured.append((command, error_prefix))
+
+    monkeypatch.setattr("nas_video_summarizer.ffmpeg_tools._run_command", fake_run)
+    asyncio.run(
+        extract_cropped_frame(
+            settings,
+            tmp_path / "segment.mp4",
+            tmp_path / "frame.jpg",
+            12.345,
+            roi=(0.1, 0.2, 0.3, 0.4),
+            output_width=960,
+        )
+    )
+
+    command, error_prefix = captured[0]
+    filter_value = command[command.index("-vf") + 1]
+    assert filter_value == (
+        "crop=iw*0.30000000:ih*0.40000000:"
+        "iw*0.10000000:ih*0.20000000,scale=960:-2"
+    )
+    assert command[command.index("-ss") + 1] == "12.345"
+    assert error_prefix == "ffmpeg ROI frame extraction failed"
 
 
 def test_motion_aware_offsets_keeps_static_baseline():

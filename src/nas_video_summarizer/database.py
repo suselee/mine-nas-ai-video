@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +117,7 @@ class Database:
                     moment_id INTEGER,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
+                    requeue_tag TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(moment_id) REFERENCES moments(id) ON DELETE SET NULL
@@ -175,6 +176,12 @@ class Database:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_moments_trigger_key "
                 "ON moments(trigger_key) WHERE trigger_key IS NOT NULL"
             )
+            board_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(board_sessions)").fetchall()
+            }
+            if "requeue_tag" not in board_columns:
+                conn.execute("ALTER TABLE board_sessions ADD COLUMN requeue_tag TEXT")
             # The retired detector-comparison tables are intentionally kept.
             # Existing deployments can contain manually reviewed results, and
             # a normal application startup must never destroy those records.
@@ -352,6 +359,50 @@ class Database:
                 "SELECT COUNT(*) FROM board_sessions WHERE status IN ('active', 'ready')"
             ).fetchone()
         return int(row[0]) if row else 0
+
+    def skipped_probable_board_sessions(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM board_sessions
+                WHERE status='skipped'
+                  AND identity='probable'
+                  AND requeue_tag IS NULL
+                ORDER BY best_ts ASC
+                """
+            ).fetchall()
+        return [self._decode_board_session(row) for row in rows]
+
+    def requeue_board_sessions(
+        self, session_keys: list[str], *, requeue_tag: str
+    ) -> int:
+        if not session_keys:
+            return 0
+        updated = 0
+        with self.connect() as conn:
+            for index, session_key in enumerate(session_keys):
+                row = conn.execute(
+                    "SELECT best_ts FROM board_sessions WHERE session_key=?",
+                    (session_key,),
+                ).fetchone()
+                if row is None:
+                    continue
+                ordered_at = (
+                    datetime.fromtimestamp(float(row["best_ts"])).astimezone()
+                    + timedelta(microseconds=index)
+                ).isoformat(timespec="microseconds")
+                cursor = conn.execute(
+                    """
+                    UPDATE board_sessions
+                    SET status='ready', attempts=0, last_error=NULL,
+                        requeue_tag=?, updated_at=?
+                    WHERE session_key=? AND status='skipped'
+                      AND requeue_tag IS NULL
+                    """,
+                    (requeue_tag, ordered_at, session_key),
+                )
+                updated += max(0, cursor.rowcount)
+        return updated
 
     def finalize_stale_board_sessions(self, cutoff_timestamp: float) -> int:
         with self.connect() as conn:
@@ -579,6 +630,51 @@ class Database:
                 (stream_role, timestamp, timestamp),
             ).fetchone()
         return row_to_dict(row) if row else None
+
+    def find_segment_near(
+        self,
+        *,
+        stream_role: str,
+        timestamp: str,
+        tolerance_seconds: float,
+    ) -> dict[str, Any] | None:
+        """Find a containing segment, then the nearest boundary within tolerance."""
+        exact = self.find_segment_at(stream_role=stream_role, timestamp=timestamp)
+        if exact is not None:
+            return exact
+        target = datetime.fromisoformat(timestamp)
+        tolerance = timedelta(seconds=max(0.0, tolerance_seconds))
+        lower = (target - tolerance).isoformat(timespec="microseconds")
+        upper = (target + tolerance).isoformat(timespec="microseconds")
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM segments
+                WHERE stream_role=? AND deleted_at IS NULL
+                  AND started_at <= ? AND ended_at >= ?
+                ORDER BY started_at ASC
+                """,
+                (stream_role, upper, lower),
+            ).fetchall()
+        candidates = [row_to_dict(row) for row in rows]
+        if not candidates:
+            return None
+
+        def distance(row: dict[str, Any]) -> tuple[float, datetime]:
+            started = datetime.fromisoformat(str(row["started_at"]))
+            ended = datetime.fromisoformat(str(row["ended_at"]))
+            if target < started:
+                seconds = (started - target).total_seconds()
+            elif target >= ended:
+                seconds = (target - ended).total_seconds()
+            else:
+                seconds = 0.0
+            return seconds, started
+
+        nearest = min(candidates, key=distance)
+        if distance(nearest)[0] > max(0.0, tolerance_seconds):
+            return None
+        return nearest
 
     def create_moment(
         self,

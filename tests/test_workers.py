@@ -4,8 +4,11 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from nas_video_summarizer.config import load_settings
 from nas_video_summarizer.database import Database
+from nas_video_summarizer.daughter_detector import ProbableVerification
 from nas_video_summarizer.ffmpeg_tools import (
     ContactSheet,
     PersonFilterDecision,
@@ -19,6 +22,7 @@ from nas_video_summarizer.workers import (
     _in_time_window,
     _in_record_window,
     _moment_period,
+    _normalized_board_roi,
     _segments_cover_window,
     _stream_alignment_snapshot,
 )
@@ -124,6 +128,37 @@ def test_segments_cover_window_across_adjacent_high_segments():
         datetime.fromisoformat("2026-07-15T08:02:10+08:00"),
         gap_tolerance_seconds=2,
     )
+
+
+def test_board_roi_maps_best_box_and_legacy_dimensions():
+    roi = _normalized_board_roi(
+        {"best_box": [202, 190, 62, 88]},
+        width_scale=3.0,
+        height_scale=2.0,
+    )
+
+    assert roi is not None
+    assert roi == pytest.approx(
+        (0.21875, 0.405556, 0.290625, 0.488889), rel=1e-5
+    )
+
+
+def test_board_roi_clamps_at_frame_edge():
+    roi = _normalized_board_roi(
+        {
+            "box": [0, 0, 100, 100],
+            "frame_width": 640,
+            "frame_height": 360,
+        },
+        width_scale=3.0,
+        height_scale=2.0,
+    )
+
+    assert roi is not None
+    assert roi[0] == 0.0
+    assert roi[1] == 0.0
+    assert roi[2] > 0
+    assert roi[3] > 0
 
 
 def _dt(hour: int, minute: int) -> datetime:
@@ -1155,7 +1190,14 @@ def _board_session(best_ts: float, *, identity: str = "confirmed", score: float 
         "score": score,
         "best_ts": best_ts,
         "last_event_at": best_ts + 5,
-        "payload": {"activity_score": 0.4},
+        "payload": {
+            "activity_score": 0.4,
+            "person_score": 0.9,
+            "box": [202, 190, 62, 88],
+            "best_box": [202, 190, 62, 88],
+            "frame_width": 640,
+            "frame_height": 360,
+        },
     }
 
 
@@ -1337,6 +1379,56 @@ def test_board_session_saves_from_high_only_across_segment_boundary(tmp_path, mo
     assert "source_low_segment" not in metadata
 
 
+def test_board_session_uses_tolerance_for_one_second_segment_gap(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "output",
+        context_before_seconds=5,
+        context_after_seconds=10,
+        stream_alignment_tolerance_seconds=2.0,
+    )
+    database = Database(tmp_path / "board-gap.sqlite3")
+    database.migrate()
+    rows = [
+        ("gap-1.mp4", "2026-07-19T07:56:00+08:00", "2026-07-19T07:58:00+08:00"),
+        ("gap-2.mp4", "2026-07-19T07:58:01+08:00", "2026-07-19T08:00:01+08:00"),
+    ]
+    ids = []
+    for name, started_at, ended_at in rows:
+        path = tmp_path / name
+        path.write_bytes(b"high")
+        ids.append(
+            database.upsert_segment(
+                camera_name="home-camera",
+                stream_role="high",
+                path=path,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_seconds=120,
+                size_bytes=4,
+            )
+        )
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        output_path.write_bytes(b"gap-ok")
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    event_time = datetime.fromisoformat("2026-07-19T07:58:00.078+08:00")
+
+    asyncio.run(
+        supervisor._save_board_session(_board_session(event_time.timestamp()))
+    )
+
+    moment = database.list_moments()[0]
+    assert moment["source_segment_id"] == ids[0]
+    assert Path(moment["clip_path"]).read_bytes() == b"gap-ok"
+
+
 def test_probable_board_clip_is_not_published_when_event_verification_fails(
     tmp_path, monkeypatch
 ):
@@ -1355,16 +1447,25 @@ def test_probable_board_clip_is_not_published_when_event_verification_fails(
     async def immediate_to_thread(function, /, *args, **kwargs):
         return function(*args, **kwargs)
 
-    async def fake_extract(settings, paths, output_path, **kwargs):
-        output_path.write_bytes(b"probable")
-
-    async def reject_probable(detector, clip_path, duration_seconds):
-        supervisor._probable_rejected += 1
-        return False
+    async def reject_probable(session, event_time):
+        verification = ProbableVerification(
+            accepted=False,
+            positive_frames=0,
+            required_frames=1,
+            evidence=("adult_face",),
+            reason="repeated adult-only face evidence",
+            decision="adult_face",
+            sampled_frames=5,
+            person_frames=5,
+            face_frames=2,
+            adult_face_frames=2,
+        )
+        details = {"accepted": False, "decision": "adult_face"}
+        supervisor._record_probable_verification(verification, details)
+        return verification, details
 
     monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
-    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
-    monkeypatch.setattr(supervisor, "_verify_board_probable_clip", reject_probable)
+    monkeypatch.setattr(supervisor, "_verify_board_probable_event", reject_probable)
     event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
 
     asyncio.run(
@@ -1376,6 +1477,131 @@ def test_probable_board_clip_is_not_published_when_event_verification_fails(
     assert database.list_moments() == []
     assert not list((tmp_path / "output").rglob("*.mp4"))
     assert supervisor._probable_rejected == 1
+    assert supervisor._probable_adult_rejected == 1
+
+
+def test_probable_event_samples_five_cropped_frames_around_best_ts(
+    tmp_path, monkeypatch
+):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        rv1106_probable_policy="verify",
+        rv1106_verify_frame_width=960,
+    )
+    database = Database(tmp_path / "board-roi.sqlite3")
+    database.migrate()
+    _index_high_segments(database, tmp_path)
+    supervisor = Supervisor(settings, database)
+    extracted = []
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def fake_extract(
+        settings, video_path, output_path, offset_seconds, *, roi, output_width
+    ):
+        extracted.append((offset_seconds, roi, output_width))
+        output_path.write_bytes(b"jpeg")
+
+    class FakeDetector:
+        def verify_board_probable_paths(self, paths, **kwargs):
+            assert len(paths) == 5
+            return ProbableVerification(
+                accepted=True,
+                positive_frames=1,
+                required_frames=2,
+                evidence=("child_face",),
+                reason="independent child face-age evidence",
+                decision="child_face",
+                sampled_frames=5,
+                person_frames=5,
+                face_frames=1,
+                child_face_frames=1,
+                max_person_score=0.9,
+            )
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr(
+        "nas_video_summarizer.workers.extract_cropped_frame", fake_extract
+    )
+    monkeypatch.setattr(supervisor, "_get_board_probable_detector", FakeDetector)
+    event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
+
+    verification, details = asyncio.run(
+        supervisor._verify_board_probable_event(
+            _board_session(event_time.timestamp(), identity="probable"),
+            event_time,
+        )
+    )
+
+    assert verification.accepted is True
+    assert verification.decision == "child_face"
+    assert len(extracted) == 5
+    assert [round(item[0]) for item in extracted] == [38, 39, 40, 41, 42]
+    assert all(item[2] == 960 for item in extracted)
+    assert details["roi"] == pytest.approx(
+        [0.21875, 0.405556, 0.290625, 0.488889], rel=1e-5
+    )
+    assert supervisor._probable_face_verified == 1
+
+
+def test_faceless_probable_is_saved_with_selection_penalty(tmp_path, monkeypatch):
+    settings = replace(
+        load_settings("/nonexistent.env"),
+        output_dir=tmp_path / "output",
+        context_after_seconds=10,
+        rv1106_probable_policy="verify",
+        rv1106_accept_probable=True,
+        rv1106_verify_faceless_score_multiplier=0.75,
+    )
+    database = Database(tmp_path / "board-faceless.sqlite3")
+    database.migrate()
+    _index_high_segments(database, tmp_path)
+    supervisor = Supervisor(settings, database)
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def fake_extract(settings, paths, output_path, **kwargs):
+        output_path.write_bytes(b"faceless-probable")
+
+    async def accept_faceless(session, event_time):
+        verification = ProbableVerification(
+            accepted=True,
+            positive_frames=0,
+            required_frames=1,
+            evidence=("person",),
+            reason="stable person ROI with strong board evidence",
+            decision="faceless_person",
+            sampled_frames=5,
+            person_frames=4,
+            max_person_score=0.9,
+        )
+        details = {
+            "accepted": True,
+            "decision": "faceless_person",
+            "person_frames": 4,
+        }
+        supervisor._record_probable_verification(verification, details)
+        return verification, details
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr("nas_video_summarizer.workers.extract_clip", fake_extract)
+    monkeypatch.setattr(supervisor, "_verify_board_probable_event", accept_faceless)
+    event_time = datetime.fromisoformat("2026-07-19T10:00:40+08:00")
+
+    asyncio.run(
+        supervisor._save_board_session(
+            _board_session(event_time.timestamp(), identity="probable", score=0.8)
+        )
+    )
+
+    moment = database.list_moments()[0]
+    assert moment["category"] == "rv1106_probable_faceless"
+    assert moment["selection_score"] == pytest.approx(0.525)
+    metadata = json.loads(Path(moment["metadata_path"]).read_text())
+    assert metadata["model_raw"]["probable_verification"]["accepted"] is True
+    assert supervisor._probable_faceless_accepted == 1
 
 
 def test_high_only_alignment_is_not_applicable(tmp_path):

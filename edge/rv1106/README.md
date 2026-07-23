@@ -17,6 +17,11 @@ Outside that window it keeps the process and MQTT heartbeat alive with
 `pipeline=sleeping`, while RTSP, decoding, and inference are stopped. Configure
 the window in the `[schedule]` section of `config.ini`.
 
+Fusion MQTT events include the source dimensions plus the highest-scoring
+track box (`best_box`) for NAS-side 4K ROI verification. The default
+`probable_hold_seconds=3.0` keeps a session stable through short body-size
+classification flicker without relaxing overlap ambiguity handling.
+
 Build with `make -C edge/rv1106/board_service`. `LUCKFOX_SDK_DIR`,
 `RKNN_SDK_DIR`, and `TOOLCHAIN_DIR` can be overridden on the make command line.
 Run `rockiva_probe config.ini 30` on the board before installing a new binary.

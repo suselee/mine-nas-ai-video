@@ -64,10 +64,12 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
             track.id = ++next_track_id_;
             track.source_id = person.id;
             track.box = person;
+            track.best_box = person;
             track.first_seen = track.last_seen = now;
             track.last_face_check = -1e9;
             track.last_confirmed = -1e9;
             track.last_publish = -1e9;
+            track.last_child_like = -1e9;
             track.first_face_hit = -1e9;
             track.best_timestamp = now;
             track.person_score = person.score;
@@ -101,6 +103,7 @@ void TrackFusion::observe(double now, const IvaResult& detections) {
                               height <= tallest * config_.relative_child_height_ratio;
         track.child_like = relative_child ||
                            (detections.people.size() == 1 && absolute_child);
+        if (track.child_like) track.last_child_like = now;
         track.ambiguous = false;
     }
 
@@ -204,7 +207,9 @@ void TrackFusion::update_identity(Track& track, double now) {
     if (!track.needs_revalidation &&
         now - track.last_confirmed <= config_.confirmed_ttl_seconds) {
         track.identity = IDENTITY_CONFIRMED;
-    } else if (!track.ambiguous && track.child_like &&
+    } else if (!track.ambiguous &&
+               (track.child_like ||
+                now - track.last_child_like <= config_.probable_hold_seconds) &&
                track.observations >= config_.probable_min_observations &&
                now - track.first_seen >= config_.probable_min_seconds) {
         track.identity = IDENTITY_PROBABLE;
@@ -220,6 +225,7 @@ void TrackFusion::update_identity(Track& track, double now) {
     if (selection >= track.best_selection) {
         track.best_selection = selection;
         track.best_timestamp = now;
+        track.best_box = track.box;
     }
 }
 
@@ -249,6 +255,7 @@ FusionEvent TrackFusion::make_event(const Track& track, const char* event, doubl
         ? std::max(track.face_score, config_.face_threshold)
         : std::min(0.75f, 0.50f + 0.02f * track.observations);
     out.box = track.box;
+    out.best_box = track.best_box;
     out.people_count = people_count_;
     return out;
 }

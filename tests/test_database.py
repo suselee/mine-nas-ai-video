@@ -113,6 +113,76 @@ def test_recent_segments_returns_newest_first(tmp_path):
     assert rows[0]["path"] == "/buffer/low/newer.mp4"
 
 
+def test_find_segment_near_prefers_earlier_segment_across_small_gap(tmp_path):
+    database = Database(tmp_path / "segment-gap.sqlite3")
+    database.migrate()
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_id = database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="high",
+        path=first,
+        started_at="2026-07-23T07:56:00+08:00",
+        ended_at="2026-07-23T07:58:00+08:00",
+        duration_seconds=120,
+        size_bytes=5,
+    )
+    database.upsert_segment(
+        camera_name="home-camera",
+        stream_role="high",
+        path=second,
+        started_at="2026-07-23T07:58:01+08:00",
+        ended_at="2026-07-23T08:00:01+08:00",
+        duration_seconds=120,
+        size_bytes=6,
+    )
+
+    segment = database.find_segment_near(
+        stream_role="high",
+        timestamp="2026-07-23T07:58:00.078+08:00",
+        tolerance_seconds=2.0,
+    )
+
+    assert segment is not None
+    assert segment["id"] == first_id
+
+
+def test_board_session_requeue_is_idempotent(tmp_path):
+    database = Database(tmp_path / "board-requeue.sqlite3")
+    database.migrate()
+    best_ts = datetime.fromisoformat("2026-07-23T10:00:00+08:00").timestamp()
+    database.record_board_event(
+        event_key="home-camera:session:s1:end:1",
+        session_key="home-camera:session:s1",
+        session_id="s1",
+        camera_id="home-camera",
+        session_start=best_ts - 10,
+        identity="probable",
+        score=0.8,
+        best_ts=best_ts,
+        last_event_at=best_ts + 5,
+        payload={"activity_score": 0.4},
+        event_state="end",
+    )
+    database.mark_board_session_skipped(
+        "home-camera:session:s1",
+        "probable event rejected by NAS event-level verification",
+    )
+
+    assert database.requeue_board_sessions(
+        ["home-camera:session:s1"], requeue_tag="roi-v1"
+    ) == 1
+    assert database.requeue_board_sessions(
+        ["home-camera:session:s1"], requeue_tag="roi-v1"
+    ) == 0
+    session = database.get_board_session("home-camera:session:s1")
+    assert session is not None
+    assert session["status"] == "ready"
+    assert session["requeue_tag"] == "roi-v1"
+
+
 def test_migrate_adds_detector_columns_to_existing_moments_table(tmp_path):
     import sqlite3
 

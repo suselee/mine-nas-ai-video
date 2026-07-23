@@ -322,6 +322,45 @@ async def _extract_frame(settings: Settings, video_path: Path, output_path: Path
     await _run_command(command, "ffmpeg frame extraction failed")
 
 
+async def extract_cropped_frame(
+    settings: Settings,
+    video_path: Path,
+    output_path: Path,
+    offset_seconds: float,
+    *,
+    roi: tuple[float, float, float, float],
+    output_width: int,
+) -> None:
+    """Extract a normalized ROI without first probing the source dimensions."""
+    x, y, width, height = roi
+    if width <= 0 or height <= 0:
+        raise ValueError("ROI width and height must be positive")
+    filter_chain = (
+        f"crop=iw*{width:.8f}:ih*{height:.8f}:"
+        f"iw*{x:.8f}:ih*{y:.8f},scale={max(32, output_width)}:-2"
+    )
+    command = [
+        settings.ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        *_hwaccel_args(settings),
+        "-ss",
+        f"{max(0.0, offset_seconds):.3f}",
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        filter_chain,
+        "-q:v",
+        "4",
+        str(output_path),
+    ]
+    await _run_command(command, "ffmpeg ROI frame extraction failed")
+
+
 async def sample_frames_with_offsets(
     settings: Settings,
     video_path: Path,

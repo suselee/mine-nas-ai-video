@@ -139,6 +139,10 @@ function renderHealth(health) {
                 : "—"
             } · probable verify ${rv1106.probable_verified || 0}/${
               rv1106.probable_rejected || 0
+            } · face ${rv1106.probable_face_verified || 0} · faceless ${
+              rv1106.probable_faceless_accepted || 0
+            } · adult reject ${rv1106.probable_adult_rejected || 0} · no-person ${
+              rv1106.probable_no_person_rejected || 0
             }`
           : "Waiting for board heartbeat",
     },

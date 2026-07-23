@@ -31,6 +31,13 @@ class ProbableVerification:
     required_frames: int
     evidence: tuple[str, ...]
     reason: str
+    decision: str = "inconclusive"
+    sampled_frames: int = 0
+    person_frames: int = 0
+    face_frames: int = 0
+    child_face_frames: int = 0
+    adult_face_frames: int = 0
+    max_person_score: float = 0.0
 
 
 class DaughterDetector:
@@ -344,34 +351,106 @@ class DaughterDetector:
         return False
 
     def verify_board_probable_paths(
-        self, paths: list[Path], *, required_frames: int = 2
+        self,
+        paths: list[Path],
+        *,
+        required_frames: int = 2,
+        required_person_frames: int = 3,
+        board_score: float = 0.0,
+        board_person_score: float = 0.0,
+        board_score_threshold: float = 0.70,
+        board_person_score_threshold: float = 0.70,
     ) -> ProbableVerification:
-        """Strictly verify a body-track-only board event.
+        """Verify a board body-track event using event-local cropped frames.
 
-        Relative body size is deliberately insufficient here: it is the same
-        evidence that produced the board's ``probable`` identity. The NAS must
-        add independent face/age evidence (heuristic mode), or repeated hits
-        from a dedicated daughter ONNX model.
+        A child face is strong positive evidence. Repeated adult/non-child
+        faces are negative evidence. When no usable face is visible at all,
+        repeated person detections may pass only alongside strong board scores.
         """
         self.reset_segment()
-        observations = [
-            self.detect_path(SampledFrame(path=path, offset_seconds=float(index)))
-            for index, path in enumerate(paths)
-        ]
-        positives = [item for item in observations if item.positive]
-        evidence = tuple(sorted({item.evidence for item in positives if item.evidence}))
+        frame_infos: list[dict[str, object]] = []
+        onnx_hits = 0
+        person_filter = self._get_person_filter()
+        for path in paths:
+            encoded = self._encoded(path)
+            info = person_filter.detect(encoded, classify_age=True)
+            frame_infos.append(info)
+            if self.mode == "onnx":
+                _, daughter_score = self._detect_onnx(path)
+                if daughter_score >= self.settings.daughter_detector_threshold:
+                    onnx_hits += 1
+
+        person_frames = sum(
+            bool(info.get("person_boxes"))
+            and float(info.get("person_score", 0.0))
+            >= self.settings.person_filter_threshold
+            for info in frame_infos
+        )
+        face_frames = sum(int(info.get("face_count", 0)) > 0 for info in frame_infos)
+        child_face_frames = sum(
+            int(info.get("face_count", 0)) > 0
+            and float(info.get("child_score", 0.0))
+            >= self.settings.person_filter_child_threshold
+            for info in frame_infos
+        )
+        adult_face_frames = sum(bool(info.get("adult_only")) for info in frame_infos)
+        max_person_score = max(
+            (float(info.get("person_score", 0.0)) for info in frame_infos),
+            default=0.0,
+        )
         required = max(1, required_frames)
-        if self.mode == "onnx":
-            accepted = sum(item.evidence == "daughter_onnx" for item in positives) >= required
-            reason = "repeated daughter ONNX evidence" if accepted else "insufficient daughter ONNX evidence"
-        else:
-            face_age_hits = sum(item.evidence == "face_age" for item in positives)
-            accepted = len(positives) >= required and face_age_hits >= 1
-            reason = "independent face-age evidence" if accepted else "no independent child face-age evidence"
+        required_people = max(1, required_person_frames)
+
+        accepted = False
+        decision = "inconclusive"
+        reason = "insufficient independent evidence"
+        if self.mode == "onnx" and onnx_hits >= required:
+            accepted = True
+            decision = "daughter_onnx"
+            reason = "repeated daughter ONNX evidence"
+        elif child_face_frames >= 1:
+            accepted = True
+            decision = "child_face"
+            reason = "independent child face-age evidence"
+        elif adult_face_frames >= 2:
+            decision = "adult_face"
+            reason = "repeated adult-only face evidence"
+        elif face_frames >= 2:
+            decision = "face_without_child"
+            reason = "repeated face evidence without child evidence"
+        elif (
+            face_frames == 0
+            and person_frames >= required_people
+            and board_score >= board_score_threshold
+            and board_person_score >= board_person_score_threshold
+        ):
+            accepted = True
+            decision = "faceless_person"
+            reason = "stable person ROI with strong board evidence"
+        elif person_frames == 0:
+            decision = "no_person"
+            reason = "no person detected in the board ROI"
+
+        evidence_values = []
+        if onnx_hits:
+            evidence_values.append("daughter_onnx")
+        if child_face_frames:
+            evidence_values.append("child_face")
+        if adult_face_frames:
+            evidence_values.append("adult_face")
+        if person_frames:
+            evidence_values.append("person")
         return ProbableVerification(
             accepted=accepted,
-            positive_frames=len(positives),
+            positive_frames=max(child_face_frames, onnx_hits),
             required_frames=required,
-            evidence=evidence,
+            evidence=tuple(evidence_values),
             reason=reason,
+            decision=decision,
+            sampled_frames=len(paths),
+            person_frames=person_frames,
+            face_frames=face_frames,
+            child_face_frames=child_face_frames,
+            adult_face_frames=adult_face_frames,
+            max_person_score=max_person_score,
         )

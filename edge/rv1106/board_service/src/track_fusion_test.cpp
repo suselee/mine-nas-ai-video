@@ -15,6 +15,7 @@ static FusionConfig test_config() {
     config.face_hit_window_seconds = 3;
     config.confirmed_ttl_seconds = 8;
     config.track_lost_seconds = 3;
+    config.probable_hold_seconds = 3;
     config.mqtt_update_seconds = 5;
     config.face_threshold = 0.35f;
     config.face_high_threshold = 0.55f;
@@ -51,7 +52,23 @@ int main() {
     std::vector<FusionEvent> events = fusion.collect_events(4);
     assert(events.size() == 1 && events[0].event == "start");
     assert(events[0].identity == "probable");
+    assert(events[0].best_box.x1 == events[0].box.x1);
     uint32_t logical_track = events[0].track_id;
+
+    // A brief child-size classification wobble keeps the existing probable
+    // session alive, then ends it once the configured hold expires.
+    TrackFusion held(config);
+    held.observe(0, one_person(1, 0.1f, 0.35f));
+    held.observe(1, one_person(1, 0.11f, 0.35f));
+    held.observe(2, one_person(1, 0.12f, 0.35f));
+    held.observe(4, one_person(1, 0.13f, 0.35f));
+    events = held.collect_events(4);
+    assert(events.size() == 1 && events[0].event == "start");
+    held.observe(5, one_person(1, 0.13f, 0.70f));
+    assert(held.collect_events(5).empty());
+    held.observe(7.5, one_person(1, 0.13f, 0.70f));
+    events = held.collect_events(7.5);
+    assert(events.size() == 1 && events[0].event == "end");
 
     fusion.apply_face_score(logical_track, 0.60f, 5);
     events = fusion.collect_events(5);

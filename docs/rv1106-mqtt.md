@@ -52,11 +52,15 @@ RV1106_SAVE_WAIT_SECONDS=180
 RV1106_PROBABLE_POLICY=verify
 ```
 
-`RV1106_PROBABLE_POLICY=verify` trusts face-confirmed sessions and samples five
-frames from a staged 4K clip for probable sessions. Body-size evidence alone
-cannot pass this check. Use `reject` after the board is mature enough to save
-confirmed sessions only, or `accept` temporarily for maximum recall. The old
-`RV1106_ACCEPT_PROBABLE` boolean remains compatible when the policy is absent.
+`RV1106_PROBABLE_POLICY=verify` trusts face-confirmed sessions. For probable
+sessions it maps the board's `best_box` to the 4K source, expands the ROI, and
+samples five frames around `best_ts`. A child face passes, repeated adult or
+non-child faces reject, and a fully faceless ROI passes at reduced selection
+score only when at least three frames contain a person and both board scores
+are at least `0.70`. Existing `.env` files use these defaults without changes.
+Use `reject` to save confirmed sessions only, or `accept` temporarily for
+maximum recall. The old `RV1106_ACCEPT_PROBABLE` boolean remains compatible
+when the policy is absent.
 
 Run `uv run nas-video-check`, restart the service, then inspect `/api/health`.
 `workers.mqtt.status=connected` confirms the subscription. The RV1106 status
@@ -65,8 +69,10 @@ heartbeat appears under `workers.rv1106`.
 ## Delivery and recovery behavior
 
 Fusion builds publish `start`, `update`, and `end` messages with a stable
-`session_id` and sequence number. The NAS stores every accepted message in
-SQLite before clip processing:
+`session_id` and sequence number. Payloads include `frame_width`,
+`frame_height`, the current `box`, and the `best_box` corresponding to
+`best_ts`; older payloads fall back to `box` at 640x360. The NAS stores every
+accepted message in SQLite before clip processing:
 
 - MQTT QoS 1 duplicate deliveries are ignored by a persistent event key.
 - Active and completed sessions survive NAS restarts.
@@ -82,6 +88,24 @@ low segment is required. Session payload, identity,
 similarity/activity scores, and the persistent trigger key are written to the
 moment metadata.
 
+Small 4K segment-boundary gaps use `STREAM_ALIGNMENT_TOLERANCE_SECONDS` when
+locating the event segment. The full requested clip window must still be
+covered, so a real stream outage remains fail-closed.
+
+## Requeue skipped probable sessions
+
+After changing verification policy, preview the strongest skipped probable
+session in each five-minute bucket before reprocessing it:
+
+```sh
+uv run nas-video-requeue-board --day 2026-07-23
+uv run nas-video-requeue-board --day 2026-07-23 --run-id roi-v1-20260723 --apply
+```
+
+Only sessions with retained 4K coverage and an eligible old rejection reason
+are selected. `requeue_tag` makes the operation idempotent. Requeued sessions
+still obey cooldown, per-period, and daily keep-best limits.
+
 ## Board active window
 
 The board keeps MQTT online but closes RTSP, the decoder, and inference outside
@@ -96,6 +120,9 @@ utc_offset_minutes = 480
 ```
 
 Sleeping heartbeats use `pipeline=sleeping` and `schedule_active=false`.
+`pipeline.probable_hold_seconds=3.0` prevents a brief child-size classification
+wobble from splitting one track into many sessions; overlap ambiguity still
+ends probable eligibility immediately.
 
 The retired RV1106-versus-YOLO comparison UI is no longer active. Existing
 `detector_events` and `comparison_cases` tables are preserved during migration

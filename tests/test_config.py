@@ -87,6 +87,13 @@ def test_new_window_and_quota_defaults(monkeypatch):
     assert settings.rv1106_save_wait_seconds == 180.0
     assert settings.rv1106_probable_policy == "accept"
     assert settings.rv1106_accept_probable is True
+    assert settings.rv1106_verify_roi_width_scale == 3.0
+    assert settings.rv1106_verify_roi_height_scale == 2.0
+    assert settings.rv1106_verify_frame_width == 960
+    assert settings.rv1106_verify_person_frames == 3
+    assert settings.rv1106_verify_board_score == 0.70
+    assert settings.rv1106_verify_board_person_score == 0.70
+    assert settings.rv1106_verify_faceless_score_multiplier == 0.75
 
 
 def test_new_probable_policy_overrides_legacy_boolean(tmp_path, monkeypatch):

@@ -24,6 +24,7 @@ struct FusionConfig {
     double face_hit_window_seconds;
     double confirmed_ttl_seconds;
     double track_lost_seconds;
+    double probable_hold_seconds;
     double mqtt_update_seconds;
     float face_threshold;
     float face_high_threshold;
@@ -42,6 +43,7 @@ struct FusionEvent {
     float person_score;
     float activity_score;
     IvaObject box;
+    IvaObject best_box;
     int people_count;
 };
 
@@ -85,11 +87,13 @@ private:
         uint32_t id;
         uint32_t source_id;
         IvaObject box;
+        IvaObject best_box;
         double first_seen;
         double last_seen;
         double last_face_check;
         double last_confirmed;
         double last_publish;
+        double last_child_like;
         double session_start;
         double best_timestamp;
         float face_score;

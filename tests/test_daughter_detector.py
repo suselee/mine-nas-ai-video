@@ -88,44 +88,112 @@ def test_relative_body_size_fallback_rejects_similar_adults():
     assert detector._relative_child_box([first, second]) is None
 
 
-def test_board_probable_requires_independent_face_age_evidence(monkeypatch, tmp_path):
+def _mock_board_frame_info(monkeypatch, detector, infos):
+    values = iter(infos)
+
+    class FakePersonFilter:
+        def detect(self, encoded, *, classify_age=True):
+            return next(values)
+
+    monkeypatch.setattr(detector, "_get_person_filter", lambda: FakePersonFilter())
+    monkeypatch.setattr(detector, "_encoded", lambda path: "encoded")
+
+
+def _frame_info(
+    *, person=0.9, faces=0, child=0.0, adult=0.0, adult_only=False
+):
+    return {
+        "person_score": person,
+        "person_boxes": [[0.1, 0.1, 0.2, 0.3]] if person > 0 else [],
+        "face_count": faces,
+        "child_score": child,
+        "adult_score": adult,
+        "adult_only": adult_only,
+    }
+
+
+def test_board_probable_accepts_one_child_face(monkeypatch, tmp_path):
     detector = DaughterDetector(load_settings("/nonexistent.env"))
     paths = [tmp_path / f"frame-{index}.jpg" for index in range(3)]
-    observations = iter(
+    _mock_board_frame_info(
+        monkeypatch,
+        detector,
         [
-            DaughterObservation(0, 0.7, [[0.1, 0.1, 0.2, 0.3]], 2, "relative_body_size"),
-            DaughterObservation(1, 0.8, [[0.1, 0.1, 0.2, 0.3]], 2, "face_age"),
-            DaughterObservation(2, 0.8, [[0.1, 0.1, 0.2, 0.3]], 2, "face_age"),
-        ]
+            _frame_info(),
+            _frame_info(faces=1, child=0.8),
+            _frame_info(),
+        ],
     )
-    monkeypatch.setattr(detector, "detect_path", lambda frame: next(observations))
 
     result = detector.verify_board_probable_paths(paths, required_frames=2)
 
     assert result.accepted is True
-    assert result.positive_frames == 3
-    assert "face_age" in result.evidence
+    assert result.decision == "child_face"
+    assert result.child_face_frames == 1
+    assert "child_face" in result.evidence
 
 
-def test_board_probable_rejects_duplicate_body_size_evidence(monkeypatch, tmp_path):
+def test_board_probable_rejects_repeated_adult_faces(monkeypatch, tmp_path):
     detector = DaughterDetector(load_settings("/nonexistent.env"))
-    paths = [tmp_path / f"frame-{index}.jpg" for index in range(2)]
-    monkeypatch.setattr(
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(5)]
+    _mock_board_frame_info(
+        monkeypatch,
         detector,
-        "detect_path",
-        lambda frame: DaughterObservation(
-            frame.offset_seconds,
-            0.7,
-            [[0.1, 0.1, 0.2, 0.3]],
-            2,
-            "relative_body_size",
-        ),
+        [
+            _frame_info(faces=1, adult=0.95, adult_only=True),
+            _frame_info(),
+            _frame_info(faces=1, adult=0.96, adult_only=True),
+            _frame_info(),
+            _frame_info(),
+        ],
     )
 
     result = detector.verify_board_probable_paths(paths, required_frames=2)
 
     assert result.accepted is False
-    assert result.reason == "no independent child face-age evidence"
+    assert result.decision == "adult_face"
+    assert result.adult_face_frames == 2
+
+
+def test_board_probable_accepts_stable_faceless_person(monkeypatch, tmp_path):
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(5)]
+    _mock_board_frame_info(
+        monkeypatch,
+        detector,
+        [_frame_info(), _frame_info(), _frame_info(), _frame_info(person=0), _frame_info(person=0)],
+    )
+
+    result = detector.verify_board_probable_paths(
+        paths,
+        required_person_frames=3,
+        board_score=0.72,
+        board_person_score=0.80,
+    )
+
+    assert result.accepted is True
+    assert result.decision == "faceless_person"
+    assert result.person_frames == 3
+
+
+def test_board_probable_faceless_path_requires_strong_board_score(monkeypatch, tmp_path):
+    detector = DaughterDetector(load_settings("/nonexistent.env"))
+    paths = [tmp_path / f"frame-{index}.jpg" for index in range(5)]
+    _mock_board_frame_info(
+        monkeypatch,
+        detector,
+        [_frame_info() for _ in paths],
+    )
+
+    result = detector.verify_board_probable_paths(
+        paths,
+        required_person_frames=3,
+        board_score=0.69,
+        board_person_score=0.90,
+    )
+
+    assert result.accepted is False
+    assert result.decision == "inconclusive"
 
 
 def test_archive_contract_contains_manifest_and_ready(tmp_path):

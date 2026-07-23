@@ -151,15 +151,22 @@ static std::string event_payload(const FusionEvent& event, const std::string& ca
     int y = (int)(event.box.y1 * height);
     int w = (int)((event.box.x2 - event.box.x1) * width);
     int h = (int)((event.box.y2 - event.box.y1) * height);
+    int best_x = (int)(event.best_box.x1 * width);
+    int best_y = (int)(event.best_box.y1 * height);
+    int best_w = (int)((event.best_box.x2 - event.best_box.x1) * width);
+    int best_h = (int)((event.best_box.y2 - event.best_box.y1) * height);
     char payload[1024];
     snprintf(payload, sizeof(payload),
              "{\"ts\":%.3f,\"score\":%.4f,\"camera_id\":\"%s\","
-             "\"box\":[%d,%d,%d,%d],\"seq\":%ld,\"event\":\"%s\","
+             "\"box\":[%d,%d,%d,%d],\"best_box\":[%d,%d,%d,%d],"
+             "\"frame_width\":%d,\"frame_height\":%d,"
+             "\"seq\":%ld,\"event\":\"%s\","
              "\"session_id\":\"%s\",\"session_start_ts\":%.3f,"
              "\"track_id\":%u,\"identity\":\"%s\",\"face_score\":%.4f,"
              "\"person_score\":%.4f,\"activity_score\":%.4f,"
              "\"best_ts\":%.3f,\"people_count\":%d,\"pipeline\":\"%s\"}",
-             event.timestamp, event.score, camera.c_str(), x, y, w, h, sequence,
+             event.timestamp, event.score, camera.c_str(), x, y, w, h,
+             best_x, best_y, best_w, best_h, width, height, sequence,
              event.event.c_str(), event.session_id.c_str(), event.session_start,
              event.track_id, event.identity.c_str(), event.face_score,
              event.person_score, event.activity_score, event.best_timestamp,
@@ -191,11 +198,12 @@ static bool publish_legacy_face(MqttPublisher& mqtt, const std::string& topic, i
     snprintf(payload, sizeof(payload),
              "{\"ts\":%.3f,\"score\":%.4f,\"camera_id\":\"%s\","
              "\"box\":[%d,%d,%d,%d],\"seq\":%ld,\"event\":\"hit\","
+             "\"frame_width\":%d,\"frame_height\":%d,"
              "\"identity\":\"confirmed\",\"face_score\":%.4f,"
              "\"best_ts\":%.3f,\"pipeline\":\"face_only_guard\"}",
              now, score, camera.c_str(), (int)(face.x1 * width), (int)(face.y1 * height),
              (int)((face.x2 - face.x1) * width), (int)((face.y2 - face.y1) * height),
-             sequence, score, now);
+             sequence, width, height, score, now);
     return mqtt.publish(topic, payload, qos);
 }
 
@@ -286,6 +294,7 @@ int main(int argc, char* argv[]) {
     fusion_cfg.face_hit_window_seconds = cfg.get_double("pipeline.face_hit_window_seconds", 6.0);
     fusion_cfg.confirmed_ttl_seconds = cfg.get_double("pipeline.confirmed_ttl_seconds", 8.0);
     fusion_cfg.track_lost_seconds = cfg.get_double("pipeline.track_lost_seconds", 6.0);
+    fusion_cfg.probable_hold_seconds = cfg.get_double("pipeline.probable_hold_seconds", 3.0);
     fusion_cfg.mqtt_update_seconds = cfg.get_double("pipeline.mqtt_update_seconds", 15.0);
     fusion_cfg.face_threshold = threshold;
     fusion_cfg.face_high_threshold = high_threshold;

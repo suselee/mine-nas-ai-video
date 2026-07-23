@@ -233,6 +233,13 @@ class Settings:
     rv1106_save_wait_seconds: float
     rv1106_probable_policy: str
     rv1106_accept_probable: bool
+    rv1106_verify_roi_width_scale: float
+    rv1106_verify_roi_height_scale: float
+    rv1106_verify_frame_width: int
+    rv1106_verify_person_frames: int
+    rv1106_verify_board_score: float
+    rv1106_verify_board_person_score: float
+    rv1106_verify_faceless_score_multiplier: float
 
     @property
     def low_buffer_dir(self) -> Path:
@@ -382,6 +389,21 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         rv1106_save_wait_seconds=_float("RV1106_SAVE_WAIT_SECONDS", 180.0),
         rv1106_probable_policy=rv1106_probable_policy,
         rv1106_accept_probable=rv1106_probable_policy != "reject",
+        rv1106_verify_roi_width_scale=_float(
+            "RV1106_VERIFY_ROI_WIDTH_SCALE", 3.0
+        ),
+        rv1106_verify_roi_height_scale=_float(
+            "RV1106_VERIFY_ROI_HEIGHT_SCALE", 2.0
+        ),
+        rv1106_verify_frame_width=_int("RV1106_VERIFY_FRAME_WIDTH", 960),
+        rv1106_verify_person_frames=_int("RV1106_VERIFY_PERSON_FRAMES", 3),
+        rv1106_verify_board_score=_float("RV1106_VERIFY_BOARD_SCORE", 0.70),
+        rv1106_verify_board_person_score=_float(
+            "RV1106_VERIFY_BOARD_PERSON_SCORE", 0.70
+        ),
+        rv1106_verify_faceless_score_multiplier=_float(
+            "RV1106_VERIFY_FACELESS_SCORE_MULTIPLIER", 0.75
+        ),
     )
 
 

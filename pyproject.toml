@@ -9,6 +9,7 @@ dependencies = []
 [project.scripts]
 nas-video = "nas_video_summarizer.app:run"
 nas-video-check = "nas_video_summarizer.cli:check_main"
+nas-video-requeue-board = "nas_video_summarizer.requeue:requeue_main"
 
 [dependency-groups]
 dev = [

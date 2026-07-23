@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import median
@@ -18,13 +18,14 @@ from .analysis import ClipCandidate
 from .archive import rebuild_day_archive
 from .config import Settings
 from .database import Database, utc_now_iso
-from .daughter_detector import DaughterDetector
+from .daughter_detector import DaughterDetector, ProbableVerification
 from .ffmpeg_tools import (
     PersonFilterDecision,
     SampledFrame,
     _extract_frame,
     build_contact_sheet_from_frames,
     build_recorder_command,
+    extract_cropped_frame,
     extract_clip,
     ffmpeg_available,
     ffprobe_available,
@@ -158,6 +159,42 @@ def _parse_category_targets(value: str) -> dict[str, int]:
 
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _normalized_board_roi(
+    payload: dict[str, Any],
+    *,
+    width_scale: float,
+    height_scale: float,
+) -> tuple[float, float, float, float] | None:
+    """Map a board pixel box to a clamped normalized expanded ROI."""
+    raw_box = payload.get("best_box") or payload.get("box")
+    if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+        return None
+    try:
+        x, y, width, height = (float(value) for value in raw_box)
+        frame_width = float(payload.get("frame_width") or 640)
+        frame_height = float(payload.get("frame_height") or 360)
+    except (TypeError, ValueError):
+        return None
+    if frame_width <= 0 or frame_height <= 0 or width <= 0 or height <= 0:
+        return None
+
+    left = x / frame_width
+    top = y / frame_height
+    box_width = width / frame_width
+    box_height = height / frame_height
+    center_x = left + box_width / 2
+    center_y = top + box_height / 2
+    expanded_width = min(1.0, box_width * max(1.0, width_scale))
+    expanded_height = min(1.0, box_height * max(1.0, height_scale))
+    roi_left = max(0.0, center_x - expanded_width / 2)
+    roi_top = max(0.0, center_y - expanded_height / 2)
+    roi_right = min(1.0, center_x + expanded_width / 2)
+    roi_bottom = min(1.0, center_y + expanded_height / 2)
+    if roi_right <= roi_left or roi_bottom <= roi_top:
+        return None
+    return roi_left, roi_top, roi_right - roi_left, roi_bottom - roi_top
 
 
 def _segments_cover_window(
@@ -337,6 +374,12 @@ class Supervisor:
         self._probable_verified = 0
         self._probable_rejected = 0
         self._probable_verify_errors = 0
+        self._probable_face_verified = 0
+        self._probable_faceless_accepted = 0
+        self._probable_adult_rejected = 0
+        self._probable_face_without_child_rejected = 0
+        self._probable_no_person_rejected = 0
+        self._probable_inconclusive_rejected = 0
         # Board sessions and MQTT event deduplication live in SQLite so restarts
         # cannot lose a trigger that has not yet produced a moment.
         # NAS analysis and board-triggered saves run as separate tasks.
@@ -424,6 +467,16 @@ class Supervisor:
             "probable_verified": self._probable_verified,
             "probable_rejected": self._probable_rejected,
             "probable_verify_errors": self._probable_verify_errors,
+            "probable_face_verified": self._probable_face_verified,
+            "probable_faceless_accepted": self._probable_faceless_accepted,
+            "probable_adult_rejected": self._probable_adult_rejected,
+            "probable_face_without_child_rejected": (
+                self._probable_face_without_child_rejected
+            ),
+            "probable_no_person_rejected": self._probable_no_person_rejected,
+            "probable_inconclusive_rejected": (
+                self._probable_inconclusive_rejected
+            ),
         }
 
     async def _mqtt_loop(self) -> None:
@@ -663,9 +716,10 @@ class Supervisor:
         wanted_start = event_time - timedelta(seconds=self.settings.context_before_seconds)
         wanted_end = event_time + timedelta(seconds=self.settings.context_after_seconds)
         segment = await asyncio.to_thread(
-            self.database.find_segment_at,
+            self.database.find_segment_near,
             stream_role="high",
-            timestamp=event_time.isoformat(timespec="seconds"),
+            timestamp=event_time.isoformat(timespec="milliseconds"),
+            tolerance_seconds=self.settings.stream_alignment_tolerance_seconds,
         )
         high_ready = False
         if segment and Path(str(segment["path"])).exists():
@@ -714,22 +768,66 @@ class Supervisor:
 
         source_start = _parse_iso(str(segment["started_at"]))
         start_offset = max(0, int((event_time - source_start).total_seconds()))
-        payload = session.get("payload") or {}
+        payload_value = session.get("payload") or {}
+        payload = payload_value if isinstance(payload_value, dict) else {}
         activity_score = max(0.0, min(1.0, float(payload.get("activity_score") or 0.0)))
         confirmed = identity == "confirmed"
+        verification_details: dict[str, Any] | None = None
+        if identity == "probable" and self.settings.rv1106_probable_policy == "verify":
+            verification, verification_details = await self._verify_board_probable_event(
+                session, event_time
+            )
+            if not verification.accepted:
+                reason = (
+                    "probable verification rejected: "
+                    f"{verification.decision}: {verification.reason}"
+                )
+                await asyncio.to_thread(
+                    self.database.mark_board_session_skipped, session_key, reason
+                )
+                self._update_rv1106_runtime_state()
+                return
+
+        faceless = bool(
+            verification_details
+            and verification_details.get("decision") == "faceless_person"
+        )
+        face_verified = bool(
+            verification_details
+            and verification_details.get("decision")
+            in {"child_face", "daughter_onnx"}
+        )
+        base_selection_score = min(1.0, score * 0.75 + activity_score * 0.25)
+        selection_score = (
+            base_selection_score
+            * max(0.0, self.settings.rv1106_verify_faceless_score_multiplier)
+            if faceless
+            else base_selection_score
+        )
         result = ClipCandidate(
             keep=True,
             title=(
                 "Daughter confirmed by RV1106"
                 if confirmed
+                else "Probable daughter activity (faceless)"
+                if faceless
                 else "Probable daughter activity"
             ),
             summary=(
                 "开发板通过人脸特征与人体轨迹融合确认女儿出现在画面中。"
                 if confirmed
+                else "开发板儿童轨迹与 4K ROI 内持续人体证据一致，未要求正脸出现。"
+                if faceless
                 else "开发板检测到持续稳定的儿童体型活动轨迹，作为高召回候选保存。"
             ),
-            tags=["daughter", "rv1106", identity, "person_tracking"],
+            tags=[
+                "daughter",
+                "rv1106",
+                identity,
+                "person_tracking",
+                *(["faceless"] if faceless else []),
+                *(["child_face"] if face_verified else []),
+            ],
             confidence=score,
             start_offset_seconds=start_offset,
             end_offset_seconds=start_offset + 1,
@@ -739,18 +837,27 @@ class Supervisor:
                 "board_session_key": session_key,
                 "identity": identity,
                 "activity_score": activity_score,
+                "base_selection_score": base_selection_score,
+                **(
+                    {"probable_verification": verification_details}
+                    if verification_details
+                    else {}
+                ),
             },
-            local_child_confirmed=confirmed,
+            local_child_confirmed=confirmed or face_verified,
             local_child_score=score,
             analysis_backend="rv1106_edge",
-            category=f"rv1106_{identity}",
-            selection_score=min(1.0, score * 0.75 + activity_score * 0.25),
+            category=(
+                "rv1106_probable_faceless"
+                if faceless
+                else "rv1106_probable_face"
+                if face_verified
+                else f"rv1106_{identity}"
+            ),
+            selection_score=min(1.0, selection_score),
         )
-        detector = None
-        if identity == "probable" and self.settings.rv1106_probable_policy == "verify":
-            detector = self._get_board_probable_detector()
         outcome = await self._save_capped_moment(
-            segment, result, analyzer=None, detector=detector
+            segment, result, analyzer=None, detector=None
         )
         if outcome.skip is not None:
             await asyncio.to_thread(
@@ -769,15 +876,9 @@ class Supervisor:
             self._safe_add_event(
                 "moment", f"saved edge-triggered moment {outcome.moment_id}"
             )
-        elif (
-            outcome.skip is None
-            and identity == "probable"
-            and self.settings.rv1106_probable_policy == "verify"
-        ):
-            reason = "probable event rejected by NAS event-level verification"
-            await asyncio.to_thread(
-                self.database.mark_board_session_skipped, session_key, reason
-            )
+        self._update_rv1106_runtime_state()
+
+    def _update_rv1106_runtime_state(self) -> None:
         self.state["rv1106"] = {
             **self.state.get("rv1106", {}),
             **self._rv1106_local_state(),
@@ -796,6 +897,164 @@ class Supervisor:
                 )
             )
         return self._board_probable_detector
+
+    @staticmethod
+    def _probable_verification_failure(
+        decision: str,
+        reason: str,
+        *,
+        sampled_frames: int = 0,
+    ) -> ProbableVerification:
+        return ProbableVerification(
+            accepted=False,
+            positive_frames=0,
+            required_frames=1,
+            evidence=(),
+            reason=reason,
+            decision=decision,
+            sampled_frames=sampled_frames,
+        )
+
+    def _record_probable_verification(
+        self,
+        verification: ProbableVerification,
+        details: dict[str, Any],
+    ) -> None:
+        if verification.accepted:
+            self._probable_verified += 1
+            if verification.decision in {"child_face", "daughter_onnx"}:
+                self._probable_face_verified += 1
+            elif verification.decision == "faceless_person":
+                self._probable_faceless_accepted += 1
+            event_type = "rv1106-probable-verified"
+        else:
+            self._probable_rejected += 1
+            if verification.decision == "adult_face":
+                self._probable_adult_rejected += 1
+            elif verification.decision == "face_without_child":
+                self._probable_face_without_child_rejected += 1
+            elif verification.decision == "no_person":
+                self._probable_no_person_rejected += 1
+            else:
+                self._probable_inconclusive_rejected += 1
+            if verification.decision == "verification_error":
+                self._probable_verify_errors += 1
+                event_type = "rv1106-probable-verify-error"
+            else:
+                event_type = "rv1106-probable-rejected"
+        self._safe_add_event(
+            event_type, json.dumps(details, ensure_ascii=False, sort_keys=True)
+        )
+
+    async def _verify_board_probable_event(
+        self, session: dict[str, Any], event_time: datetime
+    ) -> tuple[ProbableVerification, dict[str, Any]]:
+        payload_value = session.get("payload") or {}
+        payload = payload_value if isinstance(payload_value, dict) else {}
+        session_key = str(session.get("key") or "")
+        roi = _normalized_board_roi(
+            payload,
+            width_scale=self.settings.rv1106_verify_roi_width_scale,
+            height_scale=self.settings.rv1106_verify_roi_height_scale,
+        )
+        base_details: dict[str, Any] = {
+            "session_key": session_key,
+            "board_score": float(session.get("score") or 0.0),
+            "board_person_score": float(payload.get("person_score") or 0.0),
+            "board_box": payload.get("best_box") or payload.get("box"),
+            "frame_width": payload.get("frame_width") or 640,
+            "frame_height": payload.get("frame_height") or 360,
+            "sample_offsets_seconds": [-2, -1, 0, 1, 2],
+        }
+        if roi is None:
+            verification = self._probable_verification_failure(
+                "invalid_roi", "missing or invalid board person box"
+            )
+            details = {**base_details, **asdict(verification), "roi": None}
+            self._record_probable_verification(verification, details)
+            return verification, details
+
+        base_details["roi"] = [round(value, 6) for value in roi]
+        offsets = (-2.0, -1.0, 0.0, 1.0, 2.0)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="nas-video-board-roi-verify-"
+            ) as temp_dir:
+                frames: list[SampledFrame] = []
+                for index, relative_offset in enumerate(offsets, start=1):
+                    sample_time = event_time + timedelta(seconds=relative_offset)
+                    segment = await asyncio.to_thread(
+                        self.database.find_segment_near,
+                        stream_role="high",
+                        timestamp=sample_time.isoformat(timespec="milliseconds"),
+                        tolerance_seconds=(
+                            self.settings.stream_alignment_tolerance_seconds
+                        ),
+                    )
+                    if segment is None or not Path(str(segment["path"])).exists():
+                        break
+                    segment_start = _parse_iso(str(segment["started_at"]))
+                    segment_end = _parse_iso(str(segment["ended_at"]))
+                    segment_duration = max(
+                        0.1, (segment_end - segment_start).total_seconds()
+                    )
+                    seek_offset = (sample_time - segment_start).total_seconds()
+                    seek_offset = max(
+                        0.0, min(seek_offset, max(0.0, segment_duration - 0.1))
+                    )
+                    frame_path = Path(temp_dir) / f"board-roi-{index}.jpg"
+                    await extract_cropped_frame(
+                        self.settings,
+                        Path(str(segment["path"])),
+                        frame_path,
+                        seek_offset,
+                        roi=roi,
+                        output_width=self.settings.rv1106_verify_frame_width,
+                    )
+                    if not frame_path.exists():
+                        break
+                    frames.append(
+                        SampledFrame(
+                            path=frame_path, offset_seconds=relative_offset
+                        )
+                    )
+
+                if len(frames) != len(offsets):
+                    verification = self._probable_verification_failure(
+                        "incomplete_frames",
+                        f"expected {len(offsets)} ROI frames, got {len(frames)}",
+                        sampled_frames=len(frames),
+                    )
+                else:
+                    detector = self._get_board_probable_detector()
+                    verification = await asyncio.to_thread(
+                        detector.verify_board_probable_paths,
+                        [frame.path for frame in frames],
+                        required_frames=2,
+                        required_person_frames=(
+                            self.settings.rv1106_verify_person_frames
+                        ),
+                        board_score=float(session.get("score") or 0.0),
+                        board_person_score=float(
+                            payload.get("person_score") or 0.0
+                        ),
+                        board_score_threshold=(
+                            self.settings.rv1106_verify_board_score
+                        ),
+                        board_person_score_threshold=(
+                            self.settings.rv1106_verify_board_person_score
+                        ),
+                    )
+            details = {**base_details, **asdict(verification)}
+            self._record_probable_verification(verification, details)
+            return verification, details
+        except Exception as exc:
+            verification = self._probable_verification_failure(
+                "verification_error", str(exc)
+            )
+            details = {**base_details, **asdict(verification)}
+            self._record_probable_verification(verification, details)
+            return verification, details
 
     async def _recorder_loop(self, role: str, rtsp_url: str) -> None:
         while not self.stop_event.is_set():
@@ -1630,9 +1889,10 @@ class Supervisor:
             elif result.analysis_backend in {"rv1106_face", "rv1106_edge"}:
                 identity = str(result.raw.get("identity") or "confirmed").lower()
                 if identity == "probable" and self.settings.rv1106_probable_policy == "verify":
-                    assert detector is not None
-                    verified_final = await self._verify_board_probable_clip(
-                        detector, staged_clip_path, duration_seconds
+                    probable_verification = result.raw.get("probable_verification")
+                    verified_final = bool(
+                        isinstance(probable_verification, dict)
+                        and probable_verification.get("accepted")
                     )
                 else:
                     verified_final = (
@@ -1719,56 +1979,6 @@ class Supervisor:
             self.settings, self.database, display_clip_start.strftime("%Y-%m-%d")
         )
         return moment_id
-
-    async def _verify_board_probable_clip(
-        self, detector: DaughterDetector, clip_path: Path, duration_seconds: float
-    ) -> bool:
-        offsets = [
-            max(0.0, min(duration_seconds - 0.1, duration_seconds * fraction))
-            for fraction in (0.1, 0.3, 0.5, 0.7, 0.9)
-        ]
-        try:
-            with tempfile.TemporaryDirectory(prefix="nas-video-board-verify-") as temp_dir:
-                frames = await self._extract_verification_frames(
-                    replace(
-                        self.settings,
-                        analysis_frame_width=self.settings.daughter_detector_input_size,
-                    ),
-                    clip_path,
-                    offsets,
-                    temp_dir,
-                    prefix="board-daughter",
-                )
-                if len(frames) != len(offsets):
-                    raise RuntimeError(
-                        f"expected {len(offsets)} verification frames, got {len(frames)}"
-                    )
-                verification = await asyncio.to_thread(
-                    detector.verify_board_probable_paths,
-                    [frame.path for frame in frames],
-                    required_frames=2,
-                )
-            details = json.dumps(
-                {
-                    "accepted": verification.accepted,
-                    "positive_frames": verification.positive_frames,
-                    "required_frames": verification.required_frames,
-                    "evidence": verification.evidence,
-                    "reason": verification.reason,
-                },
-                ensure_ascii=False,
-            )
-            if verification.accepted:
-                self._probable_verified += 1
-                self.database.add_event("rv1106-probable-verified", details)
-            else:
-                self._probable_rejected += 1
-                self.database.add_event("rv1106-probable-rejected", details)
-            return verification.accepted
-        except Exception as exc:
-            self._probable_verify_errors += 1
-            self.database.add_event("rv1106-probable-verify-error", str(exc))
-            return False
 
     async def _verify_detector_saved_clip(
         self, detector: DaughterDetector, clip_path: Path, duration_seconds: float
